@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [39.5535, 2.4946, 474.8, 1, 0, 0, 0, 1.0, 0, 0, 0, 1.0],
+    "Color": [255, 255, 255],
+    "Material": "Rock",
+    "MaterialVariant": "PixelGlowStone",
+    "PivotOffset": [0, -1.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [3, 3, 3],
+    "TopSurface": "Smooth"
+  }
+}

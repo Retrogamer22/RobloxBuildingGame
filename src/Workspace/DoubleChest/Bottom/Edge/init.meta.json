@@ -1,0 +1,12 @@
+{
+  "className": "UnionOperation",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [-18.7966, 1.8948, 427.84, 0, 0, 1, 0, 1.0, 0, -1.0, 0, 0],
+    "Color": [42, 42, 43],
+    "Material": "Rock",
+    "MaterialVariant": "PixelStone",
+    "Size": [2.7001, 1.8004, 5.7003],
+    "Transparency": 0.3
+  }
+}

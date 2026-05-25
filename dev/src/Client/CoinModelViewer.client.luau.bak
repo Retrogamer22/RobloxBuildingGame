@@ -1,0 +1,271 @@
+--[[
+	CoinModelViewer.client.luau
+	TEMPORARY — Displays coin models in ViewportFrames
+	Uses workspace staging + PreloadAsync + viewport refresh trick
+	Delete this script when done
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContentProvider = game:GetService("ContentProvider")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+if PlayerGui:FindFirstChild("CoinModelViewer") then
+	PlayerGui.CoinModelViewer:Destroy()
+end
+
+local function findModel(name)
+	for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+		if obj.Name == name then
+			return obj
+		end
+	end
+	return nil
+end
+
+local MODEL_NAMES = {
+	"BloxCoinCouldron",
+	"BloxCoinSack",
+	"LargeBloxCoinStack",
+	"SmallBloxCoinStack",
+}
+
+-- GUI
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "CoinModelViewer"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.DisplayOrder = 100
+ScreenGui.IgnoreGuiInset = false
+ScreenGui.Parent = PlayerGui
+
+local Overlay = Instance.new("Frame")
+Overlay.Size = UDim2.new(1, 0, 1, 0)
+Overlay.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+Overlay.BackgroundTransparency = 0.3
+Overlay.BorderSizePixel = 0
+Overlay.ZIndex = 50
+Overlay.Parent = ScreenGui
+
+local Container = Instance.new("Frame")
+Container.Size = UDim2.new(0, 900, 0, 280)
+Container.Position = UDim2.new(0.5, 0, 0.5, 0)
+Container.AnchorPoint = Vector2.new(0.5, 0.5)
+Container.BackgroundTransparency = 1
+Container.ZIndex = 51
+Container.Parent = ScreenGui
+
+local Layout = Instance.new("UIListLayout")
+Layout.FillDirection = Enum.FillDirection.Horizontal
+Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+Layout.VerticalAlignment = Enum.VerticalAlignment.Center
+Layout.Padding = UDim.new(0, 20)
+Layout.Parent = Container
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(0, 900, 0, 40)
+TitleLabel.Position = UDim2.new(0.5, 0, 0.5, -180)
+TitleLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "Coin Model Preview"
+TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleLabel.Font = Enum.Font.Arcade
+TitleLabel.TextSize = 28
+TitleLabel.ZIndex = 52
+TitleLabel.Parent = ScreenGui
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 120, 0, 36)
+CloseBtn.Position = UDim2.new(0.5, 0, 0.5, 175)
+CloseBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(140, 50, 50)
+CloseBtn.BorderSizePixel = 0
+CloseBtn.Text = "Close"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.Font = Enum.Font.Arcade
+CloseBtn.TextSize = 16
+CloseBtn.ZIndex = 52
+CloseBtn.Parent = ScreenGui
+
+-- Cleanup staging folder on close
+local stagingFolder = nil
+CloseBtn.MouseButton1Click:Connect(function()
+	if stagingFolder then stagingFolder:Destroy() end
+	ScreenGui:Destroy()
+end)
+
+-- Step 1: Clone all models into a hidden workspace staging area
+-- This forces Roblox to fully load Union mesh data
+print("[CoinModelViewer] Setting up workspace staging...")
+stagingFolder = Instance.new("Folder")
+stagingFolder.Name = "_CoinViewerStaging"
+stagingFolder.Parent = workspace
+
+local stagedModels = {}
+for idx, name in ipairs(MODEL_NAMES) do
+	local source = findModel(name)
+	if source then
+		local clone = source:Clone()
+		-- Position far away and underground so player can't see them
+		if clone:IsA("Model") then
+			clone:PivotTo(CFrame.new(10000 + idx * 100, -500, 10000))
+		end
+		for _, p in ipairs(clone:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.Anchored = true
+			end
+		end
+		clone.Parent = stagingFolder
+		stagedModels[name] = clone
+		print("[CoinModelViewer] Staged", name, "in workspace")
+	else
+		warn("[CoinModelViewer] Not found:", name)
+	end
+end
+
+-- Step 2: PreloadAsync on everything in the staging folder
+local toPreload = {}
+for _, model in pairs(stagedModels) do
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("UnionOperation") or desc:IsA("MeshPart") then
+			table.insert(toPreload, desc)
+		end
+	end
+end
+ContentProvider:PreloadAsync(toPreload)
+print("[CoinModelViewer] PreloadAsync done for", #toPreload, "assets")
+
+-- Step 3: Wait a few frames for rendering engine to process
+for i = 1, 5 do
+	RunService.Heartbeat:Wait()
+end
+task.wait(0.5)
+print("[CoinModelViewer] Waited for render processing")
+
+-- Step 4: Now build the viewports using the staged (mesh-loaded) clones
+for _, name in ipairs(MODEL_NAMES) do
+	local stagedModel = stagedModels[name]
+	
+	local box = Instance.new("Frame")
+	box.Name = name
+	box.Size = UDim2.new(0, 200, 0, 240)
+	box.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	box.BorderSizePixel = 0
+	box.ZIndex = 52
+	box.Parent = Container
+	
+	local border = Instance.new("UIStroke")
+	border.Color = Color3.fromRGB(180, 180, 180)
+	border.Thickness = 2
+	border.Parent = box
+	
+	local viewport = Instance.new("ViewportFrame")
+	viewport.Name = "Viewport"
+	viewport.Size = UDim2.new(1, -8, 1, -40)
+	viewport.Position = UDim2.new(0, 4, 0, 4)
+	viewport.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	viewport.BackgroundTransparency = 0
+	viewport.BorderSizePixel = 0
+	viewport.ZIndex = 53
+	viewport.Ambient = Color3.fromRGB(200, 200, 200)
+	viewport.LightColor = Color3.fromRGB(255, 255, 255)
+	viewport.LightDirection = Vector3.new(-1, -1, -1).Unit
+	viewport.Parent = box
+	
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 32)
+	label.Position = UDim2.new(0, 0, 1, -32)
+	label.BackgroundColor3 = Color3.fromRGB(240, 240, 240)
+	label.BorderSizePixel = 0
+	label.Text = name
+	label.TextColor3 = Color3.fromRGB(40, 40, 40)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 11
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.ZIndex = 53
+	label.Parent = box
+	
+	if stagedModel then
+		local worldModel = Instance.new("WorldModel")
+		worldModel.Parent = viewport
+		
+		-- Calculate bounds from the staged model (still in workspace)
+		local minP = Vector3.new(math.huge, math.huge, math.huge)
+		local maxP = Vector3.new(-math.huge, -math.huge, -math.huge)
+		local partCount = 0
+		for _, p in ipairs(stagedModel:GetDescendants()) do
+			if p:IsA("BasePart") then
+				partCount += 1
+				local cf = p.CFrame
+				local sz = p.Size
+				for _, dx in ipairs({-0.5, 0.5}) do
+					for _, dy in ipairs({-0.5, 0.5}) do
+						for _, dz in ipairs({-0.5, 0.5}) do
+							local corner = cf:PointToWorldSpace(Vector3.new(sz.X*dx, sz.Y*dy, sz.Z*dz))
+							minP = minP:Min(corner)
+							maxP = maxP:Max(corner)
+						end
+					end
+				end
+			end
+		end
+		
+		local center = (minP + maxP) / 2
+		local size = maxP - minP
+		local maxDim = math.max(size.X, size.Y, size.Z, 1)
+		local dist = maxDim * 2.0
+		
+		-- Move the staged model directly into the viewport (preserves loaded mesh data)
+		stagedModel.Parent = worldModel
+		
+		-- Camera points at where the model currently is
+		local camera = Instance.new("Camera")
+		camera.FieldOfView = 50
+		camera.CFrame = CFrame.new(
+			center + Vector3.new(dist * 0.65, dist * 0.5, dist * 0.65),
+			center
+		)
+		camera.Parent = viewport
+		viewport.CurrentCamera = camera
+		
+		-- Force viewport refresh: toggle visible
+		viewport.Visible = false
+		viewport.Visible = true
+		
+		print("[CoinModelViewer] Loaded", name, "|", partCount, "parts")
+	else
+		local nf = Instance.new("TextLabel")
+		nf.Size = UDim2.new(1, 0, 1, -32)
+		nf.BackgroundTransparency = 1
+		nf.Text = "Not Found"
+		nf.TextColor3 = Color3.fromRGB(200, 50, 50)
+		nf.Font = Enum.Font.GothamBold
+		nf.TextSize = 14
+		nf.ZIndex = 54
+		nf.Parent = viewport
+	end
+end
+
+-- Cleanup staging folder (models are now in viewports)
+stagingFolder:Destroy()
+stagingFolder = nil
+
+-- One more refresh after a delay
+task.delay(0.5, function()
+	if not ScreenGui.Parent then return end
+	for _, box in ipairs(Container:GetChildren()) do
+		if box:IsA("Frame") then
+			local vp = box:FindFirstChild("Viewport")
+			if vp then
+				vp.Visible = false
+				task.wait()
+				vp.Visible = true
+			end
+		end
+	end
+	print("[CoinModelViewer] Final viewport refresh done")
+end)
+
+print("[CoinModelViewer] Ready")

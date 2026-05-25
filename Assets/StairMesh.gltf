@@ -1,0 +1,131 @@
+{
+  "accessors": [
+    {
+      "name": "INDEX",
+      "bufferView": 0,
+      "componentType": 5125,
+      "type": "SCALAR",
+      "count": 84
+    },
+    {
+      "name": "POSITION",
+      "bufferView": 1,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 62
+    },
+    {
+      "name": "NORMAL",
+      "bufferView": 2,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 62
+    },
+    {
+      "name": "TEXCOORD_0",
+      "bufferView": 3,
+      "componentType": 5126,
+      "type": "VEC2",
+      "count": 62
+    },
+    {
+      "name": "COLOR_0",
+      "bufferView": 4,
+      "componentType": 5121,
+      "type": "VEC4",
+      "normalized": true,
+      "count": 62
+    }
+  ],
+  "asset": {
+    "generator": "Roblox Export",
+    "version": "2.0",
+    "min_version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "name": "INDEX",
+      "buffer": 0,
+      "byteLength": 336
+    },
+    {
+      "name": "POSITION",
+      "buffer": 1,
+      "byteLength": 744
+    },
+    {
+      "name": "NORMAL",
+      "buffer": 2,
+      "byteLength": 744
+    },
+    {
+      "name": "TEXCOORD_0",
+      "buffer": 3,
+      "byteLength": 496
+    },
+    {
+      "name": "COLOR_0",
+      "buffer": 4,
+      "byteLength": 248
+    }
+  ],
+  "buffers": [
+    {
+      "name": "INDEX",
+      "uri": "data:application/octet-stream;base64,AAAAAAEAAAACAAAAAwAAAAQAAAAFAAAABgAAAAcAAAAIAAAAAQAAAAAAAAAJAAAACgAAAAMAAAALAAAADAAAAAsAAAADAAAADQAAAAsAAAAOAAAADwAAABAAAAARAAAAEgAAABMAAAAUAAAAEAAAABUAAAAWAAAAFwAAABgAAAAGAAAAGQAAAAYAAAAYAAAAGgAAABMAAAASAAAAGwAAABgAAAAcAAAAHQAAAB4AAAAfAAAAIAAAAB0AAAAhAAAAIgAAACMAAAAkAAAAJQAAACMAAAAiAAAAJgAAACcAAAAoAAAAKQAAACoAAAArAAAALAAAAC0AAAAuAAAALwAAACcAAAAwAAAAKQAAADEAAAAyAAAAMwAAADQAAAA1AAAANgAAADUAAAA3AAAALQAAACwAAAA4AAAAOQAAADoAAAA7AAAAOQAAADwAAAA9AAAA",
+      "byteLength": 336
+    },
+    {
+      "name": "POSITION",
+      "uri": "data:application/octet-stream;base64,8P//vvX//74AAAA/+v//vldV1TQAAAC/+v//vv///74AAAC/+v//vv///74AAAC/+v//vldV1TQAAAC/rqqqNFdV1TQAAAC/+v//vldV1TQAAAA/8P//vvX//74AAAA/rqqqNPX//74AAAA/+v//vldV1TQAAAA/rqqqNP///74AAAC/AgAAP1dV1TQAAAC/rqqqNFdV1TQAAAC/rqqqNP///74AAAC/AgAAP/X//74AAAC/AgAAP/X//74AAAC/AgAAP/X//74AAAA/rqqqNP///74AAAC/AgAAP1dV1TQAAAA/AgAAP/X//74AAAC/AgAAP1dV1TQAAAC/rqqqNPX//74AAAA/rqqqNP///74AAAC/rqqqNPX//74AAAA/AgAAP/X//74AAAA/rqqqNFdV1TQAAAA/AgAAP/X//74AAAA/rqqqNFdV1TQAAAA/AgAAP1dV1TQAAAA/AgAAP1dV1TQAAAC/rqqqNFdV1TQAAAC/rqqqNFdV1TQAAAA/AgAAP1dV1TQAAAA/rqqqNFdV1TQAAAA/rqqqNPX//74AAAA/+v//vv///74AAAC/rqqqNP///74AAAC/8P//vvX//74AAAA/+v//vldV1TQAAAC/+v//vgEAAD8AAAC/rqqqNFdV1TQAAAC/+v//vgEAAD8AAAA/+v//vgEAAD8AAAC/+v//vldV1TQAAAC/+v//vgEAAD8AAAA/rqqqNAEAAD8AAAC/+v//vgEAAD8AAAC/rqqqNFdV1TQAAAC/rqqqNAEAAD8AAAC/+v//vldV1TQAAAC/+v//vldV1TQAAAA/+v//vgEAAD8AAAA/+v//vldV1TQAAAA/rqqqNAEAAD8AAAA/rqqqNFdV1TQAAAA/+v//vldV1TQAAAA/rqqqNAEAAD8AAAA/rqqqNAEAAD8AAAC/rqqqNFdV1TQAAAA/rqqqNFdV1TQAAAC/rqqqNAEAAD8AAAA/rqqqNFdV1TQAAAA/",
+      "byteLength": 744
+    },
+    {
+      "name": "NORMAL",
+      "uri": "data:application/octet-stream;base64,AACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AACAvwAAAAAAAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAgD8AAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAA",
+      "byteLength": 744
+    },
+    {
+      "name": "TEXCOORD_0",
+      "uri": "data:application/octet-stream;base64,AADAP/b/vz8AAMC/AACgtQAAwL/+/78/+P+/P/7/vz/4/78/AACgtQAAgLUAAKC1+P+/vwAAoLXw/7+/9v+/PwAAgDX2/78/AADAPwAAoLUAAIC1/v+/PwAAwL8AAKC1AACAtQAAoLUAAIC1/v+/PwAAwL/2/78/AADAPwAAwD8AAMA/AADAvwAAgDUAAMA/AADAvwAAoLUAAMA/9v+/PwAAwD8AAKC1AACANQAAwL8AAIA1AADAPwAAgDX2/78/AADAP/b/vz8AAIA1AACgtQAAwL/2/78/AACANQAAoLUAAMA/AACgtQAAwL8AAMA/AACAtQAAwD8AAIC1AADAvwAAwL8AAMC/AACAtQAAwL8AAIA1AADAv/j/v78AAMA/AACANQAAwD/w/7+/AADAv/j/vz8AAKC1+P+/PwAAwL8AAIC1AACgtQAAwD8AAMC/AADAvwAAwL8AAMC/AACgtfj/vz8AAMC/AACAtQAAwD/4/78/AADAPwAAgLUAAKC1AACAtQAAwL8AAMC/AACgtQAAwD8AAKC1+P+/vwAAwL/4/7+/AACgtQAAgDUAAMC/AACANQAAoLX4/7+/AACgtQAAgLUAAMC/AADAPwAAwL8AAMC/AACgtQAAwD8AAKC1AADAvwAAwL8AAMC/AACgtQ==",
+      "byteLength": 496
+    },
+    {
+      "name": "COLOR_0",
+      "uri": "data:application/octet-stream;base64,o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf8=",
+      "byteLength": 248
+    }
+  ],
+  "meshes": [
+    {
+      "name": "Stair",
+      "primitives": [
+        {
+          "indices": 0,
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2,
+            "TEXCOORD_0": 3,
+            "COLOR_0": 4
+          }
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "children": [ ],
+      "mesh": 0,
+      "name": "Stair",
+      "translation": [61.5999756, 2.50000358, 427.90033],
+      "scale": [2.99999905, 2.99999976, 3],
+      "extras": {"RobloxInstanceType":"UnionOperation","RobloxUniqueId":"473c140d-98a5-e508-0a1e-1cf40004fa79","Material":"plastic","Color":"(163, 162, 165)","Transparency":0,"Anchored":true,"UsePartColor":false}
+    }
+  ],
+  "scenes": [
+    {
+      "nodes": [ 0 ]
+    }
+  ]
+}
+

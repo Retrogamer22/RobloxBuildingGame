@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-65.7, 5.4946, 463.5, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [198, 198, 198],
+    "Material": "Basalt",
+    "MaterialVariant": "PixelObsidian",
+    "PivotOffset": [0, -1.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [3, 3, 3],
+    "TopSurface": "Smooth"
+  }
+}

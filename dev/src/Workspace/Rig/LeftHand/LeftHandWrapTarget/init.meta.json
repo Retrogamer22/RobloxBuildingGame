@@ -1,0 +1,8 @@
+{
+  "className": "WrapTarget",
+  "properties": {
+    "CageMeshContent": "rbxassetid://74653932751478",
+    "CageOrigin": [-0.0142, -0.0069, -0.0328, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "ImportOrigin": [0.6985, 0.1927, 0.0328, 1, 0, 0, 0, 1, 0, 0, 0, 1]
+  }
+}

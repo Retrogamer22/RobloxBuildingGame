@@ -1,0 +1,6 @@
+{
+  "className": "ColorGradingEffect",
+  "properties": {
+    "TonemapperPreset": "Retro"
+  }
+}

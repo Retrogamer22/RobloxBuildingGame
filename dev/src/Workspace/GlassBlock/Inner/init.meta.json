@@ -1,0 +1,13 @@
+{
+  "className": "UnionOperation",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [31.6535, 2.5, 474.1, 0, 1, 0, -1, 0, 0, 0, 0, 1],
+    "Color": [198, 198, 198],
+    "Material": "Glass",
+    "Reflectance": 1,
+    "Size": [3.0, 3, 3],
+    "Transparency": 0.7,
+    "UsePartColor": true
+  }
+}

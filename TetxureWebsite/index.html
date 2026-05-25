@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PBR Texture Forge — Roblox Material Generator</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <header>
+    <div class="logo">
+      <svg viewBox="0 0 28 28" width="28" height="28" fill="none">
+        <rect x="2" y="2" width="24" height="24" rx="4" stroke="var(--accent)" stroke-width="2"/>
+        <path d="M8 14L12 10L16 14L20 10" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M8 19L12 15L16 19L20 15" stroke="var(--accent-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <h1>PBR Texture Forge</h1>
+    </div>
+    <p class="subtitle">Generate Roblox PBR material maps from a single texture</p>
+  </header>
+
+  <main>
+    <section id="upload-zone" class="upload-zone">
+      <div class="upload-inner">
+        <svg viewBox="0 0 48 48" width="48" height="48" fill="none">
+          <path d="M24 32V16M24 16L18 22M24 16L30 22" stroke="var(--text-dim)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M38 32C40.2091 32 42 30.2091 42 28C42 24.6863 39.3137 22 36 22C35.7893 22 35.5806 22.0092 35.3742 22.0272C34.3444 17.5088 30.1627 14 25.2 14C19.3458 14 14.6 18.7458 14.6 24.6C14.6 24.7348 14.6024 24.869 14.6071 25.0027C11.4883 25.1521 9 27.7393 9 30.9C9 31.2711 9.03135 31.6347 9.09131 31.9886" stroke="var(--text-dim)" stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+        <p class="upload-label">Drop your color texture here</p>
+        <p class="upload-hint">or click to browse — PNG, JPG, WebP — any resolution</p>
+        <input type="file" id="file-input" accept="image/*" hidden>
+      </div>
+    </section>
+
+    <!-- Compact top bar: source preview + controls side by side -->
+    <section id="source-section" class="source-section hidden">
+      <div class="top-bar">
+        <!-- Left: small color map preview -->
+        <div class="source-thumb">
+          <canvas id="source-canvas"></canvas>
+          <div class="source-meta">
+            <span id="file-name" class="file-name-tag"></span>
+            <span id="img-dimensions" class="dim-tag"></span>
+            <button id="btn-change" class="btn-ghost">Change</button>
+          </div>
+        </div>
+        <!-- Right: action buttons + save row -->
+        <div class="top-actions">
+          <div class="action-row">
+            <button id="btn-generate" class="btn-primary">
+              <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M4 10H16M16 10L11 5M16 10L11 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Regenerate All
+            </button>
+            <button id="btn-download-all" class="btn-secondary">
+              <svg viewBox="0 0 20 20" width="16" height="16" fill="none"><path d="M10 3V13M10 13L6 9M10 13L14 9M3 17H17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Download All
+            </button>
+          </div>
+          <div class="save-row">
+            <label class="save-dir-label">Save to:</label>
+            <input type="text" id="save-dir" class="save-dir-input" placeholder="Paste folder path (blank = server folder)">
+            <button id="btn-save-all" class="btn-save">
+              <svg viewBox="0 0 20 20" width="16" height="16" fill="none">
+                <path d="M15 7L15 15C15 16.1046 14.1046 17 13 17L7 17C5.89543 17 5 16.1046 5 15L5 5C5 3.89543 5.89543 3 7 3L11 3L15 7Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                <path d="M11 3V6C11 6.55228 11.4477 7 12 7H15" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                <path d="M8 12H12M10 10V14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+              Save
+            </button>
+          </div>
+          <div id="save-status" class="save-status"></div>
+          <div id="save-label" class="save-label"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="maps-section" class="maps-section hidden">
+      <div class="maps-grid">
+        <div class="map-card" data-map="normal">
+          <div class="map-header"><h3>Normal Map</h3><span class="map-tag">OpenGL Tangent Space</span></div>
+          <div class="map-preview"><canvas id="normal-canvas"></canvas></div>
+          <div class="map-controls">
+            <label><span>Strength</span><div class="slider-row"><input type="range" id="normal-strength" min="0.5" max="20" step="0.5" value="4"><span class="slider-val" data-for="normal-strength">4</span></div></label>
+            <label><span>Blur</span><div class="slider-row"><input type="range" id="normal-blur" min="0" max="5" step="1" value="0"><span class="slider-val" data-for="normal-blur">0</span></div></label>
+            <label class="toggle-label"><input type="checkbox" id="normal-invert-y"><span>Invert Y (DirectX → OpenGL)</span></label>
+          </div>
+          <button class="btn-download" data-canvas="normal-canvas" data-name="Normal">Download Normal Map</button>
+        </div>
+
+        <div class="map-card" data-map="roughness">
+          <div class="map-header"><h3>Roughness Map</h3><span class="map-tag">Grayscale</span></div>
+          <div class="map-preview"><canvas id="roughness-canvas"></canvas></div>
+          <div class="map-controls">
+            <label><span>Contrast</span><div class="slider-row"><input type="range" id="rough-contrast" min="0" max="3" step="0.1" value="1"><span class="slider-val" data-for="rough-contrast">1</span></div></label>
+            <label><span>Brightness</span><div class="slider-row"><input type="range" id="rough-brightness" min="-128" max="128" step="1" value="0"><span class="slider-val" data-for="rough-brightness">0</span></div></label>
+            <label><span>Blur</span><div class="slider-row"><input type="range" id="rough-blur" min="0" max="8" step="1" value="1"><span class="slider-val" data-for="rough-blur">1</span></div></label>
+            <label class="toggle-label"><input type="checkbox" id="rough-invert" checked><span>Invert (dark = smooth)</span></label>
+          </div>
+          <button class="btn-download" data-canvas="roughness-canvas" data-name="Roughness">Download Roughness Map</button>
+        </div>
+
+        <div class="map-card" data-map="metalness">
+          <div class="map-header"><h3>Metalness Map</h3><span class="map-tag">Grayscale</span></div>
+          <div class="map-preview"><canvas id="metalness-canvas"></canvas></div>
+          <div class="map-controls">
+            <label><span>Threshold</span><div class="slider-row"><input type="range" id="metal-threshold" min="0" max="255" step="1" value="200"><span class="slider-val" data-for="metal-threshold">200</span></div></label>
+            <label><span>Smoothing</span><div class="slider-row"><input type="range" id="metal-smooth" min="0" max="10" step="1" value="2"><span class="slider-val" data-for="metal-smooth">2</span></div></label>
+            <label class="toggle-label"><input type="checkbox" id="metal-flat-black"><span>Flat black (non-metal)</span></label>
+          </div>
+          <button class="btn-download" data-canvas="metalness-canvas" data-name="Metalness">Download Metalness Map</button>
+        </div>
+
+        <div class="map-card" data-map="emissive">
+          <div class="map-header"><h3>Emissive Map</h3><span class="map-tag">RGB</span></div>
+          <div class="map-preview"><canvas id="emissive-canvas"></canvas></div>
+          <div class="map-controls">
+            <label><span>Brightness Threshold</span><div class="slider-row"><input type="range" id="emissive-threshold" min="0" max="255" step="1" value="220"><span class="slider-val" data-for="emissive-threshold">220</span></div></label>
+            <label><span>Glow Intensity</span><div class="slider-row"><input type="range" id="emissive-intensity" min="0" max="3" step="0.1" value="1"><span class="slider-val" data-for="emissive-intensity">1</span></div></label>
+            <label class="toggle-label"><input type="checkbox" id="emissive-color"><span>Preserve original color</span></label>
+          </div>
+          <button class="btn-download" data-canvas="emissive-canvas" data-name="Emissive">Download Emissive Map</button>
+        </div>
+      </div>
+
+      <div class="preview-section">
+        <div class="preview-header">
+          <h3>3D Block Preview</h3>
+          <p class="preview-hint">Isometric view — move mouse to rotate light</p>
+        </div>
+        <div class="preview-container"><canvas id="preview-canvas"></canvas></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>PBR Texture Forge — All processing local. Transparency preserved. Run via Start.bat for folder saving.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

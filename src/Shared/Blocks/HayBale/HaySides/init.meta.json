@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-23.1465, 2.5, 464.7, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [198, 198, 198],
+    "Material": "Grass",
+    "MaterialVariant": "PixelHayBale",
+    "PivotOffset": [0, -1.4927, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [3, 2.9854, 3],
+    "TopSurface": "Smooth"
+  }
+}

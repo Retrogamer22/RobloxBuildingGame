@@ -1,0 +1,13 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-13.8516, 2.7944, 426.4002, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [62, 62, 63],
+    "Material": "Rock",
+    "MaterialVariant": "PixelConcrete",
+    "Size": [0.45, 0.72, 0.18],
+    "TopSurface": "Smooth"
+  }
+}

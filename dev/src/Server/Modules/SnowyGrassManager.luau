@@ -1,0 +1,715 @@
+--[[
+	SnowyGrassManager
+	Handles snow-on-grass conversion mechanics:
+	- When a SnowBlock is placed on top of a GrassBlock, the grass converts
+	  to SnowyGrassBlock after a short delay
+	- When the SnowBlock is removed, the SnowyGrassBlock reverts back to
+	  GrassBlock after a short delay
+	- SnowyGrassBlock saves/loads as-is (no re-derivation needed)
+	- Self-healing: if a SnowyGrassBlock has no snow above, it reverts automatically
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
+local BulkOperationFlags = require(ReplicatedStorage:WaitForChild("BulkOperationFlags"))
+local BlockSpatialIndex = require(ReplicatedStorage:WaitForChild("BlockSpatialIndex"))
+
+local SnowyGrassManager = {}
+
+-- ============================================
+-- CONFIGURATION
+-- ============================================
+local CONFIG = {
+	-- Delay before grass converts to snowy variant (seconds)
+	SNOW_CONVERT_DELAY = 3.0,
+
+	-- Delay before snowy grass reverts to normal grass (seconds)
+	REVERT_DELAY = 4.0,
+
+	-- Interval for the self-healing scan (catches orphaned snowy grass on load)
+	SELF_HEAL_INTERVAL = 5.0,
+
+	-- Block types recognized as snow that trigger conversion
+	SNOW_BLOCKS = {
+		["SnowBlock"] = true,
+		["SnowLayer"] = true,
+	},
+
+	-- Block types that can become snowy
+	GRASS_BLOCKS = {
+		["GrassBlock"] = true,
+	},
+
+	-- The snowy variant block type
+	SNOWY_GRASS_TYPE = "SnowyGrassBlock",
+}
+
+local BLOCK_SIZE = GridConfig.BLOCK_SIZE
+local DEBUG = false
+
+-- Track pending conversions so we can cancel them
+-- Key: grid key string, Value: thread reference
+local pendingConversions = {} -- grass pos -> thread (snow placed, waiting to convert)
+local pendingReversions = {}  -- snowy grass pos -> thread (snow removed, waiting to revert)
+
+-- Track monitored areas
+local monitoredAreas = {}
+
+-- ============================================
+-- HELPER FUNCTIONS
+-- ============================================
+
+local function debugLog(...)
+	if DEBUG then
+		print("[SnowyGrass]", ...)
+	end
+end
+
+-- Get grid position key from world position
+local function getGridKey(gx, gy, gz)
+	return string.format("%d,%d,%d", gx, gy, gz)
+end
+
+-- Get grid coordinates from a block instance
+local function getBlockGridPos(block)
+	-- Check stored grid position first (used by offset blocks like SnowLayer)
+	local storedX = block:GetAttribute("BlockPosX")
+	local storedY = block:GetAttribute("BlockPosY")
+	local storedZ = block:GetAttribute("BlockPosZ")
+	if storedX and storedY and storedZ then
+		return math.round(storedX / BLOCK_SIZE), math.round(storedY / BLOCK_SIZE), math.round(storedZ / BLOCK_SIZE)
+	end
+
+	local blockPos
+	if block:IsA("BasePart") then
+		blockPos = block.Position
+	elseif block:IsA("Model") then
+		local pivot = block:GetPivot()
+		blockPos = pivot.Position + Vector3.new(0, BLOCK_SIZE / 2, 0)
+	end
+
+	if not blockPos then return nil, nil, nil end
+
+	local gx = math.round(blockPos.X / BLOCK_SIZE)
+	local gy = math.round(blockPos.Y / BLOCK_SIZE)
+	local gz = math.round(blockPos.Z / BLOCK_SIZE)
+
+	return gx, gy, gz
+end
+
+-- Find a block at a specific grid position in a blocks folder
+local function getBlockAtGrid(gx, gy, gz, blocksFolder)
+	-- Try spatial index first (O(1))
+	local index = BlockSpatialIndex.GetOrCreate(blocksFolder)
+	if index then
+		local worldPos = Vector3.new(gx * BLOCK_SIZE, gy * BLOCK_SIZE, gz * BLOCK_SIZE)
+		local found = index:GetBlockAt(worldPos)
+		if found then
+			return found
+		end
+	end
+
+	-- Fallback: linear scan
+	local targetPos = Vector3.new(gx * BLOCK_SIZE, gy * BLOCK_SIZE, gz * BLOCK_SIZE)
+	for _, block in ipairs(blocksFolder:GetChildren()) do
+		local bgx, bgy, bgz = getBlockGridPos(block)
+		if bgx == gx and bgy == gy and bgz == gz then
+			return block
+		end
+	end
+
+	return nil
+end
+
+-- Get a block template from ReplicatedStorage
+local function getBlockTemplate(blockType)
+	local blocksFolder = ReplicatedStorage:FindFirstChild("Blocks")
+	if blocksFolder then
+		local template = blocksFolder:FindFirstChild(blockType)
+		if template then return template end
+	end
+	return nil
+end
+
+-- BiomeConfig for grass coloring
+local BiomeConfig = nil
+local function loadBiomeConfig()
+	if BiomeConfig then return BiomeConfig end
+	pcall(function()
+		BiomeConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BiomeConfig"))
+	end)
+	return BiomeConfig
+end
+
+-- Apply biome grass color to a block
+local function applyBiomeGrassColor(block, biomeName, seasonName)
+	loadBiomeConfig()
+	if not BiomeConfig then return end
+
+	local biomeColors = BiomeConfig.GetBiomeColors(biomeName)
+	if not biomeColors or not biomeColors.GrassColor then return end
+
+	local grassColor = BiomeConfig.GetRandomizedGrassColor(biomeColors.GrassColor, seasonName)
+
+	if block:IsA("Model") then
+		local grassPart = block:FindFirstChild("Grass")
+		if grassPart and grassPart:IsA("BasePart") then
+			grassPart.Color = grassColor
+		end
+	elseif block:IsA("BasePart") then
+		block.Color = grassColor
+	end
+
+	block:SetAttribute("Biome", biomeName)
+	if seasonName then
+		block:SetAttribute("Season", seasonName)
+	end
+end
+
+-- ============================================
+-- CONVERSION FUNCTIONS
+-- ============================================
+
+-- Convert a GrassBlock to SnowyGrassBlock
+local function convertToSnowyGrass(grassBlock, blocksFolder)
+	local blockType = grassBlock:GetAttribute("BlockType")
+	if not blockType or not CONFIG.GRASS_BLOCKS[blockType] then
+		return false
+	end
+
+	-- Verify the grass block still exists
+	if not grassBlock.Parent then return false end
+
+	local template = getBlockTemplate(CONFIG.SNOWY_GRASS_TYPE)
+	if not template then
+		warn("[SnowyGrass] Could not find SnowyGrassBlock template")
+		return false
+	end
+
+	-- Get position data
+	local grassCFrame
+	if grassBlock:IsA("BasePart") then
+		grassCFrame = grassBlock.CFrame
+	elseif grassBlock:IsA("Model") then
+		grassCFrame = grassBlock:GetPivot()
+	end
+
+	if not grassCFrame then return false end
+
+	-- Preserve attributes
+	local posX = grassBlock:GetAttribute("BlockPosX")
+	local posY = grassBlock:GetAttribute("BlockPosY")
+	local posZ = grassBlock:GetAttribute("BlockPosZ")
+	local rotation = grassBlock:GetAttribute("Rotation") or 0
+	local placedBy = grassBlock:GetAttribute("PlacedBy")
+	local isTerrainBlock = grassBlock:GetAttribute("IsTerrainBlock")
+	local terrainDepth = grassBlock:GetAttribute("TerrainDepth")
+	local isLazyLoaded = grassBlock:GetAttribute("IsLazyLoaded")
+	local biomeName = grassBlock:GetAttribute("Biome")
+	local seasonName = grassBlock:GetAttribute("Season")
+
+	-- If no stored position, calculate from CFrame
+	if not (posX and posY and posZ) then
+		local blockPos
+		if grassBlock:IsA("BasePart") then
+			blockPos = grassCFrame.Position
+		elseif grassBlock:IsA("Model") then
+			blockPos = grassCFrame.Position + Vector3.new(0, BLOCK_SIZE / 2, 0)
+		end
+		if blockPos then
+			posX = math.round(blockPos.X / BLOCK_SIZE) * BLOCK_SIZE
+			posY = math.round(blockPos.Y / BLOCK_SIZE) * BLOCK_SIZE
+			posZ = math.round(blockPos.Z / BLOCK_SIZE) * BLOCK_SIZE
+		end
+	end
+
+	if not (posX and posY and posZ) then return false end
+
+	-- Create the snowy grass block
+	local snowyBlock = template:Clone()
+	snowyBlock.Name = CONFIG.SNOWY_GRASS_TYPE .. "_" .. math.random(100000, 999999)
+
+	-- Position it exactly where the grass block was
+	if snowyBlock:IsA("BasePart") then
+		if grassBlock:IsA("BasePart") then
+			snowyBlock.CFrame = grassCFrame
+		else
+			local centerPos = grassCFrame.Position + Vector3.new(0, BLOCK_SIZE / 2, 0)
+			snowyBlock.CFrame = CFrame.new(centerPos) * grassCFrame.Rotation
+		end
+		snowyBlock.Anchored = true
+		snowyBlock.CanCollide = true
+	elseif snowyBlock:IsA("Model") then
+		if grassBlock:IsA("Model") then
+			snowyBlock:PivotTo(grassCFrame)
+		else
+			local pivotPos = grassCFrame.Position - Vector3.new(0, BLOCK_SIZE / 2, 0)
+			snowyBlock:PivotTo(CFrame.new(pivotPos) * grassCFrame.Rotation)
+		end
+		for _, part in ipairs(snowyBlock:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Anchored = true
+				part.CanCollide = true
+			end
+		end
+	end
+
+	-- Set attributes
+	snowyBlock:SetAttribute("BlockType", CONFIG.SNOWY_GRASS_TYPE)
+	snowyBlock:SetAttribute("Rotation", rotation)
+	snowyBlock:SetAttribute("BlockPosX", posX)
+	snowyBlock:SetAttribute("BlockPosY", posY)
+	snowyBlock:SetAttribute("BlockPosZ", posZ)
+
+	if placedBy then
+		snowyBlock:SetAttribute("PlacedBy", placedBy)
+	end
+	if isTerrainBlock then
+		snowyBlock:SetAttribute("IsTerrainBlock", true)
+		snowyBlock:SetAttribute("TerrainDepth", terrainDepth or 0)
+	end
+	if isLazyLoaded then
+		snowyBlock:SetAttribute("IsLazyLoaded", true)
+	end
+	if biomeName then
+		snowyBlock:SetAttribute("Biome", biomeName)
+	end
+	if seasonName then
+		snowyBlock:SetAttribute("Season", seasonName)
+	end
+
+	-- Parent the new block, destroy the old
+	snowyBlock.Parent = blocksFolder
+	grassBlock:Destroy()
+
+	debugLog("Converted GrassBlock to SnowyGrassBlock at", posX, posY, posZ)
+	return true
+end
+
+-- Convert a SnowyGrassBlock back to GrassBlock
+local function convertToNormalGrass(snowyBlock, blocksFolder)
+	local blockType = snowyBlock:GetAttribute("BlockType")
+	if blockType ~= CONFIG.SNOWY_GRASS_TYPE then
+		return false
+	end
+
+	-- Verify the block still exists
+	if not snowyBlock.Parent then return false end
+
+	-- Determine which grass type to revert to (based on biome)
+	local biomeName = snowyBlock:GetAttribute("Biome")
+	local seasonName = snowyBlock:GetAttribute("Season")
+	local grassType = GridConfig.TERRAIN.GRASS_BLOCK -- Default: "GrassBlock"
+
+	-- Try biome-specific grass
+	loadBiomeConfig()
+	if BiomeConfig and biomeName then
+		local biomeData = BiomeConfig.GetBiome(biomeName)
+		if biomeData and biomeData.GrassBlock then
+			grassType = biomeData.GrassBlock
+		end
+	end
+
+	local template = getBlockTemplate(grassType)
+	if not template then
+		warn("[SnowyGrass] Could not find grass template: " .. grassType)
+		return false
+	end
+
+	-- Get position data
+	local snowyCFrame
+	if snowyBlock:IsA("BasePart") then
+		snowyCFrame = snowyBlock.CFrame
+	elseif snowyBlock:IsA("Model") then
+		snowyCFrame = snowyBlock:GetPivot()
+	end
+
+	if not snowyCFrame then return false end
+
+	-- Preserve attributes
+	local posX = snowyBlock:GetAttribute("BlockPosX")
+	local posY = snowyBlock:GetAttribute("BlockPosY")
+	local posZ = snowyBlock:GetAttribute("BlockPosZ")
+	local rotation = snowyBlock:GetAttribute("Rotation") or 0
+	local placedBy = snowyBlock:GetAttribute("PlacedBy")
+	local isTerrainBlock = snowyBlock:GetAttribute("IsTerrainBlock")
+	local terrainDepth = snowyBlock:GetAttribute("TerrainDepth")
+	local isLazyLoaded = snowyBlock:GetAttribute("IsLazyLoaded")
+
+	if not (posX and posY and posZ) then
+		local blockPos
+		if snowyBlock:IsA("BasePart") then
+			blockPos = snowyCFrame.Position
+		elseif snowyBlock:IsA("Model") then
+			blockPos = snowyCFrame.Position + Vector3.new(0, BLOCK_SIZE / 2, 0)
+		end
+		if blockPos then
+			posX = math.round(blockPos.X / BLOCK_SIZE) * BLOCK_SIZE
+			posY = math.round(blockPos.Y / BLOCK_SIZE) * BLOCK_SIZE
+			posZ = math.round(blockPos.Z / BLOCK_SIZE) * BLOCK_SIZE
+		end
+	end
+
+	if not (posX and posY and posZ) then return false end
+
+	-- Create the grass block
+	local grassBlock = template:Clone()
+	grassBlock.Name = grassType .. "_" .. math.random(100000, 999999)
+
+	-- Position it exactly where the snowy block was
+	if grassBlock:IsA("BasePart") then
+		if snowyBlock:IsA("BasePart") then
+			grassBlock.CFrame = snowyCFrame
+		else
+			local centerPos = snowyCFrame.Position + Vector3.new(0, BLOCK_SIZE / 2, 0)
+			grassBlock.CFrame = CFrame.new(centerPos) * snowyCFrame.Rotation
+		end
+		grassBlock.Anchored = true
+		grassBlock.CanCollide = true
+	elseif grassBlock:IsA("Model") then
+		if snowyBlock:IsA("Model") then
+			grassBlock:PivotTo(snowyCFrame)
+		else
+			local pivotPos = snowyCFrame.Position - Vector3.new(0, BLOCK_SIZE / 2, 0)
+			grassBlock:PivotTo(CFrame.new(pivotPos) * snowyCFrame.Rotation)
+		end
+		for _, part in ipairs(grassBlock:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Anchored = true
+				part.CanCollide = true
+			end
+		end
+	end
+
+	-- Apply biome coloring
+	if biomeName then
+		applyBiomeGrassColor(grassBlock, biomeName, seasonName)
+	end
+
+	-- Set attributes
+	grassBlock:SetAttribute("BlockType", grassType)
+	grassBlock:SetAttribute("Rotation", rotation)
+	grassBlock:SetAttribute("BlockPosX", posX)
+	grassBlock:SetAttribute("BlockPosY", posY)
+	grassBlock:SetAttribute("BlockPosZ", posZ)
+
+	if placedBy then
+		grassBlock:SetAttribute("PlacedBy", placedBy)
+	end
+	if isTerrainBlock then
+		grassBlock:SetAttribute("IsTerrainBlock", true)
+		grassBlock:SetAttribute("TerrainDepth", terrainDepth or 0)
+	end
+	if isLazyLoaded then
+		grassBlock:SetAttribute("IsLazyLoaded", true)
+	end
+	if biomeName then
+		grassBlock:SetAttribute("Biome", biomeName)
+	end
+	if seasonName then
+		grassBlock:SetAttribute("Season", seasonName)
+	end
+
+	-- Parent the new block, destroy the old
+	grassBlock.Parent = blocksFolder
+	snowyBlock:Destroy()
+
+	debugLog("Reverted SnowyGrassBlock to", grassType, "at", posX, posY, posZ)
+	return true
+end
+
+-- ============================================
+-- EVENT HANDLERS
+-- ============================================
+
+-- Called when a block is added to a plot
+local function onBlockAdded(block, blocksFolder)
+	-- Skip during bulk operations (terrain gen, load, etc.)
+	local buildArea = blocksFolder.Parent
+	if buildArea and BulkOperationFlags.IsBulkOperation(buildArea) then
+		debugLog("Skipping - bulk operation in progress")
+		return
+	end
+
+	local blockType = block:GetAttribute("BlockType")
+	if not blockType then
+		debugLog("Block added with no BlockType attribute:", block.Name)
+		return
+	end
+
+	debugLog("Block added:", blockType, "name:", block.Name)
+
+	-- CASE 1: A snow block was placed — check if there's grass below
+	if CONFIG.SNOW_BLOCKS[blockType] then
+		local gx, gy, gz = getBlockGridPos(block)
+		if not gx then
+			debugLog("Could not get grid pos for snow block")
+			return
+		end
+
+		debugLog("Snow block at grid:", gx, gy, gz, "- checking below at", gx, gy - 1, gz)
+		local belowKey = getGridKey(gx, gy - 1, gz)
+
+		-- Cancel any pending reversion at this position (snow was placed back)
+		if pendingReversions[belowKey] then
+			task.cancel(pendingReversions[belowKey])
+			pendingReversions[belowKey] = nil
+			debugLog("Cancelled reversion at", belowKey, "(snow re-placed)")
+		end
+
+		-- Check what's below
+		local blockBelow = getBlockAtGrid(gx, gy - 1, gz, blocksFolder)
+		if blockBelow then
+			local belowType = blockBelow:GetAttribute("BlockType")
+			debugLog("Found block below:", belowType, "name:", blockBelow.Name)
+			if belowType and CONFIG.GRASS_BLOCKS[belowType] then
+				-- Schedule conversion to snowy grass after delay
+				-- Cancel existing pending conversion if any
+				if pendingConversions[belowKey] then
+					task.cancel(pendingConversions[belowKey])
+				end
+
+				pendingConversions[belowKey] = task.delay(CONFIG.SNOW_CONVERT_DELAY, function()
+					pendingConversions[belowKey] = nil
+					-- Re-verify: snow is still above and grass is still there
+					if not block.Parent then return end
+					if not blockBelow.Parent then return end
+					local currentType = blockBelow:GetAttribute("BlockType")
+					if currentType and CONFIG.GRASS_BLOCKS[currentType] then
+						convertToSnowyGrass(blockBelow, blocksFolder)
+					end
+				end)
+
+				debugLog("Scheduled snow conversion at", belowKey)
+			else
+				debugLog("Block below is not grass, type:", belowType)
+			end
+		else
+			debugLog("No block found below snow at", gx, gy - 1, gz)
+		end
+	end
+
+	-- CASE 2: A SnowyGrassBlock appeared (from load) — verify snow is still above
+	-- This is handled by the self-heal scan instead, to avoid event storms on load
+end
+
+-- Called when a block is removed from a plot
+local function onBlockRemoved(block, blocksFolder)
+	-- Skip during bulk operations
+	local buildArea = blocksFolder.Parent
+	if buildArea and BulkOperationFlags.IsBulkOperation(buildArea) then return end
+
+	local blockType = block:GetAttribute("BlockType")
+	if not blockType then return end
+
+	-- CASE 1: A snow block was removed — check if there's snowy grass below
+	if CONFIG.SNOW_BLOCKS[blockType] then
+		local gx, gy, gz = getBlockGridPos(block)
+		if not gx then return end
+
+		local belowKey = getGridKey(gx, gy - 1, gz)
+
+		-- Cancel any pending conversion (snow was removed before it could finish)
+		if pendingConversions[belowKey] then
+			task.cancel(pendingConversions[belowKey])
+			pendingConversions[belowKey] = nil
+			debugLog("Cancelled conversion at", belowKey, "(snow removed)")
+		end
+
+		-- Check if there's snowy grass below that needs to revert
+		local blockBelow = getBlockAtGrid(gx, gy - 1, gz, blocksFolder)
+		if blockBelow then
+			local belowType = blockBelow:GetAttribute("BlockType")
+			if belowType == CONFIG.SNOWY_GRASS_TYPE then
+				-- Schedule reversion after delay
+				if pendingReversions[belowKey] then
+					task.cancel(pendingReversions[belowKey])
+				end
+
+				pendingReversions[belowKey] = task.delay(CONFIG.REVERT_DELAY, function()
+					pendingReversions[belowKey] = nil
+					-- Re-verify: snowy grass is still there and still has no snow above
+					if not blockBelow.Parent then return end
+					local currentType = blockBelow:GetAttribute("BlockType")
+					if currentType ~= CONFIG.SNOWY_GRASS_TYPE then return end
+
+					-- Double-check no new snow was placed above
+					local snowAbove = getBlockAtGrid(gx, gy, gz, blocksFolder)
+					if snowAbove then
+						local aboveType = snowAbove:GetAttribute("BlockType")
+						if aboveType and CONFIG.SNOW_BLOCKS[aboveType] then
+							return -- Snow is back, don't revert
+						end
+					end
+
+					convertToNormalGrass(blockBelow, blocksFolder)
+				end)
+
+				debugLog("Scheduled reversion at", belowKey)
+			end
+		end
+	end
+end
+
+-- ============================================
+-- SELF-HEALING SCAN
+-- Catches orphaned SnowyGrassBlocks (e.g., from load where snow was lost)
+-- ============================================
+
+local function selfHealScan(blocksFolder)
+	local buildArea = blocksFolder.Parent
+	if buildArea and BulkOperationFlags.IsBulkOperation(buildArea) then return end
+
+	for _, block in ipairs(blocksFolder:GetChildren()) do
+		local blockType = block:GetAttribute("BlockType")
+		if blockType == CONFIG.SNOWY_GRASS_TYPE then
+			local gx, gy, gz = getBlockGridPos(block)
+			if gx then
+				-- Check if there's a snow block above
+				local snowAbove = getBlockAtGrid(gx, gy + 1, gz, blocksFolder)
+				local hasSnow = false
+
+				if snowAbove then
+					local aboveType = snowAbove:GetAttribute("BlockType")
+					if aboveType and CONFIG.SNOW_BLOCKS[aboveType] then
+						hasSnow = true
+					end
+				end
+
+				if not hasSnow then
+					local key = getGridKey(gx, gy, gz)
+					-- Only schedule if not already pending
+					if not pendingReversions[key] then
+						pendingReversions[key] = task.delay(CONFIG.REVERT_DELAY, function()
+							pendingReversions[key] = nil
+							if not block.Parent then return end
+							local currentType = block:GetAttribute("BlockType")
+							if currentType ~= CONFIG.SNOWY_GRASS_TYPE then return end
+
+							-- Final check for snow above
+							local finalCheck = getBlockAtGrid(gx, gy + 1, gz, blocksFolder)
+							if finalCheck then
+								local fType = finalCheck:GetAttribute("BlockType")
+								if fType and CONFIG.SNOW_BLOCKS[fType] then return end
+							end
+
+							convertToNormalGrass(block, blocksFolder)
+						end)
+						debugLog("Self-heal: scheduled reversion for orphaned SnowyGrass at", key)
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ============================================
+-- MONITORING SETUP
+-- ============================================
+
+local function monitorBuildArea(buildArea)
+	local blocksFolder = buildArea:FindFirstChild("Blocks")
+
+	-- If Blocks folder doesn't exist yet, wait for it
+	if not blocksFolder then
+		if monitoredAreas[buildArea] then return end -- Only set up one waiter
+		monitoredAreas[buildArea] = "waiting"
+		local connection
+		connection = buildArea.ChildAdded:Connect(function(child)
+			if child.Name == "Blocks" then
+				if connection then
+					connection:Disconnect()
+					connection = nil
+				end
+				monitoredAreas[buildArea] = nil -- Reset so we can fully monitor
+				task.wait(0.1)
+				monitorBuildArea(buildArea)
+			end
+		end)
+		return
+	end
+
+	if monitoredAreas[buildArea] == true then return end
+	monitoredAreas[buildArea] = true
+
+	-- Connect to block add/remove events
+	blocksFolder.ChildAdded:Connect(function(block)
+		task.wait() -- Let attributes settle
+		onBlockAdded(block, blocksFolder)
+	end)
+
+	blocksFolder.ChildRemoved:Connect(function(block)
+		onBlockRemoved(block, blocksFolder)
+	end)
+
+	debugLog("Monitoring", buildArea.Name)
+
+	-- Run initial self-heal scan (catches orphaned snowy grass on server start / load)
+	task.delay(2.0, function()
+		selfHealScan(blocksFolder)
+	end)
+
+	-- Periodic self-heal scan
+	task.spawn(function()
+		while buildArea.Parent and blocksFolder.Parent do
+			task.wait(CONFIG.SELF_HEAL_INTERVAL)
+			selfHealScan(blocksFolder)
+		end
+	end)
+end
+
+-- ============================================
+-- PUBLIC API
+-- ============================================
+
+function SnowyGrassManager.Initialize()
+	-- Monitor existing build areas
+	for i = 1, GridConfig.TOTAL_PLOTS do
+		local areaName = GridConfig.BUILD_AREA_PREFIX .. i
+		local buildArea = workspace:FindFirstChild(areaName)
+		if buildArea then
+			monitorBuildArea(buildArea)
+		end
+	end
+
+	-- Monitor new build areas
+	workspace.ChildAdded:Connect(function(child)
+		if string.find(child.Name, GridConfig.BUILD_AREA_PREFIX) then
+			monitorBuildArea(child)
+		end
+	end)
+
+	-- Monitor MegaPlot
+	local function setupMegaPlotMonitoring(megaPlotRoom)
+		local megaBuildArea = megaPlotRoom:FindFirstChild("MegaPlotBuildArea")
+		if megaBuildArea then
+			monitorBuildArea(megaBuildArea)
+		end
+		megaPlotRoom.ChildAdded:Connect(function(child)
+			if child.Name == "MegaPlotBuildArea" then
+				task.wait(0.5)
+				monitorBuildArea(child)
+			end
+		end)
+	end
+
+	local megaPlotRoom = workspace:FindFirstChild("MegaPlotRoom")
+	if megaPlotRoom then
+		setupMegaPlotMonitoring(megaPlotRoom)
+	end
+	workspace.ChildAdded:Connect(function(child)
+		if child.Name == "MegaPlotRoom" then
+			setupMegaPlotMonitoring(child)
+		end
+	end)
+
+	print("[SnowyGrass] SnowyGrassManager initialized")
+end
+
+-- Expose for external use if needed
+function SnowyGrassManager.GetConfig()
+	return CONFIG
+end
+
+return SnowyGrassManager

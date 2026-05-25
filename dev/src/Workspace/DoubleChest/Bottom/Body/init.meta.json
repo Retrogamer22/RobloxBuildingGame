@@ -1,0 +1,12 @@
+{
+  "className": "UnionOperation",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [-18.7955, 1.8972, 427.8401, 1, 0, 0, 0, 1.0, 0, 0, 0, 1.0],
+    "Color": [163, 162, 165],
+    "Material": "WoodPlanks",
+    "MaterialVariant": "PixelWoodPlanksSeperated",
+    "Size": [5.6972, 1.794, 2.698],
+    "UsePartColor": true
+  }
+}

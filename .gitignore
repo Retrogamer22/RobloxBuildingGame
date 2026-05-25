@@ -1,0 +1,18 @@
+# Argon / Rojo generated
+sourcemap.json
+*.rbxlx.lock
+*.rbxl.lock
+
+# Roblox place files (binary, not mergeable — published via Studio)
+*.rbxl
+*.rbxlx
+
+# Build output
+*.rbxm
+*.rbxmx
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+*.log

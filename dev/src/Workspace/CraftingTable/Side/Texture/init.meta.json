@@ -1,0 +1,8 @@
+{
+  "className": "Texture",
+  "properties": {
+    "StudsPerTileU": 3,
+    "StudsPerTileV": 3,
+    "TextureContent": "rbxassetid://109812729154380"
+  }
+}

@@ -1,0 +1,131 @@
+{
+  "accessors": [
+    {
+      "name": "INDEX",
+      "bufferView": 0,
+      "componentType": 5125,
+      "type": "SCALAR",
+      "count": 96
+    },
+    {
+      "name": "POSITION",
+      "bufferView": 1,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 70
+    },
+    {
+      "name": "NORMAL",
+      "bufferView": 2,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 70
+    },
+    {
+      "name": "TEXCOORD_0",
+      "bufferView": 3,
+      "componentType": 5126,
+      "type": "VEC2",
+      "count": 70
+    },
+    {
+      "name": "COLOR_0",
+      "bufferView": 4,
+      "componentType": 5121,
+      "type": "VEC4",
+      "normalized": true,
+      "count": 70
+    }
+  ],
+  "asset": {
+    "generator": "Roblox Export",
+    "version": "2.0",
+    "min_version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "name": "INDEX",
+      "buffer": 0,
+      "byteLength": 384
+    },
+    {
+      "name": "POSITION",
+      "buffer": 1,
+      "byteLength": 840
+    },
+    {
+      "name": "NORMAL",
+      "buffer": 2,
+      "byteLength": 840
+    },
+    {
+      "name": "TEXCOORD_0",
+      "buffer": 3,
+      "byteLength": 560
+    },
+    {
+      "name": "COLOR_0",
+      "buffer": 4,
+      "byteLength": 280
+    }
+  ],
+  "buffers": [
+    {
+      "name": "INDEX",
+      "uri": "data:application/octet-stream;base64,AAAAAAEAAAACAAAAAwAAAAQAAAAFAAAABgAAAAAAAAAHAAAACAAAAAkAAAAKAAAAAAAAAAYAAAALAAAADAAAAAYAAAANAAAADgAAAA8AAAAQAAAAEQAAABIAAAATAAAAFAAAAAMAAAAVAAAAFgAAABcAAAAYAAAAGQAAABUAAAADAAAAFQAAABoAAAAbAAAAFgAAABwAAAAdAAAAHgAAAB8AAAAgAAAAHAAAAAkAAAAhAAAAIgAAABAAAAAPAAAAIwAAAB8AAAAeAAAAJAAAACUAAAAmAAAAJwAAABMAAAAoAAAAKAAAACQAAAApAAAAKgAAACsAAAAsAAAALAAAACsAAAAtAAAALgAAAC8AAAAwAAAAMQAAADIAAAAzAAAAMgAAADQAAAA1AAAANgAAADcAAAA4AAAAOQAAAC8AAAA6AAAANwAAADYAAAA7AAAAPAAAAD0AAAA+AAAAPwAAAD4AAABAAAAAQQAAAEIAAABDAAAAQgAAAEQAAABFAAAA",
+      "byteLength": 384
+    },
+    {
+      "name": "POSITION",
+      "uri": "data:application/octet-stream;base64,9v//vquqqjQAAAC/9v//vgAAAL8AAAC/6///vvb//74AAAAA9v//vgAAAL8AAAC/9v//vquqqjQAAAC/q6qqNKuqqjQAAAC/AAAAv/b//74AAAA/6///vvb//74AAAAAq6qqNPb//74AAAAAAAAAv/b//74AAAA/6///vvb//74AAAAA9v//vquqqjQAAAAA9v//vquqqjQAAAAAAAAAv6uqqjQAAAA/AAAAv/b//74AAAA/AAAAP/b//74AAAA/AAAAv6uqqjQAAAA/AAAAAKuqqjQAAAAA9v//vquqqjQAAAAAAAAAv6uqqjQAAAA/q6qqNAAAAL8AAAC/AAAAP6uqqjQAAAC/AAAAP/b//74AAAC/q6qqNPb//74AAAAAq6qqNAAAAL8AAAC/q6qqNKuqqjQAAAC/AAAAP/b//74AAAC/q6qqNAAAAL8AAAC/AAAAP/b//74AAAA/q6qqNPb//74AAAAAAAAAP6uqqjQAAAA/AAAAP/b//74AAAC/AAAAP6uqqjQAAAC/q6qqNPb//74AAAAAAAAAP6uqqjQAAAA/AAAAP/b//74AAAA/AAAAP6uqqjQAAAC/q6qqNKuqqjQAAAC/AAAAAKuqqjQAAAAAAAAAAKuqqjQAAAAAAAAAP6uqqjQAAAA/AAAAAKuqqjQAAAAA6///vvb//74AAAAA9v//vgAAAL8AAAC/q6qqNPb//74AAAAAq6qqNAAAAL8AAAC/9v//vquqqjQAAAC/9v//vgAAAD8AAAC/q6qqNKuqqjQAAAC/9v//vquqqjQAAAAA9v//vgAAAD8AAAAA9v//vquqqjQAAAC/9v//vgAAAD8AAAC/9v//vquqqjQAAAC/9v//vgAAAD8AAAAAq6qqNAAAAD8AAAC/9v//vgAAAD8AAAC/q6qqNKuqqjQAAAC/q6qqNAAAAD8AAAC/q6qqNAAAAD8AAAAA9v//vgAAAD8AAAAA9v//vquqqjQAAAAAq6qqNAAAAD8AAAAAAAAAAKuqqjQAAAAA9v//vquqqjQAAAAAq6qqNKuqqjQAAAC/q6qqNAAAAD8AAAC/AAAAAKuqqjQAAAAAq6qqNAAAAD8AAAAAAAAAAKuqqjQAAAAA",
+      "byteLength": 840
+    },
+    {
+      "name": "NORMAL",
+      "uri": "data:application/octet-stream;base64,AACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAA",
+      "byteLength": 840
+    },
+    {
+      "name": "TEXCOORD_0",
+      "uri": "data:application/octet-stream;base64,AADAvwAAgLUAAMC/AADAPwAAAAD4/78/+P+/PwAAwD/4/78/AACAtQAAgLUAAIC1AADAP/j/vz8AAAAA+P+/PwAAgDUAAACAAADAvwAAwL/w/7+/AAAAgAAAAAAAAIC1AAAAAAAAgLUAAMA/AACAtQAAwL/4/78/AADAP/j/vz8AAMC/AACAtQAAAIAAAACA+P+/PwAAAIAAAMA/AADAvwAAgLUAAMA/AADAvwAAgLUAAMA/AADAPwAAgDUAAACAAACANQAAwD8AAIC1AACAtQAAwL/4/78/AACAtQAAwD8AAMA/AADAvwAAgDUAAACAAADAvwAAgLUAAMA/+P+/PwAAwD8AAIC1AACANQAAAIAAAMA/AACAtQAAwL/4/78/AADAvwAAwD8AAIC1AADAPwAAAIAAAACAAAAAgAAAAIAAAMC/AADAvwAAAIAAAACA8P+/vwAAAID4/7+/AADAPwAAgDUAAACAAACANQAAwD/4/78/AACAtfj/vz8AAMC/AACAtQAAgLUAAAAAAACAtQAAAAAAAMC/AADAvwAAgLUAAMC/AADAvwAAwL8AAIC1+P+/PwAAAIAAAIC1AADAP/j/vz8AAMA/AACAtQAAgLUAAIC1AADAvwAAgLUAAACA+P+/vwAAwL/4/7+/AACAtQAAgDUAAMC/AAAAAAAAgLX4/7+/AACAtQAAwD8AAIC1AADAPwAAwL8AAACAAACAtQAAAIAAAMC/AAAAgAAAgLU=",
+      "byteLength": 560
+    },
+    {
+      "name": "COLOR_0",
+      "uri": "data:application/octet-stream;base64,o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/w==",
+      "byteLength": 280
+    }
+  ],
+  "meshes": [
+    {
+      "name": "StairOuterCorner",
+      "primitives": [
+        {
+          "indices": 0,
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2,
+            "TEXCOORD_0": 3,
+            "COLOR_0": 4
+          }
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "children": [ ],
+      "mesh": 0,
+      "name": "StairOuterCorner",
+      "translation": [68.9999771, 2.50000381, 427.90033],
+      "scale": [3, 3, 3],
+      "extras": {"RobloxInstanceType":"UnionOperation","RobloxUniqueId":"473c140d-98a5-e508-0a1e-1cf40004fa7b","Material":"plastic","Color":"(163, 162, 165)","Transparency":0,"Anchored":true,"UsePartColor":false}
+    }
+  ],
+  "scenes": [
+    {
+      "nodes": [ 0 ]
+    }
+  ]
+}
+

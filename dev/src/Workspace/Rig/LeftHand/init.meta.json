@@ -1,0 +1,10 @@
+{
+  "className": "MeshPart",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [28.4156, -10.0979, -61.8843, 1.0, 0, 0, 0, 1.0, 0, 0, 0, 1],
+    "CanCollide": false,
+    "PivotOffset": [0.6844, 0.1858, 0, 1, 0, 0, 0, 0, -1, 0, 1, 0],
+    "Size": [0.4301, 0.4776, 0.4339]
+  }
+}

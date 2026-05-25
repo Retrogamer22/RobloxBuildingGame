@@ -1,0 +1,7 @@
+{
+  "className": "HumanoidDescription",
+  "properties": {
+    "BodyTypeScale": 1,
+    "ProportionScale": 0
+  }
+}

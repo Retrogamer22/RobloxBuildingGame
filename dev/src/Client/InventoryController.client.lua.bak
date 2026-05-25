@@ -1,0 +1,736 @@
+--[[
+	InventoryController
+	Minecraft-style inventory with templates
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local BlockShapes = require(ReplicatedStorage:WaitForChild("BlockShapes"))
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- State
+local CurrentSlot = 1
+local CurrentRotation = 0
+local InventoryOpen = false
+
+-- Hotbar: each slot holds { ShapeId, Material, Color } or nil
+local Hotbar = {}
+for i = 1, 9 do
+	Hotbar[i] = nil
+end
+
+-- Configuring block
+local ConfiguringShape = nil
+local ConfiguringMaterial = Enum.Material.Plastic
+local ConfiguringColor = Color3.fromRGB(163, 162, 165)
+
+-- UI References
+local ScreenGui = nil
+local HotbarFrame = nil
+local SlotFrames = {}
+local SelectionFrame = nil
+local BlockNameLabel = nil
+local InventoryPanel = nil
+local CustomizerPanel = nil
+
+--====================--
+--    FUNCTIONS       --
+--====================--
+
+local function updateSelection()
+	if SelectionFrame then
+		local xPos = 8 + (CurrentSlot - 1) * 52
+		TweenService:Create(SelectionFrame, TweenInfo.new(0.1), {
+			Position = UDim2.new(0, xPos, 0.5, -26)
+		}):Play()
+	end
+	
+	local data = Hotbar[CurrentSlot]
+	if BlockNameLabel then
+		if data then
+			local shape = BlockShapes.GetShape(data.ShapeId)
+			BlockNameLabel.Text = shape and shape.Name or ""
+		else
+			BlockNameLabel.Text = "Empty"
+		end
+	end
+end
+
+local function selectSlot(slotNumber)
+	CurrentSlot = slotNumber
+	updateSelection()
+end
+
+local function updateHotbarSlot(slotNumber)
+	local slot = SlotFrames[slotNumber]
+	if not slot then return end
+	
+	local preview = slot:FindFirstChild("Preview")
+	if not preview then return end
+	
+	local data = Hotbar[slotNumber]
+	
+	if data then
+		preview.BackgroundTransparency = 0
+		preview.BackgroundColor3 = data.Color
+		
+		if data.ShapeId == "Slab" then
+			preview.Size = UDim2.new(0, 28, 0, 14)
+		elseif data.ShapeId == "Stair" or data.ShapeId == "StairInnerCorner" or data.ShapeId == "StairOuterCorner" then
+			preview.Size = UDim2.new(0, 28, 0, 20)
+		else
+			preview.Size = UDim2.new(0, 28, 0, 28)
+		end
+	else
+		preview.BackgroundTransparency = 1
+	end
+end
+
+local function updateCustomizerPreview()
+	if not CustomizerPanel then return end
+	
+	local previewFrame = CustomizerPanel:FindFirstChild("PreviewFrame")
+	if not previewFrame then return end
+	
+	local blockPreview = previewFrame:FindFirstChild("BlockPreview")
+	if blockPreview then
+		blockPreview.BackgroundColor3 = ConfiguringColor
+		
+		if ConfiguringShape == "Slab" then
+			blockPreview.Size = UDim2.new(0, 40, 0, 20)
+		elseif ConfiguringShape == "Stair" or ConfiguringShape == "StairInnerCorner" or ConfiguringShape == "StairOuterCorner" then
+			blockPreview.Size = UDim2.new(0, 40, 0, 30)
+		else
+			blockPreview.Size = UDim2.new(0, 40, 0, 40)
+		end
+	end
+end
+
+local function selectShape(shapeId)
+	ConfiguringShape = shapeId
+	ConfiguringMaterial = Enum.Material.Plastic
+	ConfiguringColor = Color3.fromRGB(163, 162, 165)
+	
+	if CustomizerPanel then
+		CustomizerPanel.Visible = true
+		updateCustomizerPreview()
+		
+		local label = CustomizerPanel:FindFirstChild("Label")
+		local shape = BlockShapes.GetShape(shapeId)
+		if label and shape then
+			label.Text = "Customize: " .. shape.Name
+		end
+	end
+end
+
+local function selectColor(color)
+	ConfiguringColor = color
+	updateCustomizerPreview()
+end
+
+local function selectMaterial(material)
+	ConfiguringMaterial = material
+	updateCustomizerPreview()
+end
+
+local function addToHotbar(slotNumber)
+	if not ConfiguringShape then return end
+	
+	Hotbar[slotNumber] = {
+		ShapeId = ConfiguringShape,
+		Material = ConfiguringMaterial,
+		Color = ConfiguringColor,
+	}
+	
+	updateHotbarSlot(slotNumber)
+	
+	local slot = SlotFrames[slotNumber]
+	if slot then
+		local originalColor = slot.BackgroundColor3
+		slot.BackgroundColor3 = Color3.fromRGB(100, 255, 100)
+		task.delay(0.2, function()
+			TweenService:Create(slot, TweenInfo.new(0.3), {BackgroundColor3 = originalColor}):Play()
+		end)
+	end
+end
+
+local function openInventory()
+	if InventoryPanel then
+		InventoryPanel.Visible = true
+		InventoryOpen = true
+		ConfiguringShape = nil
+		if CustomizerPanel then
+			CustomizerPanel.Visible = false
+		end
+	end
+end
+
+local function closeInventory()
+	if InventoryPanel then
+		InventoryPanel.Visible = false
+		InventoryOpen = false
+	end
+end
+
+local function toggleInventory()
+	if InventoryOpen then
+		closeInventory()
+	else
+		openInventory()
+	end
+end
+
+local function getSelectedBlock()
+	local data = Hotbar[CurrentSlot]
+	if not data then return nil end
+	
+	local shape = BlockShapes.GetShape(data.ShapeId)
+	if not shape then return nil end
+	
+	return {
+		Id = data.ShapeId,
+		Name = shape.Name,
+		TemplateName = shape.TemplateName,
+		Offset = shape.Offset,
+		CanRotate = shape.CanRotate,
+		Material = data.Material,
+		Color = data.Color,
+	}
+end
+
+local function rotateBlock()
+	local data = Hotbar[CurrentSlot]
+	if not data then return end
+	
+	local shape = BlockShapes.GetShape(data.ShapeId)
+	if shape and shape.CanRotate then
+		CurrentRotation = (CurrentRotation + 90) % 360
+		print("Rotation: " .. CurrentRotation)
+	end
+end
+
+--====================--
+--    HOTBAR UI       --
+--====================--
+
+local function createHotbarSlot(slotNumber)
+	local slot = Instance.new("TextButton")
+	slot.Name = "Slot" .. slotNumber
+	slot.Size = UDim2.new(0, 46, 0, 46)
+	slot.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+	slot.BorderSizePixel = 0
+	slot.Text = ""
+	slot.AutoButtonColor = false
+	
+	local slotCorner = Instance.new("UICorner")
+	slotCorner.CornerRadius = UDim.new(0, 6)
+	slotCorner.Parent = slot
+	
+	local numLabel = Instance.new("TextLabel")
+	numLabel.Name = "Number"
+	numLabel.Position = UDim2.new(0, 3, 0, 2)
+	numLabel.Size = UDim2.new(0, 14, 0, 14)
+	numLabel.BackgroundTransparency = 1
+	numLabel.Text = tostring(slotNumber)
+	numLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+	numLabel.TextSize = 11
+	numLabel.Font = Enum.Font.GothamBold
+	numLabel.Parent = slot
+	
+	local preview = Instance.new("Frame")
+	preview.Name = "Preview"
+	preview.AnchorPoint = Vector2.new(0.5, 0.5)
+	preview.Position = UDim2.new(0.5, 0, 0.55, 0)
+	preview.Size = UDim2.new(0, 28, 0, 28)
+	preview.BackgroundTransparency = 1
+	preview.BorderSizePixel = 0
+	preview.Parent = slot
+	
+	local previewCorner = Instance.new("UICorner")
+	previewCorner.CornerRadius = UDim.new(0, 4)
+	previewCorner.Parent = preview
+	
+	slot.MouseButton1Click:Connect(function()
+		selectSlot(slotNumber)
+	end)
+	
+	return slot
+end
+
+local function createHotbarUI()
+	ScreenGui = Instance.new("ScreenGui")
+	ScreenGui.Name = "InventoryGui"
+	ScreenGui.ResetOnSpawn = false
+	ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	ScreenGui.Parent = PlayerGui
+	
+	HotbarFrame = Instance.new("Frame")
+	HotbarFrame.Name = "Hotbar"
+	HotbarFrame.AnchorPoint = Vector2.new(0.5, 1)
+	HotbarFrame.Position = UDim2.new(0.5, 0, 1, -20)
+	HotbarFrame.Size = UDim2.new(0, 470, 0, 60)
+	HotbarFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	HotbarFrame.BackgroundTransparency = 0.3
+	HotbarFrame.BorderSizePixel = 0
+	HotbarFrame.Parent = ScreenGui
+	
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = HotbarFrame
+	
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.VerticalAlignment = Enum.VerticalAlignment.Center
+	layout.Padding = UDim.new(0, 6)
+	layout.Parent = HotbarFrame
+	
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 8)
+	padding.PaddingRight = UDim.new(0, 8)
+	padding.Parent = HotbarFrame
+	
+	for i = 1, 9 do
+		local slot = createHotbarSlot(i)
+		slot.Parent = HotbarFrame
+		SlotFrames[i] = slot
+	end
+	
+	SelectionFrame = Instance.new("Frame")
+	SelectionFrame.Name = "Selection"
+	SelectionFrame.Size = UDim2.new(0, 52, 0, 52)
+	SelectionFrame.Position = UDim2.new(0, 5, 0.5, -26)
+	SelectionFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	SelectionFrame.BackgroundTransparency = 0.7
+	SelectionFrame.BorderSizePixel = 0
+	SelectionFrame.ZIndex = 0
+	SelectionFrame.Parent = HotbarFrame
+	
+	local selCorner = Instance.new("UICorner")
+	selCorner.CornerRadius = UDim.new(0, 8)
+	selCorner.Parent = SelectionFrame
+	
+	BlockNameLabel = Instance.new("TextLabel")
+	BlockNameLabel.Name = "BlockName"
+	BlockNameLabel.AnchorPoint = Vector2.new(0.5, 1)
+	BlockNameLabel.Position = UDim2.new(0.5, 0, 0, -5)
+	BlockNameLabel.Size = UDim2.new(0, 200, 0, 20)
+	BlockNameLabel.BackgroundTransparency = 1
+	BlockNameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	BlockNameLabel.TextSize = 14
+	BlockNameLabel.Font = Enum.Font.GothamBold
+	BlockNameLabel.TextStrokeTransparency = 0.5
+	BlockNameLabel.Text = "Empty"
+	BlockNameLabel.Parent = HotbarFrame
+	
+	local hintLabel = Instance.new("TextLabel")
+	hintLabel.Name = "Hint"
+	hintLabel.AnchorPoint = Vector2.new(0.5, 0)
+	hintLabel.Position = UDim2.new(0.5, 0, 1, 5)
+	hintLabel.Size = UDim2.new(0, 200, 0, 16)
+	hintLabel.BackgroundTransparency = 1
+	hintLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+	hintLabel.TextSize = 12
+	hintLabel.Font = Enum.Font.Gotham
+	hintLabel.TextStrokeTransparency = 0.7
+	hintLabel.Text = "Press E to open inventory"
+	hintLabel.Parent = HotbarFrame
+	
+	updateSelection()
+end
+
+--====================--
+--   INVENTORY UI     --
+--====================--
+
+local function createShapesPanel()
+	local shapesPanel = Instance.new("Frame")
+	shapesPanel.Name = "ShapesPanel"
+	shapesPanel.Position = UDim2.new(0, 20, 0, 60)
+	shapesPanel.Size = UDim2.new(1, -40, 0, 120)
+	shapesPanel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	shapesPanel.BorderSizePixel = 0
+	shapesPanel.Parent = InventoryPanel
+	
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 8)
+	panelCorner.Parent = shapesPanel
+	
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Position = UDim2.new(0, 10, 0, 8)
+	label.Size = UDim2.new(1, -20, 0, 20)
+	label.BackgroundTransparency = 1
+	label.Text = "Select Shape"
+	label.TextColor3 = Color3.fromRGB(200, 200, 200)
+	label.TextSize = 14
+	label.Font = Enum.Font.GothamBold
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = shapesPanel
+	
+	local container = Instance.new("Frame")
+	container.Name = "Shapes"
+	container.Position = UDim2.new(0, 10, 0, 35)
+	container.Size = UDim2.new(1, -20, 1, -45)
+	container.BackgroundTransparency = 1
+	container.Parent = shapesPanel
+	
+	local gridLayout = Instance.new("UIGridLayout")
+	gridLayout.CellSize = UDim2.new(0, 70, 0, 70)
+	gridLayout.CellPadding = UDim2.new(0, 8, 0, 8)
+	gridLayout.Parent = container
+	
+	for _, shape in ipairs(BlockShapes.GetAllShapes()) do
+		local btn = Instance.new("TextButton")
+		btn.Name = shape.Id
+		btn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+		btn.BorderSizePixel = 0
+		btn.Text = ""
+		btn.AutoButtonColor = false
+		btn.Parent = container
+		
+		local btnCorner = Instance.new("UICorner")
+		btnCorner.CornerRadius = UDim.new(0, 6)
+		btnCorner.Parent = btn
+		
+		local preview = Instance.new("Frame")
+		preview.Name = "Preview"
+		preview.AnchorPoint = Vector2.new(0.5, 0.5)
+		preview.Position = UDim2.new(0.5, 0, 0.4, 0)
+		preview.BackgroundColor3 = Color3.fromRGB(163, 162, 165)
+		preview.BorderSizePixel = 0
+		preview.Parent = btn
+		
+		local previewCorner = Instance.new("UICorner")
+		previewCorner.CornerRadius = UDim.new(0, 4)
+		previewCorner.Parent = preview
+		
+		if shape.Id == "Slab" then
+			preview.Size = UDim2.new(0, 32, 0, 16)
+		elseif shape.Id == "Stair" or shape.Id == "StairInnerCorner" or shape.Id == "StairOuterCorner" then
+			preview.Size = UDim2.new(0, 32, 0, 24)
+		else
+			preview.Size = UDim2.new(0, 32, 0, 32)
+		end
+		
+		local nameLabel = Instance.new("TextLabel")
+		nameLabel.Name = "Name"
+		nameLabel.Position = UDim2.new(0, 2, 1, -16)
+		nameLabel.Size = UDim2.new(1, -4, 0, 14)
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.Text = shape.Name
+		nameLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+		nameLabel.TextSize = 9
+		nameLabel.Font = Enum.Font.Gotham
+		nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+		nameLabel.Parent = btn
+		
+		btn.MouseButton1Click:Connect(function()
+			selectShape(shape.Id)
+		end)
+		
+		btn.MouseEnter:Connect(function()
+			TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = Color3.fromRGB(80, 80, 80)}):Play()
+		end)
+		
+		btn.MouseLeave:Connect(function()
+			TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = Color3.fromRGB(60, 60, 60)}):Play()
+		end)
+	end
+end
+
+local function createCustomizerPanel()
+	CustomizerPanel = Instance.new("Frame")
+	CustomizerPanel.Name = "CustomizerPanel"
+	CustomizerPanel.Position = UDim2.new(0, 20, 0, 190)
+	CustomizerPanel.Size = UDim2.new(1, -40, 0, 200)
+	CustomizerPanel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	CustomizerPanel.BorderSizePixel = 0
+	CustomizerPanel.Visible = false
+	CustomizerPanel.Parent = InventoryPanel
+	
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 8)
+	panelCorner.Parent = CustomizerPanel
+	
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Position = UDim2.new(0, 10, 0, 8)
+	label.Size = UDim2.new(0.5, -20, 0, 20)
+	label.BackgroundTransparency = 1
+	label.Text = "Customize Block"
+	label.TextColor3 = Color3.fromRGB(200, 200, 200)
+	label.TextSize = 14
+	label.Font = Enum.Font.GothamBold
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = CustomizerPanel
+	
+	-- Preview
+	local previewFrame = Instance.new("Frame")
+	previewFrame.Name = "PreviewFrame"
+	previewFrame.Position = UDim2.new(0, 10, 0, 35)
+	previewFrame.Size = UDim2.new(0, 60, 0, 60)
+	previewFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+	previewFrame.BorderSizePixel = 0
+	previewFrame.Parent = CustomizerPanel
+	
+	local previewCorner = Instance.new("UICorner")
+	previewCorner.CornerRadius = UDim.new(0, 6)
+	previewCorner.Parent = previewFrame
+	
+	local blockPreview = Instance.new("Frame")
+	blockPreview.Name = "BlockPreview"
+	blockPreview.AnchorPoint = Vector2.new(0.5, 0.5)
+	blockPreview.Position = UDim2.new(0.5, 0, 0.5, 0)
+	blockPreview.Size = UDim2.new(0, 40, 0, 40)
+	blockPreview.BackgroundColor3 = ConfiguringColor
+	blockPreview.BorderSizePixel = 0
+	blockPreview.Parent = previewFrame
+	
+	local blockPreviewCorner = Instance.new("UICorner")
+	blockPreviewCorner.CornerRadius = UDim.new(0, 4)
+	blockPreviewCorner.Parent = blockPreview
+	
+	-- Colors
+	local colorsLabel = Instance.new("TextLabel")
+	colorsLabel.Position = UDim2.new(0, 85, 0, 30)
+	colorsLabel.Size = UDim2.new(0, 60, 0, 16)
+	colorsLabel.BackgroundTransparency = 1
+	colorsLabel.Text = "Color"
+	colorsLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+	colorsLabel.TextSize = 12
+	colorsLabel.Font = Enum.Font.GothamBold
+	colorsLabel.TextXAlignment = Enum.TextXAlignment.Left
+	colorsLabel.Parent = CustomizerPanel
+	
+	local colorsContainer = Instance.new("ScrollingFrame")
+	colorsContainer.Name = "Colors"
+	colorsContainer.Position = UDim2.new(0, 85, 0, 48)
+	colorsContainer.Size = UDim2.new(0, 360, 0, 48)
+	colorsContainer.BackgroundTransparency = 1
+	colorsContainer.BorderSizePixel = 0
+	colorsContainer.ScrollBarThickness = 4
+	colorsContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
+	colorsContainer.ScrollingDirection = Enum.ScrollingDirection.X
+	colorsContainer.Parent = CustomizerPanel
+	
+	local colorsLayout = Instance.new("UIListLayout")
+	colorsLayout.FillDirection = Enum.FillDirection.Horizontal
+	colorsLayout.Padding = UDim.new(0, 4)
+	colorsLayout.Parent = colorsContainer
+	
+	for i, color in ipairs(BlockShapes.GetAllColors()) do
+		local colorBtn = Instance.new("TextButton")
+		colorBtn.Name = "Color" .. i
+		colorBtn.Size = UDim2.new(0, 24, 0, 24)
+		colorBtn.BackgroundColor3 = color
+		colorBtn.BorderSizePixel = 0
+		colorBtn.Text = ""
+		colorBtn.Parent = colorsContainer
+		
+		local colorCorner = Instance.new("UICorner")
+		colorCorner.CornerRadius = UDim.new(0, 4)
+		colorCorner.Parent = colorBtn
+		
+		colorBtn.MouseButton1Click:Connect(function()
+			selectColor(color)
+		end)
+	end
+	
+	-- Materials
+	local matsLabel = Instance.new("TextLabel")
+	matsLabel.Position = UDim2.new(0, 85, 0, 100)
+	matsLabel.Size = UDim2.new(0, 80, 0, 16)
+	matsLabel.BackgroundTransparency = 1
+	matsLabel.Text = "Material"
+	matsLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+	matsLabel.TextSize = 12
+	matsLabel.Font = Enum.Font.GothamBold
+	matsLabel.TextXAlignment = Enum.TextXAlignment.Left
+	matsLabel.Parent = CustomizerPanel
+	
+	local matsContainer = Instance.new("ScrollingFrame")
+	matsContainer.Name = "Materials"
+	matsContainer.Position = UDim2.new(0, 85, 0, 118)
+	matsContainer.Size = UDim2.new(0, 360, 0, 28)
+	matsContainer.BackgroundTransparency = 1
+	matsContainer.BorderSizePixel = 0
+	matsContainer.ScrollBarThickness = 4
+	matsContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
+	matsContainer.ScrollingDirection = Enum.ScrollingDirection.X
+	matsContainer.Parent = CustomizerPanel
+	
+	local matsLayout = Instance.new("UIListLayout")
+	matsLayout.FillDirection = Enum.FillDirection.Horizontal
+	matsLayout.Padding = UDim.new(0, 4)
+	matsLayout.Parent = matsContainer
+	
+	for _, mat in ipairs(BlockShapes.GetAllMaterials()) do
+		local matBtn = Instance.new("TextButton")
+		matBtn.Name = mat.Name
+		matBtn.Size = UDim2.new(0, 60, 0, 24)
+		matBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+		matBtn.BorderSizePixel = 0
+		matBtn.Text = string.sub(mat.Name, 1, 8)
+		matBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+		matBtn.TextSize = 10
+		matBtn.Font = Enum.Font.Gotham
+		matBtn.Parent = matsContainer
+		
+		local matCorner = Instance.new("UICorner")
+		matCorner.CornerRadius = UDim.new(0, 4)
+		matCorner.Parent = matBtn
+		
+		matBtn.MouseButton1Click:Connect(function()
+			selectMaterial(mat)
+		end)
+	end
+	
+	-- Add to hotbar
+	local addLabel = Instance.new("TextLabel")
+	addLabel.Position = UDim2.new(0, 10, 0, 155)
+	addLabel.Size = UDim2.new(1, -20, 0, 16)
+	addLabel.BackgroundTransparency = 1
+	addLabel.Text = "Click a slot to add:"
+	addLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+	addLabel.TextSize = 12
+	addLabel.Font = Enum.Font.Gotham
+	addLabel.TextXAlignment = Enum.TextXAlignment.Left
+	addLabel.Parent = CustomizerPanel
+	
+	local miniHotbar = Instance.new("Frame")
+	miniHotbar.Name = "MiniHotbar"
+	miniHotbar.Position = UDim2.new(0, 10, 0, 173)
+	miniHotbar.Size = UDim2.new(0, 320, 0, 28)
+	miniHotbar.BackgroundTransparency = 1
+	miniHotbar.Parent = CustomizerPanel
+	
+	local miniLayout = Instance.new("UIListLayout")
+	miniLayout.FillDirection = Enum.FillDirection.Horizontal
+	miniLayout.Padding = UDim.new(0, 4)
+	miniLayout.Parent = miniHotbar
+	
+	for i = 1, 9 do
+		local miniSlot = Instance.new("TextButton")
+		miniSlot.Name = "MiniSlot" .. i
+		miniSlot.Size = UDim2.new(0, 28, 0, 28)
+		miniSlot.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+		miniSlot.BorderSizePixel = 0
+		miniSlot.Text = tostring(i)
+		miniSlot.TextColor3 = Color3.fromRGB(150, 150, 150)
+		miniSlot.TextSize = 12
+		miniSlot.Font = Enum.Font.GothamBold
+		miniSlot.Parent = miniHotbar
+		
+		local miniCorner = Instance.new("UICorner")
+		miniCorner.CornerRadius = UDim.new(0, 4)
+		miniCorner.Parent = miniSlot
+		
+		miniSlot.MouseButton1Click:Connect(function()
+			addToHotbar(i)
+		end)
+	end
+end
+
+local function createInventoryUI()
+	InventoryPanel = Instance.new("Frame")
+	InventoryPanel.Name = "InventoryPanel"
+	InventoryPanel.AnchorPoint = Vector2.new(0.5, 0.5)
+	InventoryPanel.Position = UDim2.new(0.5, 0, 0.5, 0)
+	InventoryPanel.Size = UDim2.new(0, 500, 0, 410)
+	InventoryPanel.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+	InventoryPanel.BackgroundTransparency = 0.1
+	InventoryPanel.BorderSizePixel = 0
+	InventoryPanel.Visible = false
+	InventoryPanel.Parent = ScreenGui
+	
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 12)
+	panelCorner.Parent = InventoryPanel
+	
+	local title = Instance.new("TextLabel")
+	title.Position = UDim2.new(0, 20, 0, 15)
+	title.Size = UDim2.new(1, -80, 0, 30)
+	title.BackgroundTransparency = 1
+	title.Text = "Inventory"
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.TextSize = 22
+	title.Font = Enum.Font.GothamBold
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = InventoryPanel
+	
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Position = UDim2.new(1, -45, 0, 10)
+	closeBtn.Size = UDim2.new(0, 35, 0, 35)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+	closeBtn.BorderSizePixel = 0
+	closeBtn.Text = "X"
+	closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	closeBtn.TextSize = 18
+	closeBtn.Font = Enum.Font.GothamBold
+	closeBtn.Parent = InventoryPanel
+	
+	local closeBtnCorner = Instance.new("UICorner")
+	closeBtnCorner.CornerRadius = UDim.new(0, 6)
+	closeBtnCorner.Parent = closeBtn
+	
+	closeBtn.MouseButton1Click:Connect(closeInventory)
+	
+	createShapesPanel()
+	createCustomizerPanel()
+end
+
+--====================--
+--      INPUT         --
+--====================--
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	
+	if input.KeyCode == Enum.KeyCode.E then
+		toggleInventory()
+	elseif input.KeyCode == Enum.KeyCode.One then selectSlot(1)
+	elseif input.KeyCode == Enum.KeyCode.Two then selectSlot(2)
+	elseif input.KeyCode == Enum.KeyCode.Three then selectSlot(3)
+	elseif input.KeyCode == Enum.KeyCode.Four then selectSlot(4)
+	elseif input.KeyCode == Enum.KeyCode.Five then selectSlot(5)
+	elseif input.KeyCode == Enum.KeyCode.Six then selectSlot(6)
+	elseif input.KeyCode == Enum.KeyCode.Seven then selectSlot(7)
+	elseif input.KeyCode == Enum.KeyCode.Eight then selectSlot(8)
+	elseif input.KeyCode == Enum.KeyCode.Nine then selectSlot(9)
+	elseif input.KeyCode == Enum.KeyCode.R then rotateBlock()
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	
+	if input.UserInputType == Enum.UserInputType.MouseWheel then
+		local dir = input.Position.Z > 0 and -1 or 1
+		local newSlot = CurrentSlot + dir
+		if newSlot < 1 then newSlot = 9 end
+		if newSlot > 9 then newSlot = 1 end
+		selectSlot(newSlot)
+	end
+end)
+
+--====================--
+--       INIT         --
+--====================--
+
+createHotbarUI()
+createInventoryUI()
+
+_G.InventoryController = {
+	GetSelectedBlock = getSelectedBlock,
+	GetCurrentSlot = function() return CurrentSlot end,
+	GetRotation = function() return CurrentRotation end,
+	IsInventoryOpen = function() return InventoryOpen end,
+}
+
+print("InventoryController initialized")

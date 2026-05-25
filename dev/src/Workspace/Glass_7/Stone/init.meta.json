@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [46.6035, 8.9995, 461.4999, 0, 0, 1, 0, 1, 0, -1, 0, 0],
+    "Color": [198, 198, 198],
+    "Material": "Glass",
+    "PivotOffset": [0, -1.4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [0.1999, 2.8, 0.5],
+    "TopSurface": "Smooth",
+    "Transparency": 0.2
+  }
+}

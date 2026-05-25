@@ -1,0 +1,13 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [10.427, 1.55, 435.6547, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [38, 38, 39],
+    "Material": "WoodPlanks",
+    "MaterialVariant": "PixelWoodPlanksSeperated",
+    "Size": [0.1561, 0.3, 0.6291],
+    "TopSurface": "Smooth"
+  }
+}

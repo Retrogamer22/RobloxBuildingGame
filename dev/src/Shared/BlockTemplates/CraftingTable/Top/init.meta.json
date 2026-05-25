@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-23.8, 3.998, 427.9, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Material": "WoodPlanks",
+    "MaterialVariant": "PixelWoodPlanks",
+    "PivotOffset": [0, -0.0005, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [2.998, 0.001, 3],
+    "TopSurface": "Smooth",
+    "Transparency": 1
+  }
+}

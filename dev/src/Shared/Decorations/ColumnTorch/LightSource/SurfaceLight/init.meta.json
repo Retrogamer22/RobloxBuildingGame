@@ -1,0 +1,9 @@
+{
+  "className": "SurfaceLight",
+  "properties": {
+    "Angle": 180,
+    "Brightness": 1.5,
+    "Color": [1, 0.9176, 0.7098],
+    "Shadows": true
+  }
+}

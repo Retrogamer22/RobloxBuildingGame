@@ -1,0 +1,16 @@
+{
+  "className": "Lighting",
+  "properties": {
+    "Ambient": [0.6745, 0.6745, 0.6745],
+    "Attributes": {
+      "RBX_LightingCompatibilityMigrated": true,
+      "RBX_BackupExposureCompensation": 0,
+      "RBX_BackupBrightness": 1,
+      "RBX_LightingTechnologyUnifiedMigration": true,
+      "RBX_OriginalTechnologyOnFileLoad": 1
+    },
+    "EnvironmentDiffuseScale": 1,
+    "ShadowSoftness": 0.11
+  },
+  "keepUnknowns": true
+}

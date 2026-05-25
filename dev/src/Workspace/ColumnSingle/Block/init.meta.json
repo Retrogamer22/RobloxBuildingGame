@@ -1,0 +1,13 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-109.8, 2.4946, 473.8, 1, 0, 0, 0, 1.0, 0, 0, 0, 1.0],
+    "Color": [226, 225, 229],
+    "MaterialVariant": "PixelColumn",
+    "PivotOffset": [0, -0.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [2.2, 1.0, 2.2],
+    "TopSurface": "Smooth"
+  }
+}

@@ -1,0 +1,473 @@
+--[[
+	RewardsBookUI.client.luau
+	Rewards Book — shows all collectible reward blocks/items, with locked/unlocked states.
+	Currently a "Coming Soon" placeholder. Future versions will show silhouettes for
+	un-collected rewards and full block previews for collected ones.
+
+	Opens via:
+	  - Book button on right HUD strip (RewardsBookButtonGui)
+	  - Hotkey: B
+
+	Pattern: matches ShopUI (modal panel, blur, MC bevel theme, _G registration).
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ============================================
+-- CONFIG
+-- ============================================
+local IsMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+
+local FONT = Enum.Font.Arcade
+local BEVEL = 2
+
+local C = {
+	panelBg = Color3.fromRGB(24, 20, 20),
+	headerBg = Color3.fromRGB(50, 42, 42),
+	bevelHL = Color3.fromRGB(60, 54, 54),
+	bevelSH = Color3.fromRGB(14, 12, 12),
+
+	closeBtn = Color3.fromRGB(180, 50, 50),
+	closeBtnHover = Color3.fromRGB(210, 70, 70),
+	closeBtnPress = Color3.fromRGB(140, 35, 35),
+	closeBtnBevelHL = Color3.fromRGB(220, 100, 100),
+	closeBtnBevelSH = Color3.fromRGB(100, 30, 30),
+
+	textWhite = Color3.fromRGB(255, 255, 255),
+	textDim = Color3.fromRGB(170, 170, 170),
+	textMuted = Color3.fromRGB(110, 100, 95),
+
+	overlay = Color3.fromRGB(0, 0, 0),
+
+	-- Book colors (closed leather-bound look)
+	bookCover = Color3.fromRGB(120, 70, 35),
+	bookCoverDark = Color3.fromRGB(85, 50, 25),
+	bookCoverLight = Color3.fromRGB(150, 90, 50),
+	bookSpine = Color3.fromRGB(70, 40, 20),
+	bookPages = Color3.fromRGB(235, 220, 180),
+	bookPagesDark = Color3.fromRGB(190, 175, 140),
+	bookGold = Color3.fromRGB(220, 175, 60),
+}
+
+-- ============================================
+-- STATE
+-- ============================================
+local IsOpen = false
+
+_G.RewardsBookUI = {
+	IsOpen = function() return IsOpen end,
+	Open = nil,  -- assigned below
+	Close = nil, -- assigned below
+	Toggle = nil,-- assigned below
+}
+
+-- ============================================
+-- HELPERS
+-- ============================================
+local function addBevel(frame, hlColor, shColor, bevelSize)
+	local hl = hlColor or C.bevelHL
+	local sh = shColor or C.bevelSH
+	local b = bevelSize or BEVEL
+	local z = frame.ZIndex + 1
+	local top = Instance.new("Frame"); top.Name = "BT"; top.Size = UDim2.new(1, 0, 0, b)
+	top.BackgroundColor3 = hl; top.BorderSizePixel = 0; top.ZIndex = z; top.Parent = frame
+	local left = Instance.new("Frame"); left.Name = "BL"; left.Size = UDim2.new(0, b, 1, 0)
+	left.BackgroundColor3 = hl; left.BorderSizePixel = 0; left.ZIndex = z; left.Parent = frame
+	local bottom = Instance.new("Frame"); bottom.Name = "BB"; bottom.Size = UDim2.new(1, 0, 0, b)
+	bottom.Position = UDim2.new(0, 0, 1, -b)
+	bottom.BackgroundColor3 = sh; bottom.BorderSizePixel = 0; bottom.ZIndex = z; bottom.Parent = frame
+	local right = Instance.new("Frame"); right.Name = "BR"; right.Size = UDim2.new(0, b, 1, 0)
+	right.Position = UDim2.new(1, -b, 0, 0)
+	right.BackgroundColor3 = sh; right.BorderSizePixel = 0; right.ZIndex = z; right.Parent = frame
+	return {top = top, left = left, bottom = bottom, right = right}
+end
+
+local function setBevel(bv, hl, sh)
+	bv.top.BackgroundColor3 = hl; bv.left.BackgroundColor3 = hl
+	bv.bottom.BackgroundColor3 = sh; bv.right.BackgroundColor3 = sh
+end
+
+local function makeMCButton(props)
+	local btn = Instance.new("TextButton")
+	btn.Name = props.name or "MCButton"
+	btn.Size = props.size; btn.Position = props.position
+	if props.anchorPoint then btn.AnchorPoint = props.anchorPoint end
+	btn.BackgroundColor3 = props.color; btn.BorderSizePixel = 0
+	btn.Text = props.text or ""; btn.TextColor3 = props.textColor or C.textWhite
+	btn.Font = props.font or FONT; btn.TextSize = props.textSize or 14
+	btn.ZIndex = props.zIndex or 5; btn.AutoButtonColor = false
+	btn.Parent = props.parent
+	local bevels = addBevel(btn, props.bevelHL, props.bevelSH, nil)
+	btn.MouseEnter:Connect(function() btn.BackgroundColor3 = props.hoverColor or props.color end)
+	btn.MouseLeave:Connect(function()
+		btn.BackgroundColor3 = props.color; setBevel(bevels, props.bevelHL, props.bevelSH)
+	end)
+	btn.MouseButton1Down:Connect(function()
+		btn.BackgroundColor3 = props.pressColor or props.color; setBevel(bevels, props.bevelSH, props.bevelHL)
+	end)
+	btn.MouseButton1Up:Connect(function()
+		btn.BackgroundColor3 = props.hoverColor or props.color; setBevel(bevels, props.bevelHL, props.bevelSH)
+	end)
+	return btn, bevels
+end
+
+-- ============================================
+-- GUI
+-- ============================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "RewardsBookUI"; ScreenGui.ResetOnSpawn = false
+ScreenGui.DisplayOrder = 25; ScreenGui.IgnoreGuiInset = true
+ScreenGui.Enabled = false; ScreenGui.Parent = PlayerGui
+
+local Overlay = Instance.new("Frame")
+Overlay.Name = "Overlay"; Overlay.Size = UDim2.new(1, 0, 1, 0)
+Overlay.BackgroundColor3 = C.overlay; Overlay.BackgroundTransparency = 1
+Overlay.BorderSizePixel = 0; Overlay.ZIndex = 1; Overlay.Active = true
+Overlay.Parent = ScreenGui
+
+-- Panel
+local Panel = Instance.new("Frame")
+Panel.Name = "RewardsBookPanel"
+Panel.Size = UDim2.new(IsMobile and 0.9 or 0.6, 0, IsMobile and 0.8 or 0.7, 0)
+Panel.Position = UDim2.new(0.5, 0, 0.5, 0)
+Panel.AnchorPoint = Vector2.new(0.5, 0.5)
+Panel.BackgroundColor3 = C.panelBg; Panel.BackgroundTransparency = 0
+Panel.BorderSizePixel = 0; Panel.ZIndex = 2; Panel.Active = true
+Panel.Parent = ScreenGui
+addBevel(Panel)
+
+-- ============================================
+-- HEADER
+-- ============================================
+local HEADER_H = IsMobile and 40 or 50
+
+local Header = Instance.new("Frame")
+Header.Name = "Header"; Header.Size = UDim2.new(1, 0, 0, HEADER_H)
+Header.BackgroundColor3 = C.headerBg; Header.BorderSizePixel = 0
+Header.ZIndex = 3; Header.Parent = Panel
+addBevel(Header, C.bevelHL, C.bevelSH)
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -80, 1, 0); TitleLabel.Position = UDim2.new(0, 14, 0, 0)
+TitleLabel.BackgroundTransparency = 1; TitleLabel.Text = "??????"
+TitleLabel.TextColor3 = C.textWhite; TitleLabel.Font = FONT
+TitleLabel.TextSize = IsMobile and 20 or 26
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.ZIndex = 4; TitleLabel.Parent = Header
+
+-- Close button
+local CLOSE_SIZE = IsMobile and 36 or 38
+local CloseBtn = makeMCButton({
+	name = "CloseBtn", size = UDim2.new(0, CLOSE_SIZE, 0, CLOSE_SIZE),
+	position = UDim2.new(1, -CLOSE_SIZE - 6, 0.5, 0), anchorPoint = Vector2.new(0, 0.5),
+	color = C.closeBtn, hoverColor = C.closeBtnHover, pressColor = C.closeBtnPress,
+	bevelHL = C.closeBtnBevelHL, bevelSH = C.closeBtnBevelSH,
+	text = "X", textSize = IsMobile and 16 or 18,
+	zIndex = 4, parent = Header,
+})
+
+-- ============================================
+-- BODY: Coming Soon centerpiece
+-- ============================================
+local Body = Instance.new("Frame")
+Body.Name = "Body"
+Body.Size = UDim2.new(1, -16, 1, -HEADER_H - 12)
+Body.Position = UDim2.new(0, 8, 0, HEADER_H + 4)
+Body.BackgroundTransparency = 1
+Body.BorderSizePixel = 0
+Body.ZIndex = 3; Body.Parent = Panel
+
+-- Centered container so the book + text sit as a group
+local Center = Instance.new("Frame")
+Center.Name = "Center"
+Center.Size = UDim2.new(0, 260, 0, 280)
+Center.Position = UDim2.new(0.5, 0, 0.5, 0)
+Center.AnchorPoint = Vector2.new(0.5, 0.5)
+Center.BackgroundTransparency = 1
+Center.ZIndex = 4; Center.Parent = Body
+
+-- ============================================
+-- BOOK (built from Frames — closed leather-bound book)
+-- Sits in upper portion of Center, ~160x130
+-- ============================================
+local BookHolder = Instance.new("Frame")
+BookHolder.Name = "BookHolder"
+BookHolder.Size = UDim2.new(0, 160, 0, 130)
+BookHolder.Position = UDim2.new(0.5, 0, 0, 10)
+BookHolder.AnchorPoint = Vector2.new(0.5, 0)
+BookHolder.BackgroundTransparency = 1
+BookHolder.ZIndex = 4; BookHolder.Parent = Center
+
+-- Subtle drop shadow under the book
+local Shadow = Instance.new("Frame")
+Shadow.Name = "Shadow"
+Shadow.Size = UDim2.new(1, -10, 0, 10)
+Shadow.Position = UDim2.new(0.5, 0, 1, -2)
+Shadow.AnchorPoint = Vector2.new(0.5, 0)
+Shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+Shadow.BackgroundTransparency = 0.5
+Shadow.BorderSizePixel = 0
+Shadow.ZIndex = 4; Shadow.Parent = BookHolder
+
+-- Book body (cover)
+local Book = Instance.new("Frame")
+Book.Name = "Book"
+Book.Size = UDim2.new(1, 0, 1, 0)
+Book.BackgroundColor3 = C.bookCover
+Book.BorderSizePixel = 0
+Book.ZIndex = 5; Book.Parent = BookHolder
+addBevel(Book, C.bookCoverLight, C.bookCoverDark, 3)
+
+-- Spine (left edge, slightly darker vertical band)
+local Spine = Instance.new("Frame")
+Spine.Name = "Spine"
+Spine.Size = UDim2.new(0, 12, 1, 0)
+Spine.Position = UDim2.new(0, 0, 0, 0)
+Spine.BackgroundColor3 = C.bookSpine
+Spine.BorderSizePixel = 0
+Spine.ZIndex = 6; Spine.Parent = Book
+
+-- Two horizontal bands on the spine (decorative ridges)
+for i, yScale in ipairs({0.2, 0.8}) do
+	local band = Instance.new("Frame")
+	band.Name = "SpineBand" .. i
+	band.Size = UDim2.new(1, 0, 0, 4)
+	band.Position = UDim2.new(0, 0, yScale, -2)
+	band.BackgroundColor3 = C.bookCoverDark
+	band.BorderSizePixel = 0
+	band.ZIndex = 7; band.Parent = Spine
+end
+
+-- Pages peeking out on the right edge (cream stripe with horizontal lines)
+local Pages = Instance.new("Frame")
+Pages.Name = "Pages"
+Pages.Size = UDim2.new(0, 6, 1, -10)
+Pages.Position = UDim2.new(1, -6, 0.5, 0)
+Pages.AnchorPoint = Vector2.new(0, 0.5)
+Pages.BackgroundColor3 = C.bookPages
+Pages.BorderSizePixel = 0
+Pages.ZIndex = 7; Pages.Parent = Book
+
+-- Page line texture (a few darker stripes)
+for i = 1, 3 do
+	local line = Instance.new("Frame")
+	line.Size = UDim2.new(1, 0, 0, 1)
+	line.Position = UDim2.new(0, 0, i / 4, 0)
+	line.BackgroundColor3 = C.bookPagesDark
+	line.BorderSizePixel = 0
+	line.ZIndex = 8; line.Parent = Pages
+end
+
+-- Decorative gold border on the cover (inner rectangle)
+local GoldFrame = Instance.new("Frame")
+GoldFrame.Name = "GoldFrame"
+GoldFrame.Size = UDim2.new(1, -32, 1, -22)
+GoldFrame.Position = UDim2.new(0, 18, 0.5, 0)
+GoldFrame.AnchorPoint = Vector2.new(0, 0.5)
+GoldFrame.BackgroundTransparency = 1
+GoldFrame.BorderSizePixel = 0
+GoldFrame.ZIndex = 7; GoldFrame.Parent = Book
+
+local goldStroke = Instance.new("UIStroke")
+goldStroke.Color = C.bookGold
+goldStroke.Thickness = 2
+goldStroke.Transparency = 0.15
+goldStroke.Parent = GoldFrame
+
+-- Center emblem on the cover: a small star/diamond icon (rotated square)
+local Emblem = Instance.new("Frame")
+Emblem.Name = "Emblem"
+Emblem.Size = UDim2.new(0, 24, 0, 24)
+Emblem.Position = UDim2.new(0.5, 0, 0.5, 0)
+Emblem.AnchorPoint = Vector2.new(0.5, 0.5)
+Emblem.BackgroundColor3 = C.bookGold
+Emblem.BorderSizePixel = 0
+Emblem.Rotation = 45
+Emblem.ZIndex = 8; Emblem.Parent = GoldFrame
+
+local emblemInner = Instance.new("Frame")
+emblemInner.Size = UDim2.new(1, -8, 1, -8)
+emblemInner.Position = UDim2.new(0.5, 0, 0.5, 0)
+emblemInner.AnchorPoint = Vector2.new(0.5, 0.5)
+emblemInner.BackgroundColor3 = C.bookCover
+emblemInner.BorderSizePixel = 0
+emblemInner.ZIndex = 9; emblemInner.Parent = Emblem
+
+-- ============================================
+-- TEXT: Coming Soon
+-- ============================================
+local ComingSoonShadow = Instance.new("TextLabel")
+ComingSoonShadow.Name = "ComingSoonShadow"
+ComingSoonShadow.Size = UDim2.new(1, 0, 0, 36)
+ComingSoonShadow.Position = UDim2.new(0, 2, 0, 162)
+ComingSoonShadow.BackgroundTransparency = 1
+ComingSoonShadow.Text = "COMING SOON"
+ComingSoonShadow.TextColor3 = Color3.fromRGB(0, 0, 0)
+ComingSoonShadow.TextTransparency = 0.4
+ComingSoonShadow.Font = FONT
+ComingSoonShadow.TextSize = IsMobile and 24 or 28
+ComingSoonShadow.ZIndex = 4; ComingSoonShadow.Parent = Center
+
+local ComingSoon = Instance.new("TextLabel")
+ComingSoon.Name = "ComingSoon"
+ComingSoon.Size = UDim2.new(1, 0, 0, 36)
+ComingSoon.Position = UDim2.new(0, 0, 0, 160)
+ComingSoon.BackgroundTransparency = 1
+ComingSoon.Text = "COMING SOON"
+ComingSoon.TextColor3 = C.textWhite
+ComingSoon.Font = FONT
+ComingSoon.TextSize = IsMobile and 24 or 28
+ComingSoon.ZIndex = 5; ComingSoon.Parent = Center
+
+-- Subtle floating animation on the book
+task.spawn(function()
+	local startY = BookHolder.Position.Y.Offset
+	local t = 0
+	while BookHolder and BookHolder.Parent do
+		t = t + 0.03
+		BookHolder.Position = UDim2.new(0.5, 0, 0, startY + math.sin(t) * 4)
+		task.wait(0.03)
+	end
+end)
+
+-- ============================================
+-- OPEN / CLOSE
+-- ============================================
+local rewardsBlur = Instance.new("BlurEffect")
+rewardsBlur.Name = "RewardsBookBlur"
+rewardsBlur.Size = 0
+rewardsBlur.Enabled = false
+rewardsBlur.Parent = Lighting
+
+-- UIs to hide while the rewards book is open (matches ShopUI's set)
+local GAME_UIS_TO_HIDE = {
+	"InventoryGui",
+	"CrosshairGui",
+	"MainMenuButtonGui",
+	"CoinHUD",
+	"RewardsBookButtonGui",
+	"TipToastsGui",
+	"MobileControlsGui",
+	"LikesLeaderboardGui",
+	"FeedbackUI",
+	"ChatMonitorUI",
+}
+
+-- Roblox CoreGui elements to hide (built-in chat icon, etc.)
+local CORE_GUIS_TO_HIDE = {
+	Enum.CoreGuiType.Chat,
+}
+
+local function hideGameUIs()
+	for _, name in ipairs(GAME_UIS_TO_HIDE) do
+		local ui = PlayerGui:FindFirstChild(name)
+		if ui then ui.Enabled = false end
+	end
+	for _, coreType in ipairs(CORE_GUIS_TO_HIDE) do
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(coreType, false)
+		end)
+	end
+end
+
+local function showGameUIs()
+	for _, name in ipairs(GAME_UIS_TO_HIDE) do
+		local ui = PlayerGui:FindFirstChild(name)
+		if ui then ui.Enabled = true end
+	end
+	for _, coreType in ipairs(CORE_GUIS_TO_HIDE) do
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(coreType, true)
+		end)
+	end
+end
+
+local function openBook()
+	if IsOpen then return end
+	-- Block opening on title screen
+	if _G.CameraController and _G.CameraController.IsGameStarted and not _G.CameraController.IsGameStarted() then return end
+	-- Block opening if any other modal is up
+	if _G.ShopUI and _G.ShopUI.IsOpen and _G.ShopUI.IsOpen() then return end
+	if _G.DailyRewardsUI and _G.DailyRewardsUI.IsOpen and _G.DailyRewardsUI.IsOpen() then return end
+
+	print("[RewardsBookUI] Opening")
+	IsOpen = true
+
+	hideGameUIs()
+
+	rewardsBlur.Size = 0; rewardsBlur.Enabled = true
+	TweenService:Create(rewardsBlur, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = 20,
+	}):Play()
+
+	local fullSize = Panel.Size
+	local sx, sy = fullSize.X.Scale, fullSize.Y.Scale
+
+	ScreenGui.Enabled = true
+	Panel.Size = UDim2.new(sx * 0.85, 0, sy * 0.85, 0)
+	Overlay.BackgroundTransparency = 1
+	TweenService:Create(Panel, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Size = fullSize,
+	}):Play()
+	TweenService:Create(Overlay, TweenInfo.new(0.2), { BackgroundTransparency = 0.4 }):Play()
+end
+
+local function closeBook()
+	if not IsOpen then return end
+	print("[RewardsBookUI] Closing")
+	IsOpen = false
+
+	TweenService:Create(rewardsBlur, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Size = 0,
+	}):Play()
+
+	local fullSize = UDim2.new(IsMobile and 0.9 or 0.6, 0, IsMobile and 0.8 or 0.7, 0)
+	local sx, sy = fullSize.X.Scale, fullSize.Y.Scale
+	local tp = TweenService:Create(Panel, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Size = UDim2.new(sx * 0.92, 0, sy * 0.92, 0),
+	})
+	local to = TweenService:Create(Overlay, TweenInfo.new(0.15), { BackgroundTransparency = 1 })
+	tp:Play(); to:Play(); tp.Completed:Wait()
+	ScreenGui.Enabled = false
+	Panel.Size = fullSize
+	rewardsBlur.Enabled = false
+
+	showGameUIs()
+end
+
+local function toggleBook()
+	if IsOpen then closeBook() else openBook() end
+end
+
+CloseBtn.MouseButton1Click:Connect(closeBook)
+
+Overlay.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		closeBook()
+	end
+end)
+
+-- Hotkey: B
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.KeyCode == Enum.KeyCode.B then
+		local focused = UserInputService:GetFocusedTextBox()
+		if focused then return end
+		toggleBook()
+	end
+end)
+
+-- Public API
+_G.RewardsBookUI.Open = openBook
+_G.RewardsBookUI.Close = closeBook
+_G.RewardsBookUI.Toggle = toggleBook
+
+print("[RewardsBookUI] Initialized — Open via book button or B key")

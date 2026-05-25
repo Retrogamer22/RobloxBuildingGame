@@ -1,0 +1,11 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-3.8999, 2.8001, 288.45, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "PivotOffset": [0, 0, 0.15, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [1, 0.5999, 0.3],
+    "TopSurface": "Smooth"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "className": "UnionOperation",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [13, 3.85, 441.0501, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [38, 38, 39],
+    "Size": [0.3, 0.3, 0.8998]
+  }
+}

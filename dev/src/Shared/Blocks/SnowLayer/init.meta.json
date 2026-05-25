@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-30.4, 1.1875, 464.7, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [221, 221, 221],
+    "Material": "Ice",
+    "MaterialVariant": "PixelSnow",
+    "PivotOffset": [0, -0.1875, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [3, 0.375, 3],
+    "TopSurface": "Smooth"
+  }
+}

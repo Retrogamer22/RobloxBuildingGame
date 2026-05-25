@@ -1,0 +1,14 @@
+{
+  "className": "MeshPart",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [-27.7, 2.1445, 427.6624, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [29, 28, 29],
+    "DoubleSided": true,
+    "InitialSize": [600, 140.0001, 375],
+    "MeshContent": "rbxassetid://116049844390703",
+    "PivotOffset": [0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 1, 0],
+    "Size": [3, 0.7, 1.875],
+    "TextureContent": "rbxassetid://128875933879613"
+  }
+}

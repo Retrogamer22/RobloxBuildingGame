@@ -1,0 +1,45 @@
+{
+  "name": "BuildBlox-Dev",
+  "servePort": 8001,
+  "tree": {
+    "$className": "DataModel",
+    "Lighting": {
+      "$path": "src/Lighting"
+    },
+    "ReplicatedFirst": {
+      "$path": "src/ReplicatedFirst"
+    },
+    "ReplicatedStorage": {
+      "$path": "src/Shared"
+    },
+    "ServerScriptService": {
+      "$path": "src/Server"
+    },
+    "ServerStorage": {
+      "$path": "src/ServerStorage"
+    },
+    "SoundService": {
+      "$path": "src/SoundService"
+    },
+    "StarterGui": {
+      "$path": "src/StarterGui"
+    },
+    "StarterPack": {
+      "$path": "src/StarterPack"
+    },
+    "StarterPlayer": {
+      "StarterCharacterScripts": {
+        "$path": "src/StarterCharacterScripts"
+      },
+      "StarterPlayerScripts": {
+        "$path": "src/Client"
+      },
+      "$properties": {
+        "EnableMouseLockOption": false
+      }
+    },
+    "Workspace": {
+      "$path": "src/Workspace"
+    }
+  }
+}

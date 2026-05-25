@@ -1,0 +1,359 @@
+--[[
+	SignTextController
+	Handles right-click interaction with signs to edit their text
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local Camera = workspace.CurrentCamera
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local UpdateSignText = Remotes:WaitForChild("UpdateSignText", 10)
+
+local REACH_DISTANCE = 50
+local MAX_LINES = 5
+local MAX_CHARS_PER_LINE = 20
+
+-- State
+local EditingSign = nil
+local EditUI = nil
+local TextInputs = {}
+
+-- ============================================
+-- UI CREATION
+-- ============================================
+
+local function createEditUI()
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "SignEditGui"
+	screenGui.ResetOnSpawn = false
+	screenGui.DisplayOrder = 100
+	screenGui.Parent = PlayerGui
+	
+	-- Background overlay
+	local overlay = Instance.new("Frame")
+	overlay.Name = "Overlay"
+	overlay.Size = UDim2.new(1, 0, 1, 0)
+	overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	overlay.BackgroundTransparency = 0.5
+	overlay.BorderSizePixel = 0
+	overlay.Parent = screenGui
+	
+	-- Main panel
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.Size = UDim2.new(0, 320, 0, 280)
+	panel.Position = UDim2.new(0.5, -160, 0.5, -140)
+	panel.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+	panel.BorderSizePixel = 0
+	panel.Parent = screenGui
+	
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 8)
+	panelCorner.Parent = panel
+	
+	local panelStroke = Instance.new("UIStroke")
+	panelStroke.Color = Color3.fromRGB(80, 80, 80)
+	panelStroke.Thickness = 2
+	panelStroke.Parent = panel
+	
+	-- Title
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Size = UDim2.new(1, 0, 0, 36)
+	title.Position = UDim2.new(0, 0, 0, 0)
+	title.BackgroundTransparency = 1
+	title.Text = "Edit Sign"
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.TextSize = 20
+	title.Font = Enum.Font.GothamBold
+	title.Parent = panel
+	
+	-- Text inputs container
+	local inputsFrame = Instance.new("Frame")
+	inputsFrame.Name = "Inputs"
+	inputsFrame.Size = UDim2.new(1, -32, 0, 150)
+	inputsFrame.Position = UDim2.new(0, 16, 0, 40)
+	inputsFrame.BackgroundTransparency = 1
+	inputsFrame.Parent = panel
+	
+	local inputLayout = Instance.new("UIListLayout")
+	inputLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	inputLayout.Padding = UDim.new(0, 6)
+	inputLayout.Parent = inputsFrame
+	
+	-- Create 5 text input fields
+	TextInputs = {}
+	for i = 1, MAX_LINES do
+		local inputFrame = Instance.new("Frame")
+		inputFrame.Name = "Line" .. i
+		inputFrame.Size = UDim2.new(1, 0, 0, 26)
+		inputFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		inputFrame.BorderSizePixel = 0
+		inputFrame.LayoutOrder = i
+		inputFrame.Parent = inputsFrame
+		
+		local inputCorner = Instance.new("UICorner")
+		inputCorner.CornerRadius = UDim.new(0, 4)
+		inputCorner.Parent = inputFrame
+		
+		local textBox = Instance.new("TextBox")
+		textBox.Name = "TextBox"
+		textBox.Size = UDim2.new(1, -16, 1, 0)
+		textBox.Position = UDim2.new(0, 8, 0, 0)
+		textBox.BackgroundTransparency = 1
+		textBox.Text = ""
+		textBox.PlaceholderText = "Line " .. i
+		textBox.PlaceholderColor3 = Color3.fromRGB(100, 100, 100)
+		textBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+		textBox.TextSize = 14
+		textBox.Font = Enum.Font.Gotham
+		textBox.TextXAlignment = Enum.TextXAlignment.Center
+		textBox.ClearTextOnFocus = false
+		textBox.Parent = inputFrame
+		
+		-- Limit characters
+		textBox:GetPropertyChangedSignal("Text"):Connect(function()
+			if #textBox.Text > MAX_CHARS_PER_LINE then
+				textBox.Text = string.sub(textBox.Text, 1, MAX_CHARS_PER_LINE)
+			end
+		end)
+		
+		TextInputs[i] = textBox
+	end
+	
+	-- Buttons container
+	local buttonsFrame = Instance.new("Frame")
+	buttonsFrame.Name = "Buttons"
+	buttonsFrame.Size = UDim2.new(1, -32, 0, 36)
+	buttonsFrame.Position = UDim2.new(0, 16, 1, -52)
+	buttonsFrame.BackgroundTransparency = 1
+	buttonsFrame.Parent = panel
+	
+	-- Save button
+	local saveBtn = Instance.new("TextButton")
+	saveBtn.Name = "SaveButton"
+	saveBtn.Size = UDim2.new(0.48, 0, 1, 0)
+	saveBtn.Position = UDim2.new(0, 0, 0, 0)
+	saveBtn.BackgroundColor3 = Color3.fromRGB(46, 125, 50)
+	saveBtn.BorderSizePixel = 0
+	saveBtn.Text = "Save"
+	saveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	saveBtn.TextSize = 16
+	saveBtn.Font = Enum.Font.GothamBold
+	saveBtn.Parent = buttonsFrame
+	
+	local saveBtnCorner = Instance.new("UICorner")
+	saveBtnCorner.CornerRadius = UDim.new(0, 6)
+	saveBtnCorner.Parent = saveBtn
+	
+	-- Cancel button
+	local cancelBtn = Instance.new("TextButton")
+	cancelBtn.Name = "CancelButton"
+	cancelBtn.Size = UDim2.new(0.48, 0, 1, 0)
+	cancelBtn.Position = UDim2.new(0.52, 0, 0, 0)
+	cancelBtn.BackgroundColor3 = Color3.fromRGB(120, 40, 40)
+	cancelBtn.BorderSizePixel = 0
+	cancelBtn.Text = "Cancel"
+	cancelBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	cancelBtn.TextSize = 16
+	cancelBtn.Font = Enum.Font.GothamBold
+	cancelBtn.Parent = buttonsFrame
+	
+	local cancelBtnCorner = Instance.new("UICorner")
+	cancelBtnCorner.CornerRadius = UDim.new(0, 6)
+	cancelBtnCorner.Parent = cancelBtn
+	
+	-- Button hover effects
+	local function setupHover(btn, normalColor)
+		btn.MouseEnter:Connect(function()
+			btn.BackgroundColor3 = Color3.fromRGB(
+				math.min(255, normalColor.R * 255 + 20),
+				math.min(255, normalColor.G * 255 + 20),
+				math.min(255, normalColor.B * 255 + 20)
+			)
+		end)
+		btn.MouseLeave:Connect(function()
+			btn.BackgroundColor3 = normalColor
+		end)
+	end
+	
+	setupHover(saveBtn, Color3.fromRGB(46, 125, 50))
+	setupHover(cancelBtn, Color3.fromRGB(120, 40, 40))
+	
+	-- Button click handlers
+	saveBtn.MouseButton1Click:Connect(function()
+		if EditingSign and UpdateSignText then
+			local lines = {}
+			for i = 1, MAX_LINES do
+				lines[i] = TextInputs[i].Text
+			end
+			UpdateSignText:FireServer(EditingSign, lines)
+		end
+		closeEditUI()
+	end)
+	
+	cancelBtn.MouseButton1Click:Connect(function()
+		closeEditUI()
+	end)
+	
+	-- Click overlay to close
+	overlay.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			closeEditUI()
+		end
+	end)
+	
+	screenGui.Enabled = false
+	EditUI = screenGui
+	
+	return screenGui
+end
+
+function closeEditUI()
+	if EditUI then
+		EditUI.Enabled = false
+	end
+	EditingSign = nil
+	
+	-- Re-enable player controls
+	local character = LocalPlayer.Character
+	if character then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.WalkSpeed = 16
+		end
+	end
+end
+
+local function openEditUI(sign)
+	if not EditUI then
+		createEditUI()
+	end
+	
+	EditingSign = sign
+	
+	-- Load existing text from sign
+	for i = 1, MAX_LINES do
+		local existingText = sign:GetAttribute("SignLine" .. i) or ""
+		TextInputs[i].Text = existingText
+	end
+	
+	EditUI.Enabled = true
+	
+	-- Focus first input
+	task.defer(function()
+		if TextInputs[1] then
+			TextInputs[1]:CaptureFocus()
+		end
+	end)
+	
+	-- Slow player movement while editing
+	local character = LocalPlayer.Character
+	if character then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.WalkSpeed = 0
+		end
+	end
+end
+
+-- ============================================
+-- SIGN DETECTION
+-- ============================================
+
+local function raycastForSign()
+	local viewportSize = Camera.ViewportSize
+	local ray = Camera:ViewportPointToRay(viewportSize.X / 2, viewportSize.Y / 2)
+	
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = {LocalPlayer.Character}
+	
+	local result = workspace:Raycast(ray.Origin, ray.Direction * REACH_DISTANCE, raycastParams)
+	
+	if result and result.Instance then
+		local hit = result.Instance
+		
+		-- Check if it's a sign or part of a sign model
+		if hit:GetAttribute("IsSignStanding") or hit:GetAttribute("IsWallSign") then
+			return hit
+		end
+		
+		-- Check parent
+		if hit.Parent then
+			if hit.Parent:GetAttribute("IsSignStanding") or hit.Parent:GetAttribute("IsWallSign") then
+				return hit.Parent
+			end
+			
+			-- Check grandparent (for nested models)
+			if hit.Parent.Parent then
+				if hit.Parent.Parent:GetAttribute("IsSignStanding") or hit.Parent.Parent:GetAttribute("IsWallSign") then
+					return hit.Parent.Parent
+				end
+			end
+		end
+	end
+	
+	return nil
+end
+
+local function isInMyPlot(sign)
+	-- Check if sign is in player's plot
+	local plotData = _G.PlotClient and _G.PlotClient.GetMyPlot()
+	if not plotData or not plotData.BuildArea then return false end
+	
+	local blocksFolder = plotData.BuildArea:FindFirstChild("Blocks")
+	if not blocksFolder then return false end
+	
+	return sign.Parent == blocksFolder
+end
+
+-- ============================================
+-- INPUT HANDLING
+-- ============================================
+
+local function isInventoryOpen()
+	return _G.InventoryController and _G.InventoryController.IsInventoryOpen and _G.InventoryController.IsInventoryOpen()
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if isInventoryOpen() then return end
+	if EditUI and EditUI.Enabled then return end
+	
+	-- Right click to edit sign
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		local sign = raycastForSign()
+		if sign and isInMyPlot(sign) then
+			-- Check if it's actually a sign we can edit
+			if sign:GetAttribute("IsSignStanding") or sign:GetAttribute("IsWallSign") then
+				openEditUI(sign)
+			end
+		end
+	end
+end)
+
+-- Close UI on Escape
+UserInputService.InputBegan:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.Escape then
+		if EditUI and EditUI.Enabled then
+			closeEditUI()
+		end
+	end
+end)
+
+-- Expose for other scripts
+_G.SignTextController = {
+	IsEditing = function()
+		return EditUI and EditUI.Enabled
+	end,
+	CloseUI = closeEditUI,
+}
+
+print("SignTextController initialized")

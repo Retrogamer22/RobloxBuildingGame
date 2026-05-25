@@ -1,0 +1,10 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [29.1, -9.1053, -61.8843, 1.0, 0, 0, 0, 1.0, 0, 0, 0, 1],
+    "PivotOffset": [0, -2.1661, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [2, 2, 1],
+    "Transparency": 1
+  }
+}

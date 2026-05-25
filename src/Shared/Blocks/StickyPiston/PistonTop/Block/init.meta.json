@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [27.27, 3.49, 285.02, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [165, 159, 91],
+    "Material": "Wood",
+    "MaterialVariant": "Wood_Wall",
+    "PivotOffset": [0, -0.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [2.98, 1, 2.98],
+    "TopSurface": "Smooth"
+  }
+}

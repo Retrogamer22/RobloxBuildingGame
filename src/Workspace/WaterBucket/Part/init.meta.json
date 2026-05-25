@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [-38.95, 1.7946, 470.65, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [148, 212, 234],
+    "Material": "Grass",
+    "MaterialVariant": "PixelGrass",
+    "Size": [1.1898, 1.2, 1.1893],
+    "TopSurface": "Smooth",
+    "Transparency": 0.3
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "accessors": [
+    {
+      "name": "INDEX",
+      "bufferView": 0,
+      "componentType": 5125,
+      "type": "SCALAR",
+      "count": 36
+    },
+    {
+      "name": "POSITION",
+      "bufferView": 1,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 24
+    },
+    {
+      "name": "NORMAL",
+      "bufferView": 2,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 24
+    },
+    {
+      "name": "TEXCOORD_0",
+      "bufferView": 3,
+      "componentType": 5126,
+      "type": "VEC2",
+      "count": 24
+    },
+    {
+      "name": "COLOR_0",
+      "bufferView": 4,
+      "componentType": 5121,
+      "type": "VEC4",
+      "normalized": true,
+      "count": 24
+    }
+  ],
+  "asset": {
+    "generator": "Roblox Export",
+    "version": "2.0",
+    "min_version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "name": "INDEX",
+      "buffer": 0,
+      "byteLength": 144
+    },
+    {
+      "name": "POSITION",
+      "buffer": 1,
+      "byteLength": 288
+    },
+    {
+      "name": "NORMAL",
+      "buffer": 2,
+      "byteLength": 288
+    },
+    {
+      "name": "TEXCOORD_0",
+      "buffer": 3,
+      "byteLength": 192
+    },
+    {
+      "name": "COLOR_0",
+      "buffer": 4,
+      "byteLength": 96
+    }
+  ],
+  "buffers": [
+    {
+      "name": "INDEX",
+      "uri": "data:application/octet-stream;base64,AAAAAAEAAAACAAAAAgAAAAMAAAAAAAAABAAAAAUAAAAGAAAABgAAAAcAAAAEAAAACAAAAAkAAAAKAAAACgAAAAsAAAAIAAAADAAAAA0AAAAOAAAADgAAAA8AAAAMAAAAEAAAABEAAAASAAAAEgAAABMAAAAQAAAAFAAAABUAAAAWAAAAFgAAABcAAAAUAAAA",
+      "byteLength": 144
+    },
+    {
+      "name": "POSITION",
+      "uri": "data:application/octet-stream;base64,AAAAPwAAAD8AAAA/AAAAPwAAAL8AAAA/AAAAPwAAAL8AAAC/AAAAPwAAAD8AAAC/AAAAPwAAAD8AAAA/AAAAPwAAAD8AAAC/AAAAvwAAAD8AAAC/AAAAvwAAAD8AAAA/AAAAPwAAAD8AAAA/AAAAvwAAAD8AAAA/AAAAvwAAAL8AAAA/AAAAPwAAAL8AAAA/AAAAvwAAAL8AAAA/AAAAvwAAAD8AAAA/AAAAvwAAAD8AAAC/AAAAvwAAAL8AAAC/AAAAPwAAAL8AAAC/AAAAPwAAAL8AAAA/AAAAvwAAAL8AAAA/AAAAvwAAAL8AAAC/AAAAvwAAAD8AAAC/AAAAPwAAAD8AAAC/AAAAPwAAAL8AAAC/AAAAvwAAAL8AAAC/",
+      "byteLength": 288
+    },
+    {
+      "name": "NORMAL",
+      "uri": "data:application/octet-stream;base64,AACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/",
+      "byteLength": 288
+    },
+    {
+      "name": "TEXCOORD_0",
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAIA/AAAAAAAAgD8AAIA/AAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAACAPwAAgD8AAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAIA/AACAPwAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAgD8AAIA/AAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAACAPwAAgD8AAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAIA/AACAPwAAAAAAAIA/",
+      "byteLength": 192
+    },
+    {
+      "name": "COLOR_0",
+      "uri": "data:application/octet-stream;base64,o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/o6Kl/6Oipf+joqX/",
+      "byteLength": 96
+    }
+  ],
+  "meshes": [
+    {
+      "name": "WallpaperTemplate",
+      "primitives": [
+        {
+          "indices": 0,
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2,
+            "TEXCOORD_0": 3,
+            "COLOR_0": 4
+          }
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "children": [ ],
+      "mesh": 0,
+      "name": "WallpaperTemplate",
+      "translation": [46.4534798, 2.49456763, 427.625],
+      "rotation": [0, 0.707106769, 0, 0.707106769],
+      "scale": [0.00100000005, 2.99999976, 3],
+      "extras": {"RobloxInstanceType":"Part","RobloxUniqueId":"473c140d-98a5-e508-0a1e-1cf40004fa7f","Shape":"Block","Material":"plastic","Color":"(163, 162, 165)","Transparency":0,"Anchored":true}
+    }
+  ],
+  "scenes": [
+    {
+      "nodes": [ 0 ]
+    }
+  ]
+}
+

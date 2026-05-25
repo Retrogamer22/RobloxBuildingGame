@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [11.6382, 1.3946, 473.3103, 0, 0, 1, 0, 1, 0, -1, 0, 0],
+    "CastShadow": false,
+    "Color": [255, 215, 151],
+    "Material": "Wood",
+    "MaterialVariant": "PixelLogTop",
+    "Size": [2.9223, 0.5133, 0.5067],
+    "TopSurface": "Smooth"
+  }
+}

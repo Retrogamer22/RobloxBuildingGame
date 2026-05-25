@@ -1,0 +1,12 @@
+{
+  "className": "UnionOperation",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [-33.5261, -7.771, 508.4834, 0, 0, -1, 0.0002, 1, 0, 1, -0.0002, 0],
+    "Color": [120, 98, 75],
+    "Material": "Grass",
+    "MaterialVariant": "PixelHayBaleEnds",
+    "Size": [2, 2.4, 2],
+    "UsePartColor": true
+  }
+}

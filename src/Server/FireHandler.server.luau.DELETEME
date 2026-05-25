@@ -1,0 +1,67 @@
+--[[
+	FireHandler
+	Server-side handler for fire SPREAD + burn-away (Minecraft-style).
+
+	Model (matches ToolHandler/SaveManager):
+	- A Fire occupies the empty grid cell directly ABOVE a support block.
+	- It stores HostBlockX/Y/Z = the support's grid center.
+
+	Spread rules:
+	- Fire only catches FLAMMABLE blocks (see FLAMMABLE config below). Stone,
+	  dirt, glass, etc. are fireproof and act as firebreaks.
+	- Each tick, every fire may:
+	    1. Consume its host (if flammable): destroy the host block AND this fire,
+	       leaving empty space.
+	    2. Spread: ignite flammable blocks adjacent to the host (4 sides + below
+	       + above) by placing a new Fire on top of each catching block.
+	- A fire whose host has vanished extinguishes (no support).
+	- "Burns out only if nothing flammable nearby": a fire on a NON-flammable
+	  host with no flammable neighbours lingers, but we give it a short grace
+	  countdown so stray fires (e.g. lit on stone) eventually fizzle instead of
+	  burning forever. Set EXTINGUISH_STRAY = false to disable.
+
+	This script is self-contained (no custom module requires beyond the shared
+	spatial index + grid config) so a sync hiccup can only stop fire spread, not
+	take down save/load.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
+local BlockSpatialIndex = require(ReplicatedStorage:WaitForChild("BlockSpatialIndex", 10))
+local BulkOperationFlags = nil
+pcall(function()
+	BulkOperationFlags = require(ReplicatedStorage:WaitForChild("BulkOperationFlags", 5))
+end)
+
+local BLOCK_SIZE = GridConfig.BLOCK_SIZE
+local BlockTemplates = ReplicatedStorage:WaitForChild("BlockTemplates", 10)
+
+-- Remote for the client-side blocky shatter particle burst (created if missing).
+-- Fired (server->all clients) with a small table { pos, size, color } whenever a
+-- burnt block breaks; the BurntShatterParticles client script spawns the voxels.
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+if not Remotes then
+	Remotes = Instance.new("Folder")
+	Remotes.Name = "Remotes"
+	Remotes.Parent = ReplicatedStorage
+end
+local BurntShatterFX = Remotes:FindFirstChild("BurntShatterFX")
+if not BurntShatterFX then
+	BurntShatterFX = Instance.new("RemoteEvent")
+	BurntShatterFX.Name = "BurntShatterFX"
+	BurntShatterFX.Parent = Remotes
+end
+-- Remote for the periodic falling-ember "drip" under a hot, floating charred block
+-- (the block is still glowing while it cools, suspended in the air, so embers
+-- crumble off the bottom). Fired (server->all clients) with { pos, size, color }.
+local BurntEmberDripFX = Remotes:FindFirstChild("BurntEmberDripFX")
+if not BurntEmberDripFX then
+	BurntEmberDripFX = Instance.new("RemoteEvent")
+	BurntEmberDripFX.Name = "BurntEmberDripFX"
+	BurntEmberDripFX.Parent = Remotes
+end
+
+-- PLACEHOLDER

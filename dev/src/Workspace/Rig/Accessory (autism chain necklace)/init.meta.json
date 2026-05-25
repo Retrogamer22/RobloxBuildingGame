@@ -1,0 +1,7 @@
+{
+  "className": "Accessory",
+  "properties": {
+    "AccessoryType": "Neck",
+    "AttachmentPoint": [0.0256, 0.19, 0.0517, 1, 0, 0, 0, 1, 0, 0, 0, 1]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "className": "Part",
+  "properties": {
+    "BottomSurface": "Smooth",
+    "CFrame": [20.6535, 1.85, 420.6, 1, 0, 0, 0, 1.0, 0, 0, 0, 1.0],
+    "Size": [3.0, 1.7, 0.2],
+    "TopSurface": "Smooth"
+  }
+}

@@ -1,0 +1,561 @@
+--[[
+	BlockDebugUI (formerly FenceDebugUI)
+	Shows debug information about fences AND stairs you're looking at
+	Press F to toggle on/off
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- Try to load modules
+local FencePlacement = nil
+local StairPlacement = nil
+pcall(function()
+	FencePlacement = require(ReplicatedStorage:WaitForChild("FencePlacement", 5))
+end)
+pcall(function()
+	StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 5))
+end)
+
+local BLOCK_SIZE = 3
+
+-- Direction mapping
+local DIR_NAMES = {
+	[0] = "N",
+	[1] = "E", 
+	[2] = "S",
+	[3] = "W",
+}
+
+local DIR_FULL_NAMES = {
+	[0] = "NORTH (+Z)",
+	[1] = "EAST (+X)", 
+	[2] = "SOUTH (-Z)",
+	[3] = "WEST (-X)",
+}
+
+-- Create UI
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "BlockDebugUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Name = "DebugFrame"
+frame.Size = UDim2.new(0, 420, 0, 380)
+frame.Position = UDim2.new(0, 10, 0.5, -190)
+frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+frame.BackgroundTransparency = 0.2
+frame.BorderSizePixel = 0
+frame.Visible = false
+frame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1, 0, 0, 30)
+title.Position = UDim2.new(0, 0, 0, 0)
+title.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+title.BorderSizePixel = 0
+title.Text = "🔧 Block Debug (F to toggle)"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 16
+title.Font = Enum.Font.GothamBold
+title.Parent = frame
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 8)
+titleCorner.Parent = title
+
+local infoLabel = Instance.new("TextLabel")
+infoLabel.Name = "InfoLabel"
+infoLabel.Size = UDim2.new(1, -120, 0, 150)
+infoLabel.Position = UDim2.new(0, 10, 0, 35)
+infoLabel.BackgroundTransparency = 1
+infoLabel.Text = "Look at a fence or stair..."
+infoLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+infoLabel.TextSize = 12
+infoLabel.Font = Enum.Font.GothamMedium
+infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+infoLabel.TextYAlignment = Enum.TextYAlignment.Top
+infoLabel.TextWrapped = true
+infoLabel.Parent = frame
+
+-- Corner Logic section
+local cornerLogicLabel = Instance.new("TextLabel")
+cornerLogicLabel.Name = "CornerLogicLabel"
+cornerLogicLabel.Size = UDim2.new(1, -20, 0, 180)
+cornerLogicLabel.Position = UDim2.new(0, 10, 0, 190)
+cornerLogicLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+cornerLogicLabel.BackgroundTransparency = 0.5
+cornerLogicLabel.Text = ""
+cornerLogicLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+cornerLogicLabel.TextSize = 11
+cornerLogicLabel.Font = Enum.Font.Code
+cornerLogicLabel.TextXAlignment = Enum.TextXAlignment.Left
+cornerLogicLabel.TextYAlignment = Enum.TextYAlignment.Top
+cornerLogicLabel.TextWrapped = true
+cornerLogicLabel.Parent = frame
+
+local cornerLogicCorner = Instance.new("UICorner")
+cornerLogicCorner.CornerRadius = UDim.new(0, 4)
+cornerLogicCorner.Parent = cornerLogicLabel
+
+-- Direction visualization
+local dirFrame = Instance.new("Frame")
+dirFrame.Name = "DirectionViz"
+dirFrame.Size = UDim2.new(0, 100, 0, 100)
+dirFrame.Position = UDim2.new(1, -110, 0, 35)
+dirFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+dirFrame.BorderSizePixel = 0
+dirFrame.Parent = frame
+
+local dirCorner = Instance.new("UICorner")
+dirCorner.CornerRadius = UDim.new(0, 8)
+dirCorner.Parent = dirFrame
+
+-- Direction indicators (N, E, S, W)
+local directions = {"N", "E", "S", "W"}
+local dirPositions = {
+	N = UDim2.new(0.5, -14, 0, 2),
+	E = UDim2.new(1, -30, 0.5, -14),
+	S = UDim2.new(0.5, -14, 1, -30),
+	W = UDim2.new(0, 2, 0.5, -14),
+}
+local dirLabels = {}
+
+for _, dir in ipairs(directions) do
+	local label = Instance.new("TextLabel")
+	label.Name = dir
+	label.Size = UDim2.new(0, 28, 0, 28)
+	label.Position = dirPositions[dir]
+	label.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+	label.BorderSizePixel = 0
+	label.Text = dir
+	label.TextColor3 = Color3.fromRGB(200, 200, 200)
+	label.TextSize = 11
+	label.Font = Enum.Font.GothamBold
+	label.Parent = dirFrame
+	
+	local labelCorner = Instance.new("UICorner")
+	labelCorner.CornerRadius = UDim.new(0, 4)
+	labelCorner.Parent = label
+	
+	dirLabels[dir] = label
+end
+
+-- Center indicator (shows facing direction for stairs)
+local centerDot = Instance.new("Frame")
+centerDot.Name = "Center"
+centerDot.Size = UDim2.new(0, 24, 0, 24)
+centerDot.Position = UDim2.new(0.5, -12, 0.5, -12)
+centerDot.BackgroundColor3 = Color3.fromRGB(255, 200, 100)
+centerDot.BorderSizePixel = 0
+centerDot.Parent = dirFrame
+
+local centerCorner = Instance.new("UICorner")
+centerCorner.CornerRadius = UDim.new(0.5, 0)
+centerCorner.Parent = centerDot
+
+local centerLabel = Instance.new("TextLabel")
+centerLabel.Name = "CenterLabel"
+centerLabel.Size = UDim2.new(1, 0, 1, 0)
+centerLabel.BackgroundTransparency = 1
+centerLabel.Text = ""
+centerLabel.TextColor3 = Color3.fromRGB(0, 0, 0)
+centerLabel.TextSize = 10
+centerLabel.Font = Enum.Font.GothamBold
+centerLabel.Parent = centerDot
+
+-- Legend frame
+local legendFrame = Instance.new("Frame")
+legendFrame.Name = "Legend"
+legendFrame.Size = UDim2.new(0, 100, 0, 45)
+legendFrame.Position = UDim2.new(1, -110, 0, 140)
+legendFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+legendFrame.BorderSizePixel = 0
+legendFrame.Parent = frame
+
+local legendCorner = Instance.new("UICorner")
+legendCorner.CornerRadius = UDim.new(0, 6)
+legendCorner.Parent = legendFrame
+
+local legendText = Instance.new("TextLabel")
+legendText.Name = "LegendText"
+legendText.Size = UDim2.new(1, -6, 1, -4)
+legendText.Position = UDim2.new(0, 3, 0, 2)
+legendText.BackgroundTransparency = 1
+legendText.Text = "🟡Face 🔵Same\n🟢Perp 🟠Opp"
+legendText.TextColor3 = Color3.fromRGB(150, 150, 150)
+legendText.TextSize = 10
+legendText.Font = Enum.Font.Gotham
+legendText.TextXAlignment = Enum.TextXAlignment.Left
+legendText.TextYAlignment = Enum.TextYAlignment.Top
+legendText.TextWrapped = true
+legendText.Parent = legendFrame
+
+-- State
+local enabled = false
+
+local function updateDirectionVizForFence(neighbors)
+	for i, dir in ipairs(directions) do
+		local hasNeighbor = neighbors[i - 1] -- 0-indexed
+		local label = dirLabels[dir]
+		
+		if hasNeighbor then
+			label.BackgroundColor3 = Color3.fromRGB(100, 200, 100)
+			label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		else
+			label.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+			label.TextColor3 = Color3.fromRGB(120, 120, 120)
+		end
+	end
+	
+	centerDot.BackgroundColor3 = Color3.fromRGB(255, 200, 100)
+	centerLabel.Text = "F"
+end
+
+local function updateDirectionVizForStair(facingDir, adjacentStairs)
+	for i, dir in ipairs(directions) do
+		local dirIndex = i - 1 -- 0-indexed (N=0, E=1, S=2, W=3)
+		local label = dirLabels[dir]
+		local adjInfo = adjacentStairs and adjacentStairs[dirIndex]
+		
+		if dirIndex == facingDir then
+			-- This is the facing direction - yellow
+			label.BackgroundColor3 = Color3.fromRGB(255, 200, 50)
+			label.TextColor3 = Color3.fromRGB(0, 0, 0)
+		elseif adjInfo and adjInfo.exists then
+			if adjInfo.direction == facingDir then
+				-- Same direction stair - blue
+				label.BackgroundColor3 = Color3.fromRGB(80, 150, 255)
+				label.TextColor3 = Color3.fromRGB(255, 255, 255)
+			elseif adjInfo.isPerpendicular then
+				-- Perpendicular stair - green
+				label.BackgroundColor3 = Color3.fromRGB(100, 200, 100)
+				label.TextColor3 = Color3.fromRGB(255, 255, 255)
+			else
+				-- Opposite stair - orange
+				label.BackgroundColor3 = Color3.fromRGB(255, 150, 50)
+				label.TextColor3 = Color3.fromRGB(255, 255, 255)
+			end
+		else
+			-- No stair here
+			label.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+			label.TextColor3 = Color3.fromRGB(120, 120, 120)
+		end
+	end
+	
+	centerDot.BackgroundColor3 = Color3.fromRGB(255, 200, 50)
+	centerLabel.Text = DIR_NAMES[facingDir] or "?"
+end
+
+local function resetDirectionViz()
+	for _, dir in ipairs(directions) do
+		local label = dirLabels[dir]
+		label.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+		label.TextColor3 = Color3.fromRGB(200, 200, 200)
+	end
+	centerDot.BackgroundColor3 = Color3.fromRGB(255, 200, 100)
+	centerLabel.Text = ""
+end
+
+local function getBlocksFolder(instance)
+	local current = instance.Parent
+	while current do
+		if current.Name == "Blocks" then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+local function analyzeAdjacentStairs(pos, facingDir, blocksFolder)
+	if not StairPlacement then return nil end
+	
+	local adjacent = {}
+	
+	for checkDir = 0, 3 do
+		local offset = StairPlacement.GetDirectionOffset(checkDir) * BLOCK_SIZE
+		local checkPos = pos + offset
+		
+		local stairInfo = StairPlacement.GetStairAt(checkPos, blocksFolder)
+		
+		if stairInfo then
+			local isPerpendicular = (math.abs(stairInfo.direction - facingDir) % 2) == 1
+			adjacent[checkDir] = {
+				exists = true,
+				direction = stairInfo.direction,
+				directionName = DIR_NAMES[stairInfo.direction],
+				upsideDown = stairInfo.upsideDown,
+				cornerType = stairInfo.object:GetAttribute("CornerType") or "normal",
+				isPerpendicular = isPerpendicular,
+			}
+		else
+			adjacent[checkDir] = { exists = false }
+		end
+	end
+	
+	return adjacent
+end
+
+local function analyzeCornerLogic(direction, upsideDown, adjacentStairs)
+	if not StairPlacement or not adjacentStairs then return "No StairPlacement module" end
+	
+	local lines = {}
+	
+	-- Direction helpers
+	local backDir = StairPlacement.GetOppositeDirection(direction)
+	local frontDir = direction
+	local leftDir = StairPlacement.GetLeftDirection(direction)
+	local rightDir = StairPlacement.GetRightDirection(direction)
+	
+	table.insert(lines, "=== DIRECTION MAP ===")
+	table.insert(lines, string.format("FRONT=%s  BACK=%s  LEFT=%s  RIGHT=%s", 
+		DIR_NAMES[frontDir], DIR_NAMES[backDir], DIR_NAMES[leftDir], DIR_NAMES[rightDir]))
+	table.insert(lines, "")
+	
+	-- Check BACK stair (original corner detection)
+	table.insert(lines, "=== BACK CHECK ===")
+	local backStair = adjacentStairs[backDir]
+	if backStair and backStair.exists then
+		table.insert(lines, string.format("Back stair: %s (dir=%s)", 
+			backStair.isPerpendicular and "PERP" or "NOT PERP", backStair.directionName))
+		if backStair.isPerpendicular and backStair.upsideDown == upsideDown then
+			local turn = StairPlacement.GetTurnDirection(direction, backStair.direction)
+			table.insert(lines, string.format("Turn: %s -> %s", turn:upper(), turn == "left" and "INNER" or "OUTER"))
+		end
+	else
+		table.insert(lines, "No stair behind")
+	end
+	table.insert(lines, "")
+	
+	-- Check FRONT stair (L-shape detection)
+	table.insert(lines, "=== FRONT CHECK ===")
+	local frontStair = adjacentStairs[frontDir]
+	if frontStair and frontStair.exists then
+		table.insert(lines, string.format("Front stair: %s (dir=%s)", 
+			frontStair.isPerpendicular and "PERP" or "NOT PERP", frontStair.directionName))
+		
+		if frontStair.isPerpendicular and frontStair.upsideDown == upsideDown then
+			local frontStairBackDir = StairPlacement.GetOppositeDirection(frontStair.direction)
+			local connectsOnLeft = (leftDir == frontStairBackDir)
+			local connectsOnRight = (rightDir == frontStairBackDir)
+			
+			table.insert(lines, string.format("Front's BACK=%s", DIR_NAMES[frontStairBackDir]))
+			table.insert(lines, string.format("ConnectsLeft=%s ConnectsRight=%s", 
+				tostring(connectsOnLeft), tostring(connectsOnRight)))
+			
+			if connectsOnLeft or connectsOnRight then
+				-- Check other side for same-dir stair
+				local checkDir = connectsOnLeft and rightDir or leftDir
+				local sideStair = adjacentStairs[checkDir]
+				local hasSameDirOnOtherSide = sideStair and sideStair.exists and sideStair.direction == direction and sideStair.upsideDown == upsideDown
+				
+				table.insert(lines, string.format("OtherSide(%s): %s", 
+					DIR_NAMES[checkDir],
+					hasSameDirOnOtherSide and "HAS SAME-DIR (skip corner!)" or "empty/diff"))
+				
+				if not hasSameDirOnOtherSide then
+					local cornerType = connectsOnLeft and "OUTER" or "INNER"
+					table.insert(lines, string.format("-> Would be: %s corner", cornerType))
+				else
+					table.insert(lines, "-> BLOCKED by same-dir neighbor")
+				end
+			else
+				table.insert(lines, "No L-connection possible")
+			end
+		end
+	else
+		table.insert(lines, "No stair in front")
+	end
+	
+	return table.concat(lines, "\n")
+end
+
+local function update()
+	if not enabled then return end
+	
+	-- Raycast from camera
+	local ray = camera:ViewportPointToRay(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = {player.Character}
+	
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 50, raycastParams)
+	
+	if result and result.Instance then
+		local hit = result.Instance
+		
+		-- Check for fence
+		local fence = nil
+		if hit:GetAttribute("IsFence") then
+			fence = hit
+		elseif hit.Parent and hit.Parent:GetAttribute("IsFence") then
+			fence = hit.Parent
+		end
+		
+		-- Check for stair
+		local stair = nil
+		local blockType = hit:GetAttribute("BlockType")
+		if blockType and StairPlacement and StairPlacement.IsStairType(blockType) then
+			stair = hit
+		elseif hit.Parent then
+			blockType = hit.Parent:GetAttribute("BlockType")
+			if blockType and StairPlacement and StairPlacement.IsStairType(blockType) then
+				stair = hit.Parent
+			end
+		end
+		
+		-- === STAIR DEBUG ===
+		if stair then
+			title.Text = "🔧 Stair Debug (F to toggle)"
+			
+			local stairBlockType = stair:GetAttribute("BlockType") or "Unknown"
+			local cornerType = stair:GetAttribute("CornerType") or "normal"
+			local rotation = stair:GetAttribute("Rotation") or 0
+			local direction = stair:GetAttribute("StairDirection")
+			local isUpsideDown = stair:GetAttribute("IsUpsideDown") or false
+			
+			if direction == nil then
+				direction = StairPlacement.RotationToDirection(rotation)
+			end
+			
+			local pos
+			if stair:IsA("BasePart") then
+				pos = stair.Position
+			elseif stair:IsA("Model") then
+				local primary = stair.PrimaryPart or stair:FindFirstChildWhichIsA("BasePart")
+				if primary then pos = primary.Position end
+			end
+			
+			local blocksFolder = getBlocksFolder(stair)
+			local adjacentStairs = analyzeAdjacentStairs(pos, direction, blocksFolder)
+			
+			-- Build adjacent info
+			local adjStrings = {}
+			if adjacentStairs then
+				for dirIdx = 0, 3 do
+					local adj = adjacentStairs[dirIdx]
+					if adj.exists then
+						local relation = adj.direction == direction and "SAME" or (adj.isPerpendicular and "PERP" or "OPP")
+						table.insert(adjStrings, string.format("%s:%s(%s)", DIR_NAMES[dirIdx], adj.directionName, relation))
+					end
+				end
+			end
+			
+			local info = string.format([[
+Type: %s | Corner: %s
+Rotation: %d° | Dir: %s
+Upside Down: %s
+
+Adjacent: %s
+Pos: (%.0f, %.0f, %.0f)
+]], 
+				stairBlockType,
+				cornerType:upper(),
+				rotation,
+				DIR_NAMES[direction] or "?",
+				isUpsideDown and "YES" or "NO",
+				#adjStrings > 0 and table.concat(adjStrings, " ") or "(none)",
+				pos and pos.X or 0,
+				pos and pos.Y or 0,
+				pos and pos.Z or 0
+			)
+			
+			infoLabel.Text = info
+			cornerLogicLabel.Text = analyzeCornerLogic(direction, isUpsideDown, adjacentStairs)
+			updateDirectionVizForStair(direction, adjacentStairs)
+			return
+		end
+		
+		-- === FENCE DEBUG ===
+		if fence then
+			title.Text = "🔧 Fence Debug (F to toggle)"
+			
+			local fenceBlockType = fence:GetAttribute("BlockType") or "Unknown"
+			local connectionType = fence:GetAttribute("FenceConnectionType") or "unknown"
+			local rotation = fence:GetAttribute("Rotation") or 0
+			
+			local pos
+			if fence:IsA("BasePart") then
+				pos = fence:GetPivot().Position
+			elseif fence:IsA("Model") then
+				pos = fence:GetPivot().Position
+			end
+			
+			local neighbors = {[0] = false, [1] = false, [2] = false, [3] = false}
+			
+			if FencePlacement and pos then
+				local blocksFolder = fence.Parent
+				if blocksFolder then
+					neighbors = FencePlacement.GetFenceNeighbors(pos, blocksFolder)
+				end
+			end
+			
+			local neighborDirs = {}
+			for i = 0, 3 do
+				if neighbors[i] then
+					table.insert(neighborDirs, DIR_NAMES[i])
+				end
+			end
+			
+			local info = string.format([[
+Type: %s
+Connection: %s
+Rotation: %d°
+
+Neighbors: %s
+Position: (%.0f, %.0f, %.0f)
+]], 
+				fenceBlockType,
+				connectionType:upper(),
+				rotation,
+				#neighborDirs > 0 and table.concat(neighborDirs, ", ") or "none",
+				pos and pos.X or 0,
+				pos and pos.Y or 0,
+				pos and pos.Z or 0
+			)
+			
+			infoLabel.Text = info
+			cornerLogicLabel.Text = "(Fence - no corner logic)"
+			updateDirectionVizForFence(neighbors)
+			return
+		end
+	end
+	
+	-- Not looking at anything
+	title.Text = "🔧 Block Debug (F to toggle)"
+	infoLabel.Text = "Look at a fence or stair\nto see debug info."
+	cornerLogicLabel.Text = ""
+	resetDirectionViz()
+end
+
+-- Toggle with F key
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	
+	if input.KeyCode == Enum.KeyCode.F then
+		enabled = not enabled
+		frame.Visible = enabled
+		
+		if enabled then
+			print("[BlockDebug] Enabled")
+		else
+			print("[BlockDebug] Disabled")
+		end
+	end
+end)
+
+RunService.RenderStepped:Connect(update)
+
+print("BlockDebugUI loaded - Press F to toggle")

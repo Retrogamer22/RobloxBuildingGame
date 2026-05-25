@@ -1,0 +1,14 @@
+{
+  "className": "Part",
+  "properties": {
+    "Anchored": true,
+    "BottomSurface": "Smooth",
+    "CFrame": [0.6, 2.5, 466, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [172, 172, 172],
+    "Material": "Ground",
+    "MaterialVariant": "PixelCactus",
+    "PivotOffset": [0, -1.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [2.6, 3, 2.6],
+    "TopSurface": "Smooth"
+  }
+}

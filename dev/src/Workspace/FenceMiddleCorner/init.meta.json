@@ -1,0 +1,13 @@
+{
+  "className": "UnionOperation",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [32.4577, 2.5, 429.2666, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [248, 194, 139],
+    "Material": "Wood",
+    "MaterialVariant": "Cheap Plywood",
+    "PivotOffset": [0, 0, -0.5, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [3.0, 3, 2],
+    "UsePartColor": true
+  }
+}

@@ -1,0 +1,284 @@
+--[[
+	BuildingController
+	Ghost preview using templates, placement, and removal
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local BlockShapes = require(ReplicatedStorage:WaitForChild("BlockShapes"))
+local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
+local BlockTemplates = ReplicatedStorage:WaitForChild("BlockTemplates")
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local PlaceBlock = Remotes:WaitForChild("PlaceBlock")
+local RemoveBlock = Remotes:WaitForChild("RemoveBlock")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local BLOCK_SIZE = GridConfig.BLOCK_SIZE
+local GHOST_TRANSPARENCY = 0.6
+local VALID_COLOR = Color3.fromRGB(100, 255, 100)
+local INVALID_COLOR = Color3.fromRGB(255, 100, 100)
+
+local GhostBlock = nil
+local CurrentGridPos = nil
+local CanPlace = false
+local LastBlockType = nil
+
+task.wait(0.5)
+
+local function applyGhostAppearance(block, color)
+	if block:IsA("BasePart") then
+		block.Transparency = GHOST_TRANSPARENCY
+		block.Color = color
+		block.CanCollide = false
+		block.CastShadow = false
+		block.Anchored = true
+	end
+	
+	for _, child in ipairs(block:GetDescendants()) do
+		if child:IsA("BasePart") then
+			child.Transparency = GHOST_TRANSPARENCY
+			child.Color = color
+			child.CanCollide = false
+			child.CastShadow = false
+			child.Anchored = true
+		end
+	end
+end
+
+local function createGhostBlock(blockData)
+	if GhostBlock then
+		GhostBlock:Destroy()
+		GhostBlock = nil
+	end
+	
+	if not blockData or not blockData.TemplateName then return nil end
+	
+	local template = BlockTemplates:FindFirstChild(blockData.TemplateName)
+	if not template then
+		warn("Ghost template not found: " .. tostring(blockData.TemplateName))
+		return nil
+	end
+	
+	local ghost = template:Clone()
+	ghost.Name = "GhostBlock"
+	
+	applyGhostAppearance(ghost, VALID_COLOR)
+	
+	local selectionBox = Instance.new("SelectionBox")
+	selectionBox.Adornee = ghost
+	selectionBox.Color3 = Color3.fromRGB(255, 255, 255)
+	selectionBox.LineThickness = 0.02
+	selectionBox.Transparency = 0.5
+	selectionBox.Parent = ghost
+	
+	ghost.Parent = workspace
+	GhostBlock = ghost
+	LastBlockType = blockData.Id
+	
+	return ghost
+end
+
+local function snapToGrid(position)
+	local x = math.round(position.X / BLOCK_SIZE) * BLOCK_SIZE
+	local y = math.round(position.Y / BLOCK_SIZE) * BLOCK_SIZE
+	local z = math.round(position.Z / BLOCK_SIZE) * BLOCK_SIZE
+	return Vector3.new(x, y, z)
+end
+
+local function getRotationCFrame()
+	local rotation = _G.InventoryController and _G.InventoryController.GetRotation() or 0
+	return CFrame.Angles(0, math.rad(rotation), 0)
+end
+
+local function isInMyPlot(position)
+	local plotData = _G.PlotClient and _G.PlotClient.GetMyPlot()
+	if not plotData or not plotData.BasePlate then return false end
+	
+	local basePlate = plotData.BasePlate
+	local platePos = basePlate.Position
+	local plateSize = basePlate.Size
+	
+	local halfX = plateSize.X / 2
+	local halfZ = plateSize.Z / 2
+	
+	if position.X < platePos.X - halfX or position.X > platePos.X + halfX then
+		return false
+	end
+	if position.Z < platePos.Z - halfZ or position.Z > platePos.Z + halfZ then
+		return false
+	end
+	
+	local minY = platePos.Y + plateSize.Y / 2
+	local maxY = minY + GridConfig.PLOT_HEIGHT
+	if position.Y < minY or position.Y > maxY then
+		return false
+	end
+	
+	return true
+end
+
+local function getPlacementPosition(blockData)
+	local plotData = _G.PlotClient and _G.PlotClient.GetMyPlot()
+	if not plotData or not plotData.BuildArea then return nil end
+	
+	local mousePos = UserInputService:GetMouseLocation()
+	local ray = Camera:ViewportPointToRay(mousePos.X, mousePos.Y)
+	
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = {LocalPlayer.Character, GhostBlock}
+	
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 500, raycastParams)
+	
+	if result then
+		local placementPos = result.Position + result.Normal * (BLOCK_SIZE / 2)
+		local gridPos = snapToGrid(placementPos)
+		
+		if blockData and blockData.Offset then
+			gridPos = gridPos + blockData.Offset
+		end
+		
+		return gridPos
+	end
+	
+	return nil
+end
+
+local function setGhostPosition(position, rotation)
+	if not GhostBlock then return end
+	
+	local cframe = CFrame.new(position) * rotation
+	
+	if GhostBlock:IsA("BasePart") then
+		GhostBlock.CFrame = cframe
+	elseif GhostBlock:IsA("Model") then
+		local primary = GhostBlock.PrimaryPart or GhostBlock:FindFirstChildWhichIsA("BasePart")
+		if primary then
+			GhostBlock:SetPrimaryPartCFrame(cframe)
+		end
+	end
+end
+
+local function hideGhost()
+	if not GhostBlock then return end
+	
+	if GhostBlock:IsA("BasePart") then
+		GhostBlock.Transparency = 1
+	else
+		for _, part in ipairs(GhostBlock:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Transparency = 1
+			end
+		end
+	end
+end
+
+local function showGhost(color)
+	if not GhostBlock then return end
+	
+	if GhostBlock:IsA("BasePart") then
+		GhostBlock.Transparency = GHOST_TRANSPARENCY
+		GhostBlock.Color = color
+	else
+		for _, part in ipairs(GhostBlock:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Transparency = GHOST_TRANSPARENCY
+				part.Color = color
+			end
+		end
+	end
+end
+
+local function updateGhost()
+	if _G.InventoryController and _G.InventoryController.IsInventoryOpen() then
+		hideGhost()
+		return
+	end
+	
+	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
+	
+	if not blockData then
+		hideGhost()
+		CanPlace = false
+		return
+	end
+	
+	if not GhostBlock or LastBlockType ~= blockData.Id then
+		createGhostBlock(blockData)
+	end
+	
+	if not GhostBlock then return end
+	
+	local gridPos = getPlacementPosition(blockData)
+	
+	if gridPos then
+		CurrentGridPos = gridPos
+		setGhostPosition(gridPos, getRotationCFrame())
+		CanPlace = isInMyPlot(gridPos)
+		showGhost(CanPlace and VALID_COLOR or INVALID_COLOR)
+	else
+		hideGhost()
+		CanPlace = false
+	end
+end
+
+local function placeBlock()
+	if _G.InventoryController and _G.InventoryController.IsInventoryOpen() then return end
+	if not CanPlace or not CurrentGridPos then return end
+	
+	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
+	if not blockData then return end
+	
+	local rotation = _G.InventoryController and _G.InventoryController.GetRotation() or 0
+	
+	PlaceBlock:FireServer({
+		BlockType = blockData.Id,
+		Position = CurrentGridPos,
+		Rotation = rotation,
+		Material = blockData.Material,
+		Color = blockData.Color,
+	})
+end
+
+local function removeBlock()
+	if _G.InventoryController and _G.InventoryController.IsInventoryOpen() then return end
+	
+	local mousePos = UserInputService:GetMouseLocation()
+	local ray = Camera:ViewportPointToRay(mousePos.X, mousePos.Y)
+	
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = {LocalPlayer.Character, GhostBlock}
+	
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 500, raycastParams)
+	
+	if result and result.Instance then
+		local hit = result.Instance
+		
+		if hit:GetAttribute("BlockType") then
+			RemoveBlock:FireServer(hit)
+		elseif hit.Parent and hit.Parent:GetAttribute("BlockType") then
+			RemoveBlock:FireServer(hit.Parent)
+		end
+	end
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		placeBlock()
+	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+		removeBlock()
+	end
+end)
+
+RunService.RenderStepped:Connect(updateGhost)
+
+print("BuildingController initialized")

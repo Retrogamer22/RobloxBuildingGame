@@ -1,0 +1,12 @@
+{
+  "className": "Part",
+  "properties": {
+    "BottomSurface": "Smooth",
+    "CFrame": [24.2535, 1.85, 420.6, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Color": [66, 66, 67],
+    "Material": "Grass",
+    "MaterialVariant": "PixelGrass",
+    "Size": [0.2, 1.7, 0.2],
+    "TopSurface": "Smooth"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "className": "UnionOperation",
+  "properties": {
+    "Anchored": true,
+    "CFrame": [11.5099, 2.1463, 454.229, 0.7071, 0, 0.7071, 0, 1, 0, -0.7071, 0, 0.7071],
+    "Color": [100, 188, 29],
+    "Material": "Grass",
+    "MaterialVariant": "PixelGrass",
+    "PivotOffset": [0, -1.2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "Size": [0.001, 2.4, 1],
+    "UsePartColor": true
+  }
+}

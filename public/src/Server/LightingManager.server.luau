@@ -336,8 +336,6 @@ local function recalcBuildArea(buildArea)
 	end
 	
 	if adjustedCount > 0 then
-		print(string.format("[LightingManager] Recalculated %d lights (%d adjusted) in %s",
-			processedCount, adjustedCount, buildArea.Name))
 	end
 end
 
@@ -379,7 +377,6 @@ local function trackLight(light)
 	
 	local buildArea = getBuildArea(light)
 	if not buildArea then
-		print(string.format("[LightingManager] Skipped light '%s' - no build area found", light:GetFullName()))
 		return
 	end
 	
@@ -451,9 +448,6 @@ local function trackLight(light)
 	
 	local totalInArea = countLightsInArea(buildArea)
 	local flickerTag = isFlicker and " [flicker]" or ""
-	print(string.format("[LightingManager] Tracking %s%s (original: %.2f, target: %.2f, range: %.0f) in %s [%d total]",
-		light.ClassName, flickerTag, originalBrightness, targetBrightness, getLightRange(light),
-		buildArea.Name, totalInArea))
 	
 	-- Listen for Enabled changes (lamp toggling, etc.)
 	local enabledConn = light:GetPropertyChangedSignal("Enabled"):Connect(function()
@@ -475,7 +469,6 @@ local function trackLight(light)
 			enabledConn:Disconnect()
 			destroyConn:Disconnect()
 			local remaining = countLightsInArea(buildArea)
-			print(string.format("[LightingManager] Untracked light from %s [%d remaining]", buildArea.Name, remaining))
 			scheduleRecalc(buildArea)
 		end
 	end)
@@ -536,7 +529,6 @@ local function monitorBuildArea(buildArea)
 		end
 		
 		if lightCount > 0 then
-			print(string.format("[LightingManager] Found %d existing lights in %s", lightCount, buildArea.Name))
 		end
 		
 		local addedConn = folder.ChildAdded:Connect(function(block)
@@ -587,7 +579,6 @@ local function checkDeferredAreas()
 				end
 			end
 			
-			print(string.format("[LightingManager] Bulk operation ended in %s - rescanning", buildArea.Name))
 			scheduleRecalc(buildArea)
 		end
 	end
@@ -646,4 +637,3 @@ end
 
 initialize()
 
-print("[LightingManager] Initialized - monitoring light sources for blowout prevention")

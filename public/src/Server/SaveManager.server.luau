@@ -27,7 +27,6 @@ local BetaConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild
 
 -- Unique instance ID for debugging duplicate script detection
 local INSTANCE_ID = math.random(100000, 999999)
-print("[SaveManager] Script instance starting, ID:", INSTANCE_ID)
 
 -- Configuration
 local DATASTORE_NAME = "PlotSaves_v2"  -- New datastore for multi-slot system
@@ -48,6 +47,21 @@ local SlabPlacement = require(ReplicatedStorage:WaitForChild("SlabPlacement", 10
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local FencePlacement = require(ReplicatedStorage:WaitForChild("FencePlacement", 10))
 local GlassPlacement = require(ReplicatedStorage:WaitForChild("GlassPlacement", 10))
+
+-- Resolve a glass-style block's template Model from its type + generic shape name.
+-- Mirrors the same-named helper in BlockHandler. Standard glass lives in
+-- Decorations/Glass; glass-style reward sets (CandyLattice) live in their
+-- RewardSets folder. GlassPlacement.ResolveTemplate is the single source of
+-- truth for folder + model name per type. Returns the template Instance or nil.
+local function resolveGlassTemplate(glassType, genericTemplateName)
+	local folderPath, modelName = GlassPlacement.ResolveTemplate(glassType, genericTemplateName)
+	local folder = ReplicatedStorage
+	for _, folderName in ipairs(string.split(folderPath, "/")) do
+		folder = folder and folder:FindFirstChild(folderName)
+	end
+	if not folder then return nil end
+	return folder:FindFirstChild(modelName)
+end
 local LadderPlacement = require(ReplicatedStorage:WaitForChild("LadderPlacement", 10))
 local TorchPlacement = require(ReplicatedStorage:WaitForChild("TorchPlacement", 10))
 local LanternPlacement = require(ReplicatedStorage:WaitForChild("LanternPlacement", 10))
@@ -61,7 +75,7 @@ local ColorPalette = require(ReplicatedStorage:WaitForChild("Config"):WaitForChi
 local BulkOperationFlags = require(ReplicatedStorage:WaitForChild("BulkOperationFlags", 10))
 
 -- Glass debug levels: 0=off, 1=summary, 2=verbose
-local DEBUG_GLASS_LEVEL = 1
+local DEBUG_GLASS_LEVEL = 0
 
 -- Wait for terrain generator and weather manager
 local TerrainGenerator = nil
@@ -97,7 +111,6 @@ task.spawn(function()
 			task.wait(0.5)
 			if _G.SaplingHandler then
 				SaplingHandler = _G.SaplingHandler
-				print("[SaveManager] SaplingHandler loaded")
 				return
 			end
 		end
@@ -244,7 +257,6 @@ local function checkForDuplicateRemotes()
 				if child.Name == name then
 					if foundFirst then
 						child:Destroy()
-						print("[SaveManager] Removed duplicate remote: " .. name)
 					else
 						foundFirst = true
 					end
@@ -265,6 +277,12 @@ local PurchaseSlotWithCoins = getOrCreateRemote("PurchaseSlotWithCoins")
 local RenameSlot = getOrCreateRemote("RenameSlot")
 local ImportLegacy = getOrCreateRemote("ImportLegacy")
 local PlotClearing = getOrCreateRemote("PlotClearing")  -- Notify clients when plot is being cleared/loaded
+-- Seed the client's dug-position set at load time so its terrain prediction never spawns
+-- phantom blocks into saved holes. Same remote the BlockHandler uses for after-the-fact
+-- cleanup; ClientPrediction's handler marks each position dug and removes any prediction
+-- there. getOrCreateRemote is idempotent: returns BlockHandler's instance if it already
+-- made one, otherwise creates the shared remote here (order-independent).
+local TerrainDugPositions = getOrCreateRemote("TerrainDugPositions")
 
 -- Check for and remove any duplicate remotes
 checkForDuplicateRemotes()
@@ -402,8 +420,6 @@ local function migrateLegacySave(player)
 		return false, "No legacy save found"
 	end
 	
-	print("[SaveManager] Found legacy save for " .. player.Name .. ", migrating to slot 1...")
-	
 	-- Get or create metadata
 	local meta = getPlayerMeta(player.UserId)
 	if not meta then
@@ -441,7 +457,6 @@ local function migrateLegacySave(player)
 	
 	savePlayerMeta(player.UserId, meta)
 	
-	print("[SaveManager] Successfully migrated legacy save for " .. player.Name)
 	return true, 1  -- Return success and slot number
 end
 
@@ -613,7 +628,6 @@ local function savePlotToSlot(player, buildArea, slotNumber)
 			end
 			if #removedRelative > 0 then
 				saveData.removedBlocks = removedRelative
-				print(string.format("[SaveManager] Saving %d removed terrain-generated blocks", #removedRelative))
 			end
 		end
 	end
@@ -623,10 +637,6 @@ local function savePlotToSlot(player, buildArea, slotNumber)
 	if size > PlotSerializer.MAX_SIZE then
 		return false, "Save data too large: " .. math.floor(size / 1000) .. "KB (max 3500KB)"
 	end
-	
-	-- Debug: Log dug positions before save
-	print(string.format("[SaveManager] DEBUG: Saving %d blocks, %d dug positions, %d removed terrain blocks to slot %d", 
-		#saveData.blocks, #(saveData.dug or {}), #(saveData.removedBlocks or {}), slotNumber))
 	
 	-- CORRUPTION GUARD: Refuse to save if the serializer returned 0 blocks but the
 	-- Blocks folder has player-placed blocks. This indicates a serializer error or
@@ -687,9 +697,6 @@ local function savePlotToSlot(player, buildArea, slotNumber)
 		}
 		meta.activeSlot = slotNumber
 		savePlayerMeta(player.UserId, meta)
-		
-		print(string.format("[SaveManager] Saved plot for %s to slot %d (%d blocks, %d lifetime, %.1fKB)", 
-			player.Name, slotNumber, blockCount, lifetimeBlocks, size / 1000))
 		return true, blockCount, lifetimeBlocks
 	else
 		warn("[SaveManager] Save failed for " .. player.Name .. ": " .. tostring(err))
@@ -756,13 +763,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		blockData.gridY * BLOCK_SIZE + offset.Y,
 		blockData.gridZ * BLOCK_SIZE + offset.Z
 	)
-	
-	-- Debug logging for lazy-loaded blocks
-	if blockData.attributes.IsLazyLoaded then
-		print(string.format("[LoadDebug] %s LazyLoaded -> Grid(%d,%d,%d) -> WorldPos(%.2f,%.2f,%.2f)",
-			blockData.blockType, blockData.gridX, blockData.gridY, blockData.gridZ,
-			worldPos.X, worldPos.Y, worldPos.Z))
-	end
 	
 	-- Determine template to use
 	local templateName = shapeData.TemplateName
@@ -877,10 +877,11 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 			end
 		end
 	elseif isGlass then
-		-- GLASS: Use template from Decorations/Glass folder based on connection type
-		local glassFolder = DecorationsSourceFolder and DecorationsSourceFolder:FindFirstChild("Glass")
-		if glassFolder then
-			template = glassFolder:FindFirstChild(templateName)
+		-- GLASS: Resolve template from the glass-type registry. Standard glass uses
+		-- Decorations/Glass; CandyLattice uses RewardSets/CandyBlocks. templateName is
+		-- the generic shape (Glass_0 / Glass_Corner / Glass_Tee / Glass_4_Way).
+		template = resolveGlassTemplate(blockData.blockType, templateName)
+		if template then
 			usedBlockModel = false
 		end
 	elseif isTorch then
@@ -918,8 +919,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 			end
 			template = BlockTemplates:FindFirstChild(chestModelName)
 			usedBlockModel = false
-			print(string.format("[Chest] LOAD template=%s found=%s isDouble=%s",
-				chestModelName, tostring(template ~= nil), tostring(blockData.attributes.IsDoubleChest or false)))
 		end
 	elseif isBed then
 		-- BED: Use template from BlockTemplates
@@ -998,7 +997,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		if solidName and BlockTemplates then
 			template = BlockTemplates:FindFirstChild(solidName)
 			usedBlockModel = false
-			print("[SaveManager] Using solid template " .. solidName .. " for filled frame " .. blockData.blockType)
 		end
 	end
 	
@@ -1020,7 +1018,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 			template = frameBlocksFolder:FindFirstChild(frameCornerName)
 			if template then
 				usedBlockModel = true
-				print("[SaveManager] Using frame corner model " .. frameCornerName .. " for " .. blockData.blockType)
 			end
 		end
 	end
@@ -1065,7 +1062,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 	local block = template:Clone()
 	block.Name = blockData.blockType
 	if isChest then
-		print(string.format("[Chest] LOAD cloned template=%s for type=%s isDouble=%s", template.Name, blockData.blockType, tostring(blockData.attributes.IsDoubleChest)))
 	end
 	
 	-- Check if this is a decoration (need this early for CanCollide)
@@ -1253,9 +1249,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		-- Wall sign: use saved face and fence post flag for flush positioning
 		local signFace = blockData.attributes.SignFace or "North"
 		local isOnFencePost = blockData.attributes.IsOnFencePost or false
-		print(string.format("[SaveManager] Loading wall sign: face=%s, isOnFencePost=%s, worldPos=(%.2f,%.2f,%.2f), grid=(%d,%d,%d)", 
-			signFace, tostring(isOnFencePost), worldPos.X, worldPos.Y, worldPos.Z,
-			blockData.gridX, blockData.gridY, blockData.gridZ))
 		cframe = SignPlacement.GetWallSignCFrame(worldPos, signFace, isOnFencePost)
 		-- Store grid position so subsequent saves use correct position (not visual offset position)
 		block:SetAttribute("GridPosX", worldPos.X)
@@ -1270,12 +1263,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		local hostX = blockData.attributes.HostBlockX
 		local hostY = blockData.attributes.HostBlockY
 		local hostZ = blockData.attributes.HostBlockZ
-		print(string.format("[WP-LOAD] %s face=%s filled=%s grid=(%d,%d,%d) worldPos=(%.2f,%.2f,%.2f)",
-			blockData.blockType, wallpaperFace, tostring(blockData.attributes.FrameFillBlockId),
-			blockData.gridX, blockData.gridY, blockData.gridZ,
-			worldPos.X, worldPos.Y, worldPos.Z))
-		print(string.format("[WP-LOAD]   HostBlock=(%s,%s,%s) using worldPos as host",
-			tostring(hostX), tostring(hostY), tostring(hostZ)))
 		-- Always use worldPos for CFrame (it's the correct grid center)
 		cframe = WallpaperPlacement.GetWallpaperCFrame(worldPos, wallpaperFace)
 		if not blockData.attributes.FrameFillBlockId then
@@ -1297,9 +1284,6 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		block:SetAttribute("HostBlockX", worldPos.X)
 		block:SetAttribute("HostBlockY", worldPos.Y)
 		block:SetAttribute("HostBlockZ", worldPos.Z)
-		print(string.format("[WP-LOAD]   CFrame.pos=(%.2f,%.2f,%.2f) gridAligned=(%.2f,%.2f,%.2f)",
-			cframe.Position.X, cframe.Position.Y, cframe.Position.Z,
-			worldPos.X, worldPos.Y, worldPos.Z))
 	elseif blockData.blockType == "SnowLayer" then
 		-- SnowLayer: resize based on saved layer count and position at bottom of grid cell
 		local snowLayers = blockData.attributes.SnowLayers or 1
@@ -1356,24 +1340,63 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		local chestRotation = blockData.attributes.Rotation or 0
 		local chestCenter = worldPos
 		local isDouble = blockData.attributes.IsDoubleChest
-		-- Double chests: position at midpoint between primary and secondary cells
-		if isDouble and blockData.attributes.ChestSecondaryX then
-			local secX = blockData.attributes.ChestSecondaryX
-			local secY = blockData.attributes.ChestSecondaryY
-			local secZ = blockData.attributes.ChestSecondaryZ
-			local secondaryWorldPos = Vector3.new(secX, secY, secZ)
+		-- Double chests: position at midpoint between primary and secondary cells.
+		-- Secondary is now stored ORIGIN-RELATIVE (csx/csy/csz) and reconstructed with the
+		-- same transform as the primary worldPos, so it re-bases correctly at any origin.
+		-- Legacy saves only have absolute ChestSecondaryX/Y/Z; for those we recover the
+		-- offset direction from the saved rotation (cells are always one block apart along
+		-- the facing axis) so the chest still lands inside the plot.
+		local secondaryWorldPos = nil
+		if isDouble then
+			local relSecX = blockData.attributes.csx
+			local relSecY = blockData.attributes.csy
+			local relSecZ = blockData.attributes.csz
+			if relSecX and relSecY and relSecZ then
+				-- New relative format: same transform as primary worldPos
+				secondaryWorldPos = Vector3.new(
+					relSecX * BLOCK_SIZE + offset.X,
+					relSecY * BLOCK_SIZE + offset.Y,
+					relSecZ * BLOCK_SIZE + offset.Z
+				)
+			elseif blockData.attributes.ChestSecondaryX then
+				-- Legacy absolute format: reconstruct from primary + rotation axis. The two
+				-- cells differ by one BLOCK_SIZE along X (rot 0/180) or Z (rot 90/270); recover
+				-- the sign from the stale absolute pair (their delta is origin-independent).
+				local legSecX = blockData.attributes.ChestSecondaryX
+				local legSecZ = blockData.attributes.ChestSecondaryZ
+				local legPrimX = blockData.attributes.BlockPosX
+				local legPrimZ = blockData.attributes.BlockPosZ
+				local rotNorm = chestRotation % 360
+				local axisIsX = (rotNorm == 0 or rotNorm == 180)
+				local sign = 1
+				if legPrimX and legPrimZ then
+					if axisIsX then
+						sign = (legSecX - legPrimX) >= 0 and 1 or -1
+					else
+						sign = (legSecZ - legPrimZ) >= 0 and 1 or -1
+					end
+				end
+				local delta = axisIsX and Vector3.new(sign * BLOCK_SIZE, 0, 0) or Vector3.new(0, 0, sign * BLOCK_SIZE)
+				secondaryWorldPos = worldPos + delta
+			end
+		end
+		if isDouble and secondaryWorldPos then
 			chestCenter = (worldPos + secondaryWorldPos) / 2
-			print(string.format("[Chest] LOAD DOUBLE CFrame: worldPos=(%.2f,%.2f,%.2f) secondary=(%.2f,%.2f,%.2f) midpoint=(%.2f,%.2f,%.2f) rot=%d",
-				worldPos.X, worldPos.Y, worldPos.Z, secX, secY, secZ, chestCenter.X, chestCenter.Y, chestCenter.Z, chestRotation))
 		else
-			print(string.format("[Chest] LOAD SINGLE CFrame: worldPos=(%.2f,%.2f,%.2f) rot=%d isDouble=%s hasSecondary=%s",
-				worldPos.X, worldPos.Y, worldPos.Z, chestRotation, tostring(isDouble), tostring(blockData.attributes.ChestSecondaryX ~= nil)))
 		end
 		cframe = CFrame.new(chestCenter) * CFrame.Angles(0, math.rad(chestRotation), 0) * CFrame.new(0, 0, 0.15)
 		-- Store clean grid position so next save cycle doesn't drift
 		block:SetAttribute("BlockPosX", worldPos.X)
 		block:SetAttribute("BlockPosY", worldPos.Y)
 		block:SetAttribute("BlockPosZ", worldPos.Z)
+		-- Re-write the live secondary attributes to the CORRECTED world coords so that
+		-- split-on-break and the next save use accurate positions (the generic attribute
+		-- loop below would otherwise restore stale/relative values).
+		if isDouble and secondaryWorldPos then
+			block:SetAttribute("ChestSecondaryX", secondaryWorldPos.X)
+			block:SetAttribute("ChestSecondaryY", secondaryWorldPos.Y)
+			block:SetAttribute("ChestSecondaryZ", secondaryWorldPos.Z)
+		end
 	elseif isBed then
 		-- Bed: saved rotation, Y offset to sit on cell floor
 		local bedRotation = blockData.attributes.Rotation or 0
@@ -1584,6 +1607,11 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 			if attrName == "_WireConnections" then
 				wireConnections = attrValue
 			end
+		elseif attrName == "ChestSecondaryX" or attrName == "ChestSecondaryY" or attrName == "ChestSecondaryZ"
+			or attrName == "csx" or attrName == "csy" or attrName == "csz" then
+			-- Chest secondary position is handled explicitly in the chest CFrame block above
+			-- (reconstructed from relative csx/csy/csz or legacy absolutes). Skip here so the
+			-- corrected world coords aren't clobbered by stale/relative saved values.
 		else
 			block:SetAttribute(attrName, attrValue)
 		end
@@ -1992,11 +2020,16 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 			end
 		end
 		-- DoubleChest: resize hitbox to span both cells
-		if blockData.attributes.IsDoubleChest and blockData.attributes.ChestSecondaryX then
+		if blockData.attributes.IsDoubleChest then
 			local hitbox = block:FindFirstChild("Hitbox")
-			if hitbox then
+			-- Read the CORRECTED secondary off the block (set in the chest CFrame block above),
+			-- not the stale/relative saved attributes.
+			local csX = block:GetAttribute("ChestSecondaryX")
+			local csY = block:GetAttribute("ChestSecondaryY")
+			local csZ = block:GetAttribute("ChestSecondaryZ")
+			if hitbox and csX and csY and csZ then
 				local chestRot = (blockData.attributes.Rotation or 0) % 360
-				local secPos = Vector3.new(blockData.attributes.ChestSecondaryX, blockData.attributes.ChestSecondaryY, blockData.attributes.ChestSecondaryZ)
+				local secPos = Vector3.new(csX, csY, csZ)
 				local midpoint = (worldPos + secPos) / 2
 				hitbox.Size = Vector3.new(
 					(chestRot == 0 or chestRot == 180) and BLOCK_SIZE * 2 or BLOCK_SIZE,
@@ -2197,7 +2230,6 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 	
 	-- If no save data, reset to fresh plot
 	if not saveData then
-		print("[SaveManager] No save data in slot " .. slotNumber .. " for " .. player.Name .. ", resetting to fresh plot")
 		
 		-- Notify clients to clear particles before we clear the plot
 		PlotClearing:FireClient(player, plotNumber)
@@ -2245,8 +2277,6 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 	end
 	
 	-- Debug
-	print(string.format("[SaveManager] DEBUG LOAD: Slot %d has %d blocks", 
-		slotNumber, saveData.blocks and #saveData.blocks or 0))
 	
 	-- Deserialize
 	local plotData, deserializeError = PlotSerializer.DeserializePlot(saveData)
@@ -2285,7 +2315,6 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 		end
 		
 		plotData.dugPositions = reconstructedDug
-		print(string.format("[SaveManager] Reconstructed %d dug positions", #reconstructedDug))
 	end
 	
 	-- Notify clients to clear particles before we clear the plot
@@ -2310,7 +2339,6 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 			if plotData.terrainMaxHeight then buildArea:SetAttribute("TerrainMaxHeight", plotData.terrainMaxHeight) end
 			if plotData.terrainStartX then buildArea:SetAttribute("TerrainStartX", plotData.terrainStartX) end
 			if plotData.terrainStartZ then buildArea:SetAttribute("TerrainStartZ", plotData.terrainStartZ) end
-			print(string.format("[SaveManager] Restored saved height map for exact terrain restoration"))
 		end
 		
 		local originalSettings = TerrainGenerator.GetGenerationSettings()
@@ -2352,6 +2380,12 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 			posZ - sizeZ / 2 + BLOCK_SIZE / 2
 		)
 	end
+	
+	-- Accumulates every dug world-position handed to MarkPositionsAsDug below, so we can
+	-- seed the owning client's terrain prediction with the same set once the load finishes.
+	-- Prevents the "phantom terrain flashes into old holes on first dig" glitch. Consumed by
+	-- the TerrainDugPositions:FireClient block at the end of this function.
+	local clientDugSeed = {}
 	
 	-- Remove dug terrain blocks (optimized with budget-based yielding)
 	local dugRemoved = 0
@@ -2487,12 +2521,15 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 			end
 			
 			TerrainGenerator.MarkPositionsAsDug(dugWorldPositions, plotNumber)
+			-- Mirror into the client seed (see clientDugSeed above)
+			for _, p in ipairs(dugWorldPositions) do clientDugSeed[#clientDugSeed + 1] = p end
 			
-			-- Spawn edge walls for dug positions at plot boundaries
-			-- This fills the gaps visible when digging at the edge, saving, and reloading
-			if TerrainGenerator.SpawnEdgeWallsForDugPositions then
-				TerrainGenerator.SpawnEdgeWallsForDugPositions(buildArea, plotNumber, dugWorldPositions)
-			end
+			-- Edge walls DISABLED: floor is deep enough now that edge gaps don't need filling.
+			-- This load-time fill was spawning unbreakable (CanQuery=false) dark-tinted dirt
+			-- columns around the plot border whenever the player dug near the edge and reloaded.
+			-- if TerrainGenerator.SpawnEdgeWallsForDugPositions then
+			-- 	TerrainGenerator.SpawnEdgeWallsForDugPositions(buildArea, plotNumber, dugWorldPositions)
+			-- end
 		end
 	end
 	
@@ -2602,7 +2639,6 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 		end
 		
 		if removedTerrainCount > 0 then
-			print(string.format("[SaveManager] Removed %d terrain-generated blocks (trees/decorations/etc) from loaded save", removedTerrainCount))
 		end
 	end
 	
@@ -2628,6 +2664,8 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 		
 		if #allDugPositions > 0 then
 			TerrainGenerator.MarkPositionsAsDug(allDugPositions, plotNumber)
+			-- Mirror into the client seed (see clientDugSeed above)
+			for _, p in ipairs(allDugPositions) do clientDugSeed[#clientDugSeed + 1] = p end
 		end
 	end
 	
@@ -2679,9 +2717,6 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 	createdBlocks = nil -- Free for GC
 	templateCtx = nil
 	
-	print(string.format("[SaveManager] Loaded slot %d for %s (%d blocks, %d failed)", 
-		slotNumber, player.Name, created, failed))
-	
 	-- Post-load: Remove decorations that overlap with player-placed blocks
 	-- Uses playerBlockPositions tracked during creation (no extra child scan needed)
 	local decoCleanupCount = 0
@@ -2715,7 +2750,6 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 		playerBlockPositions = nil -- Free for GC
 		
 		if decoCleanupCount > 0 then
-			print(string.format("[SaveManager] Cleaned up %d decorations overlapping with player blocks", decoCleanupCount))
 		end
 	end
 	
@@ -2728,10 +2762,7 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 	end
 	
 	if #glassBlocks > 0 then
-		local DecorationsSourceFolder = getDecorationsFolder()
-		local glassFolder = DecorationsSourceFolder and DecorationsSourceFolder:FindFirstChild("Glass")
-		
-		if glassFolder then
+		do
 			local glassUpdated = 0
 			
 			local function snapToGrid(pos)
@@ -2743,7 +2774,8 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 			end
 			
 			local function createGlassBlock(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-				local template = glassFolder:FindFirstChild(glassTemplateName)
+				-- Resolve per-block: standard glass -> Decorations/Glass, CandyLattice -> RewardSets/CandyBlocks.
+				local template = resolveGlassTemplate(glassType, glassTemplateName)
 				if not template then return nil end
 				
 				local newGlass = template:Clone()
@@ -2866,13 +2898,28 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 	if TerrainGenerator and TerrainGenerator.RepairMissingTerrain then
 		local repaired = TerrainGenerator.RepairMissingTerrain(buildArea, plotNumber)
 		if repaired > 0 then
-			print(string.format("[SaveManager] Auto-repaired %d missing terrain blocks", repaired))
 		end
 	end
 	
 	DirtyPlots[player.UserId] = false
 	PlayerActiveSlot[player.UserId] = slotNumber
 	LoadSucceeded[player.UserId] = true -- Plot loaded successfully; saving is now safe.
+	
+	-- Seed the client's terrain prediction with this plot's dug positions BEFORE it can
+	-- predict into them. Without this, digging next to a previously-dug-out area makes the
+	-- client spawn phantom terrain into the saved hole (it has no session record that those
+	-- cells are dug), which then gets cleaned up a round-trip later -- the "blocks flash in,
+	-- then vanish" glitch. Chunked so no single remote payload is huge on heavily-mined plots.
+	if #clientDugSeed > 0 and TerrainDugPositions then
+		local SEED_CHUNK = 600
+		for i = 1, #clientDugSeed, SEED_CHUNK do
+			local batch = {}
+			for j = i, math.min(i + SEED_CHUNK - 1, #clientDugSeed) do
+				batch[#batch + 1] = clientDugSeed[j]
+			end
+			TerrainDugPositions:FireClient(player, batch)
+		end
+	end
 	
 	-- Update metadata
 	local meta = getPlayerMeta(player.UserId)
@@ -2923,7 +2970,6 @@ local function deleteSlot(player, slotNumber)
 	meta.slots[slotNumber] = nil
 	savePlayerMeta(player.UserId, meta)
 	
-	print("[SaveManager] Deleted slot " .. slotNumber .. " for " .. player.Name)
 	return true
 end
 
@@ -2948,7 +2994,6 @@ local function purchaseExtraSlot(player)
 	if player.UserId == ownerUserId then
 		meta.maxSlots = meta.maxSlots + 1
 		savePlayerMeta(player.UserId, meta)
-		print("[SaveManager] Granted free slot to game owner (now has " .. meta.maxSlots .. " slots)")
 		return true, meta.maxSlots
 	end
 	
@@ -2992,7 +3037,6 @@ _G.RegisterReceiptHandler = function(productId, handler)
 		return
 	end
 	ExtraReceiptHandlers[productId] = handler
-	print("[SaveManager] Registered receipt handler for productId", productId)
 end
 
 local function processReceipt(receiptInfo)
@@ -3019,7 +3063,6 @@ local function processReceipt(receiptInfo)
 			warn("[SaveManager] Slot purchase save failed for", player.Name, ":", err)
 			return Enum.ProductPurchaseDecision.NotProcessedYet
 		end
-		print("[SaveManager] Added slot for " .. player.Name .. " (now has " .. meta.maxSlots .. " slots)")
 		SaveLoadResult:FireClient(player, "slotPurchased", true, meta.maxSlots)
 		return Enum.ProductPurchaseDecision.PurchaseGranted
 	end
@@ -3103,7 +3146,6 @@ local function connectEventHandlers()
 	-- Save to slot
 	SavePlot.OnServerEvent:Connect(function(player, slotNumber)
 		slotNumber = slotNumber or PlayerActiveSlot[player.UserId] or 1
-		print("[SaveManager] Save request to slot", slotNumber, "from", player.Name)
 		
 		local buildArea, plotNumber = getPlayerBuildArea(player)
 		if not buildArea then
@@ -3126,7 +3168,6 @@ local function connectEventHandlers()
 	-- Load from slot
 	LoadPlot.OnServerEvent:Connect(function(player, slotNumber)
 		slotNumber = slotNumber or PlayerActiveSlot[player.UserId] or 1
-		print("[SaveManager] Load request from slot", slotNumber, "for", player.Name)
 		
 		local buildArea, plotNumber = getPlayerBuildArea(player)
 		if not buildArea then
@@ -3144,7 +3185,6 @@ local function connectEventHandlers()
 	
 	-- Delete slot
 	DeleteSlot.OnServerEvent:Connect(function(player, slotNumber)
-		print("[SaveManager] Delete request for slot", slotNumber, "from", player.Name)
 		
 		local success, err = deleteSlot(player, slotNumber)
 		if success then
@@ -3156,7 +3196,6 @@ local function connectEventHandlers()
 	
 	-- Rename slot
 	RenameSlot.OnServerEvent:Connect(function(player, slotNumber, newName)
-		print("[SaveManager] Rename request for slot", slotNumber, "to", newName, "from", player.Name)
 		
 		local meta = getPlayerMeta(player.UserId)
 		if not meta then
@@ -3188,7 +3227,6 @@ local function connectEventHandlers()
 		local success, err = savePlayerMeta(player.UserId, meta)
 		
 		if success then
-			print("[SaveManager] Renamed slot " .. slotNumber .. " to '" .. newName .. "' for " .. player.Name)
 			SaveLoadResult:FireClient(player, "rename", true, newName)
 		else
 			SaveLoadResult:FireClient(player, "rename", false, "Failed to save: " .. tostring(err))
@@ -3197,7 +3235,6 @@ local function connectEventHandlers()
 	
 	-- Import legacy save to a slot
 	ImportLegacy.OnServerEvent:Connect(function(player, targetSlot)
-		print("[SaveManager] Import legacy request to slot", targetSlot, "from", player.Name)
 		
 		local legacyStore = getLegacyDataStore()
 		if not legacyStore then
@@ -3258,13 +3295,12 @@ local function connectEventHandlers()
 		}
 		savePlayerMeta(player.UserId, meta)
 		
-		print("[SaveManager] Imported legacy save (" .. blockCount .. " blocks) to slot " .. targetSlot .. " for " .. player.Name)
+		
 		SaveLoadResult:FireClient(player, "import", true, blockCount)
 	end)
 	
 	-- Purchase slot
 	PurchaseSlot.OnServerEvent:Connect(function(player)
-		print("[SaveManager] Slot purchase (Robux) request from", player.Name)
 		
 		local success, result = purchaseExtraSlot(player)
 		if success and type(result) == "number" then
@@ -3278,7 +3314,6 @@ local function connectEventHandlers()
 	
 	-- Coin-based slot purchase
 	PurchaseSlotWithCoins.OnServerEvent:Connect(function(player)
-		print("[SaveManager] Slot purchase (Coins) request from", player.Name)
 		
 		local meta = getPlayerMeta(player.UserId)
 		if not meta then
@@ -3308,7 +3343,6 @@ local function connectEventHandlers()
 		-- Grant the slot
 		meta.maxSlots = meta.maxSlots + 1
 		savePlayerMeta(player.UserId, meta)
-		print("[SaveManager] Granted coin-purchased slot to " .. player.Name .. " (now has " .. meta.maxSlots .. " slots, spent " .. price .. " coins)")
 		SaveLoadResult:FireClient(player, "slotPurchased", true, meta.maxSlots)
 	end)
 	
@@ -3335,9 +3369,8 @@ local function connectEventHandlers()
 				LastSaveTime[player.UserId] = 0
 				local success, blockCount = savePlotToSlot(player, buildArea, activeSlot)
 				if success then
-					print("[SaveManager] Emergency save succeeded for " .. player.Name .. " (" .. tostring(blockCount) .. " blocks)")
+					
 				else
-					warn("[SaveManager] Emergency save FAILED for " .. player.Name .. ": " .. tostring(blockCount))
 				end
 			end
 		end
@@ -3367,7 +3400,6 @@ local function connectEventHandlers()
 		end)
 	end
 	
-	print("[SaveManager] Event handlers connected")
 end
 
 connectEventHandlers()
@@ -3452,7 +3484,6 @@ AutoLoadPlot.OnInvoke = function(player, buildArea, plotNumber)
 		return false, "No save data"
 	end
 	
-	print("[SaveManager] Auto-loading slot " .. activeSlot .. " for " .. player.Name)
 	
 	local success, result = loadPlotFromSlot(player, buildArea, plotNumber, activeSlot)
 	
@@ -3486,7 +3517,6 @@ SavePlotSync.OnInvoke = function(player)
 	-- BindToClose fires first during Studio stop/server shutdown and may save the correct
 	-- build area. SavePlotSync firing afterwards could overwrite with stale/wrong data.
 	if SavedDuringShutdown[player.UserId] then
-		print("[SaveManager] SavePlotSync: Skipping - BindToClose already saved " .. player.Name)
 		SavedOnLeave[player.UserId] = true
 		return true, 0
 	end
@@ -3503,15 +3533,12 @@ SavePlotSync.OnInvoke = function(player)
 	if not activeSlot then
 		local meta = getPlayerMeta(player.UserId)
 		activeSlot = meta and meta.activeSlot or 1
-		print("[SaveManager] SavePlotSync: PlayerActiveSlot was nil, using meta.activeSlot:", activeSlot)
 	end
 	
 	-- Log build area details so we can verify we're saving the right plot
 	local sizeX = buildArea:GetAttribute("BasePlateSizeX") or 0
 	local sizeZ = buildArea:GetAttribute("BasePlateSizeZ") or 0
 	local terrainStyle = buildArea:GetAttribute("TerrainStyle") or "?"
-	print(string.format("[SaveManager] SavePlotSync starting for %s (slot %d, buildArea=%s, size=%.0fx%.0f, terrain=%s)",
-		player.Name, activeSlot, buildArea.Name, sizeX, sizeZ, terrainStyle))
 	
 	LastSaveTime[player.UserId] = 0
 	local success, blockCount, lifetimeBlocks = savePlotToSlot(player, buildArea, activeSlot)
@@ -3520,7 +3547,6 @@ SavePlotSync.OnInvoke = function(player)
 	SavedOnLeave[player.UserId] = true
 	
 	if success then
-		print(string.format("[SaveManager] Sync-saved to slot %d for %s (%d blocks)", activeSlot, player.Name, blockCount))
 		SavedDuringShutdown[player.UserId] = true
 		
 		if BetaPlayerManager then
@@ -3544,7 +3570,6 @@ end)
 -- ============================================
 
 game:BindToClose(function()
-	print("[SaveManager] Server shutting down, saving all player plots...")
 	
 	local saveThreads = {}
 	local skippedCount = 0
@@ -3563,14 +3588,14 @@ game:BindToClose(function()
 				if not activeSlot then
 					local meta = getPlayerMeta(player.UserId)
 					activeSlot = meta and meta.activeSlot or 1
-					print("[SaveManager] BindToClose: PlayerActiveSlot was nil for", player.Name, ", using meta.activeSlot:", activeSlot)
+					
 				end
 				
 				LastSaveTime[player.UserId] = 0
 				local success, result = savePlotToSlot(player, buildArea, activeSlot)
 				if success then
 					SavedDuringShutdown[player.UserId] = true
-					print("[SaveManager] BindToClose saved slot " .. activeSlot .. " for " .. player.Name)
+					
 				end
 			end)
 			table.insert(saveThreads, thread)
@@ -3589,7 +3614,7 @@ game:BindToClose(function()
 		task.wait(0.1)
 	end
 	
-	print(string.format("[SaveManager] BindToClose complete (skipped %d already-saved)", skippedCount))
+	
 end)
 
 -- ============================================
@@ -3614,8 +3639,6 @@ task.spawn(function()
 							LastSaveTime[userId] = 0 -- bypass cooldown for autosave
 							local success, result = savePlotToSlot(player, buildArea, activeSlot)
 							if success then
-								print(string.format("[SaveManager] Auto-saved %s slot %d (%d blocks)",
-									player.Name, activeSlot, result))
 							else
 								warn(string.format("[SaveManager] Auto-save failed for %s slot %d: %s",
 									player.Name, activeSlot, tostring(result)))
@@ -3648,8 +3671,5 @@ MarkTipsSeen.OnServerEvent:Connect(function(player)
 	if meta then
 		meta.tipsSeen = true
 		savePlayerMeta(player.UserId, meta)
-		print("[SaveManager] Marked tips as seen for", player.Name)
 	end
 end)
-
-print("[SaveManager] Multi-slot system initialized (instance:", INSTANCE_ID, ")")

@@ -324,6 +324,8 @@ local DecorationPlacementRestrictions = {
 	["DarkOakSapling"] = { "Dirt", "GrassBlock" },
 	["EbonySapling"] = { "Dirt", "GrassBlock" },
 	["RedwoodSapling"] = { "Dirt", "GrassBlock" },
+	-- Candy reward sapling (Step 5) — same restriction.
+	["CandyCaneSapling"] = { "Dirt", "GrassBlock" },
 }
 
 -- Color palette for customization
@@ -2011,15 +2013,27 @@ end
 -- Generate presets at module load
 local Presets = generatePresets()
 
--- Append auto-generated reward block presets (from ReplicatedStorage.RewardSets)
+-- Append auto-generated reward block presets (from ReplicatedStorage.RewardSets).
+-- Generate() returns (presets, themedTabs); the latter is a list of themed-pack
+-- tabs declared by manifests (e.g. Candy), which the inventory renders as right-
+-- side tabs gated by player unlocks.
+local ThemedPackTabs = {}
 local rewardPresetsOk, RewardBlockPresets = pcall(require, ReplicatedStorage:WaitForChild("RewardBlockPresets"))
 if rewardPresetsOk and RewardBlockPresets then
-	local rewardPresets = RewardBlockPresets.Generate()
+	local rewardPresets, themedTabs = RewardBlockPresets.Generate()
 	for _, preset in ipairs(rewardPresets) do
 		table.insert(Presets, preset)
 	end
+	if themedTabs then
+		ThemedPackTabs = themedTabs
+	end
 	if #rewardPresets > 0 then
 		print(string.format("[BlockPresets] Added %d reward-block preset(s) from RewardSets folder", #rewardPresets))
+	end
+	if #ThemedPackTabs > 0 then
+		local names = {}
+		for _, t in ipairs(ThemedPackTabs) do table.insert(names, t.Name) end
+		print(string.format("[BlockPresets] Themed-pack tabs: %s", table.concat(names, ", ")))
 	end
 else
 	warn("[BlockPresets] Could not load RewardBlockPresets module")
@@ -2124,6 +2138,13 @@ local function GetAllCategories()
 	return Categories
 end
 
+-- Themed-pack tabs (right-side tabs declared by reward-set Manifest.Tab fields).
+-- Returns a list of { Name = "Candy", IconBlockName = "CandyBricks", SetName = "CandyBlocks" }.
+-- The inventory uses this to render dynamic right-side tabs gated by player unlocks.
+local function GetThemedPackTabs()
+	return ThemedPackTabs
+end
+
 local function GetAllColors()
 	return Colors
 end
@@ -2147,11 +2168,26 @@ local function IsGlass(id)
 end
 
 local function IsSapling(id)
-	return SaplingBlocks[id] ~= nil
+	if SaplingBlocks[id] ~= nil then return true end
+	-- Reward-set saplings are tagged via the manifest (IsSaplingItem=true). Consult
+	-- the preset list so SaplingHandler.RegisterSapling fires for them at placement.
+	for _, preset in ipairs(Presets) do
+		if preset.Id == id and preset.IsSaplingItem then
+			return true
+		end
+	end
+	return false
 end
 
 local function GetSaplingTreeType(id)
-	return SaplingBlocks[id]
+	if SaplingBlocks[id] then return SaplingBlocks[id] end
+	-- Reward-set saplings carry TreeType on the preset itself.
+	for _, preset in ipairs(Presets) do
+		if preset.Id == id and preset.TreeType then
+			return preset.TreeType
+		end
+	end
+	return nil
 end
 
 local function IsLadder(id)
@@ -2307,6 +2343,7 @@ return {
 	GetShape = GetShape,
 	GetAllPresets = GetAllPresets,
 	GetAllCategories = GetAllCategories,
+	GetThemedPackTabs = GetThemedPackTabs,
 	GetAllColors = GetAllColors,
 	IsDecoration = IsDecoration,
 	IsDoor = IsDoor,

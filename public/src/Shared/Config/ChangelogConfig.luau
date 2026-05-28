@@ -6,16 +6,15 @@
 
 local ChangelogConfig = {
 	-- Current version (increment this with each update)
-	VERSION = 22,
+	VERSION = 24,
 	
 	-- Version display name (shown to players)
-	VERSION_NAME = "v1.7.3",
+	VERSION_NAME = "v1.7.5",
 	
 	-- Developer Notes (optional) - shown in a highlighted box above changes
 	-- Set to nil or empty string to hide the notes section
 	-- Use this for bug awareness, upcoming features, warnings, etc.
 	NOTES = "",
-	
 	-- Notes style: "warning" (yellow), "info" (blue), "success" (green), "error" (red)
 	NOTES_STYLE = "warning",
 	
@@ -25,7 +24,7 @@ local ChangelogConfig = {
 	IMAGES = {
 		-- Example:
 		{ imageId = "rbxassetid://139684623132536", caption = "Added more parity blocks!" },
-		{ imageId = "rbxassetid://72629514451612", caption = "Added vines and an arch frame variant" },
+		{ imageId = "rbxaspsetid://72629514451612", caption = "Added vines and an arch frame variant" },
 	},
 	
 	-- Changelog entries for the current version
@@ -40,6 +39,8 @@ local ChangelogConfig = {
 		{ icon = "", text = "Tweaked campfire smoke and lighting system" },
 		{ icon = "", text = "Tweaked saving/loading system to be more robust" },
 		{ icon = "", text = "Fixed daily rewards system" },
+		{ icon = "", text = "Fixed terrain around the edge of the plot" },
+		{ icon = "", text = "Fixed weird grass bug" },
 		{ icon = "", text = "Fixed more bugs and issues as usual!" },
 	},
 	

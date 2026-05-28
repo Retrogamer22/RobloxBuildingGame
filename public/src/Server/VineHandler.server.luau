@@ -42,9 +42,6 @@ local CONFIG = {
 	MAX_VINE_LENGTH = 24,
 }
 
--- Debug flag
-local DEBUG_VINES = false
-
 -- Track active plots for vine spreading
 local ActivePlots = {}
 local IsRunning = false
@@ -214,11 +211,6 @@ local function createVine(position, face, blocksFolder, placedBy)
 	-- Add ceiling piece if solid block above
 	updateCeilingVine(vine, position, blocksFolder)
 	
-	if DEBUG_VINES then
-		print(string.format("[VineHandler] Created vine at (%.1f, %.1f, %.1f) face=%s",
-			position.X, position.Y, position.Z, face))
-	end
-	
 	return vine
 end
 
@@ -260,17 +252,8 @@ updateCeilingVine = function(vineBlock, gridPosition, blocksFolder)
 		end
 		
 		ceiling.Parent = vineBlock
-		
-		if DEBUG_VINES then
-			print(string.format("[VineHandler] Added ceiling vine at (%.1f, %.1f, %.1f)",
-				gridPosition.X, gridPosition.Y, gridPosition.Z))
-		end
 	elseif not shouldHave and existingCeiling then
 		existingCeiling:Destroy()
-		if DEBUG_VINES then
-			print(string.format("[VineHandler] Removed ceiling vine at (%.1f, %.1f, %.1f)",
-				gridPosition.X, gridPosition.Y, gridPosition.Z))
-		end
 	end
 end
 
@@ -356,10 +339,6 @@ local function processPlotVines(blocksFolder)
 				if newVine then
 					spreadCount = spreadCount + 1
 					spread = true
-					if DEBUG_VINES then
-						print(string.format("[VineHandler] Vine spread DOWN from (%.1f,%.1f,%.1f) to (%.1f,%.1f,%.1f)",
-							vinePos.X, vinePos.Y, vinePos.Z, belowPos.X, belowPos.Y, belowPos.Z))
-					end
 				end
 			end
 		end
@@ -371,17 +350,9 @@ local function processPlotVines(blocksFolder)
 				if newVine then
 					spreadCount = spreadCount + 1
 					spread = true
-					if DEBUG_VINES then
-						print(string.format("[VineHandler] Vine spread UP from (%.1f,%.1f,%.1f) to (%.1f,%.1f,%.1f)",
-							vinePos.X, vinePos.Y, vinePos.Z, abovePos.X, abovePos.Y, abovePos.Z))
-					end
 				end
 			end
 		end
-	end
-	
-	if spreadCount > 0 and DEBUG_VINES then
-		print(string.format("[VineHandler] Spread %d vines this tick", spreadCount))
 	end
 	
 	-- Update ceiling vines (handles loaded saves, block changes above vines)

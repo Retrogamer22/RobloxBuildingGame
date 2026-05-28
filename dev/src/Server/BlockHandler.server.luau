@@ -9,8 +9,9 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local CollectionService = game:GetService("CollectionService")
 
 local BlockPresetsModule = ReplicatedStorage:WaitForChild("BlockPresets", 10)
-local BlockPresets = BlockPresetsModuAle and require(BlockPresetsModule)
+local BlockPresets = BlockPresetsModule and require(BlockPresetsModule)
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("GridConfig", 10))
+local NetherConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("NetherConfig", 10))
 local BiomeConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("BiomeConfig", 10))
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local LogPlacement = require(ReplicatedStorage:WaitForChild("LogPlacement", 10))
@@ -39,6 +40,14 @@ local FrameBlocksFolder = ReplicatedStorage:FindFirstChild("FrameBlocks")
 local LogicGates = nil
 pcall(function()
 	LogicGates = require(ReplicatedStorage:WaitForChild("LogicGates", 5))
+end)
+
+-- Portal extinguish: breaking a frame block (obsidian) or a portal block puts
+-- out the connected portal. Loaded defensively so a missing/unsynced module
+-- never breaks block removal.
+local PortalHandler = nil
+pcall(function()
+	PortalHandler = require(ServerScriptService:WaitForChild("Modules", 10):WaitForChild("PortalHandler", 10))
 end)
 
 -- Debug: verify folders found (disabled for production)
@@ -175,10 +184,31 @@ local DEBUG_LANTERNS = false
 local DEBUG_SIGNS = false
 local DEBUG_COLLISION = false
 local DEBUG_ARCHITRAVES = false
+local DEBUG_ARCH = false -- Verbose arch placement diagnostics (off; placement logic verified correct)
+local DEBUG_ARCH_FILL = false -- Verbose arch FILL diagnostics (off; fill logic verified correct)
 
 -- ============================================
 -- HELPER FUNCTIONS
 -- ============================================
+
+-- Convert a world-space vector to a cardinal direction label (for arch debugging).
+-- We pick the dominant horizontal axis and report sign + compass name.
+local function vectorToCompass(v)
+	if not v then return "nil" end
+	local absX = math.abs(v.X)
+	local absZ = math.abs(v.Z)
+	if absX > absZ then
+		return v.X > 0 and "+X (EAST)" or "-X (WEST)"
+	else
+		return v.Z > 0 and "+Z (NORTH)" or "-Z (SOUTH)"
+	end
+end
+
+-- Format a Vector3 as compact integer grid coords for log readability.
+local function gridFmt(v)
+	if not v then return "nil" end
+	return string.format("(%d,%d,%d)", math.floor(v.X + 0.5), math.floor(v.Y + 0.5), math.floor(v.Z + 0.5))
+end
 
 local function getPlayerBuildArea(player)
 	for i = 1, GridConfig.TOTAL_PLOTS do
@@ -250,6 +280,43 @@ local function getBuildAreaAtPosition(position)
 			end
 		end
 	end
+
+	-- Check NetherPlots (NetherPlot1..9). These pair 1:1 with BuildArea{N}; we
+	-- return plotNumber 100+i as a nether marker so canPlayerBuildAtPosition can
+	-- recognise it and grant access to the matching overworld plot's owner.
+	for i = 1, GridConfig.TOTAL_PLOTS do
+		local netherPlot = workspace:FindFirstChild(NetherConfig.NETHER_PLOT_PREFIX .. i)
+		if netherPlot then
+			local posX = netherPlot:GetAttribute("BasePlatePositionX")
+			local posY = netherPlot:GetAttribute("BasePlatePositionY")
+			local posZ = netherPlot:GetAttribute("BasePlatePositionZ")
+			local sizeX = netherPlot:GetAttribute("BasePlateSizeX")
+			local sizeY = netherPlot:GetAttribute("BasePlateSizeY")
+			local sizeZ = netherPlot:GetAttribute("BasePlateSizeZ")
+
+			-- Fall back to the part's own geometry if attributes aren't cached yet
+			-- (NetherPlots may be bare baseplates the travel manager hasn't touched).
+			if not (posX and posY and posZ and sizeX and sizeY and sizeZ) and netherPlot:IsA("BasePart") then
+				posX, posY, posZ = netherPlot.Position.X, netherPlot.Position.Y, netherPlot.Position.Z
+				sizeX, sizeY, sizeZ = netherPlot.Size.X, netherPlot.Size.Y, netherPlot.Size.Z
+			end
+
+			if posX and posY and posZ and sizeX and sizeY and sizeZ then
+				local halfX = sizeX / 2
+				local halfZ = sizeZ / 2
+				if position.X >= posX - halfX and position.X <= posX + halfX and
+				   position.Z >= posZ - halfZ and position.Z <= posZ + halfZ then
+					-- The bubble straddles the baseplate Y (64 blocks up + 64 down).
+					local halfH = 64 * BLOCK_SIZE
+					local minY = posY - halfH - BLOCK_SIZE
+					local maxY = posY + halfH + BLOCK_SIZE
+					if position.Y >= minY and position.Y <= maxY then
+						return netherPlot, 100 + i
+					end
+				end
+			end
+		end
+	end
 	return nil, nil
 end
 
@@ -269,6 +336,37 @@ local function canPlayerBuildAtPosition(player, position)
 		else
 			return false, nil
 		end
+	end
+
+	-- NETHER CHECK: plotNumber 100+N is NetherPlot{N}, which pairs with
+	-- BuildArea{N}. Access is derived from the overworld plot's owner so the
+	-- nether behaves exactly like the overworld (your nether is yours because
+	-- plot N is yours, plus anyone you've shared plot N with).
+	if plotNumber >= 100 then
+		local overworldNumber = plotNumber - 100
+		local overworld = workspace:FindFirstChild(GridConfig.BUILD_AREA_PREFIX .. overworldNumber)
+
+		-- Private servers: mirror the overworld's open-build policy.
+		if PrivateServerManager and PrivateServerManager.IsPrivateServer() then
+			if PrivateServerManager.CanBuildOnPlot(player, overworldNumber) then
+				return true, buildArea
+			end
+		end
+
+		if overworld then
+			-- Owner of the paired overworld plot owns the nether.
+			if overworld:GetAttribute("OwnerUserId") == player.UserId then
+				return true, buildArea
+			end
+			-- Shared access on the overworld plot extends to the nether.
+			if CheckPlotBuildPermission then
+				local hasPermission = CheckPlotBuildPermission:Invoke(player, overworldNumber)
+				if hasPermission then
+					return true, buildArea
+				end
+			end
+		end
+		return false, nil
 	end
 	
 	-- PRIVATE SERVER CHECK: In private servers, everyone can build on any plot
@@ -357,6 +455,59 @@ end
 local function addBlockHitbox(block, gridPosition)
 	if not block then return end
 	if block:FindFirstChild("Hitbox") then return end
+	
+	-- For glass, the default 3x3x3 hitbox is way too generous - it makes the cursor
+	-- catch on the glass when the player is aiming at adjacent grass / blocks.
+	-- - For special connections (corner / tee / 4-way) the visible Outer/Inner geometry
+	--   already covers 2/3/4 sides of the cell with thin walls, so we just rely on the
+	--   model's own parts as the clickable region (no extra hitbox part).
+	-- - For flat panes (NS / EW) the visible pane is so thin it's hard to click, so we
+	--   add a thin hitbox sized to the pane orientation - wide enough to click but not
+	--   so wide that it bleeds into neighboring cells.
+	if block:GetAttribute("IsGlass") then
+		local markAllQueryable
+		markAllQueryable = function()
+			if block:IsA("BasePart") then
+				block.CanQuery = true
+			elseif block:IsA("Model") then
+				for _, part in ipairs(block:GetDescendants()) do
+					if part:IsA("BasePart") then
+						part.CanQuery = true
+					end
+				end
+			end
+		end
+
+		local orientation = block:GetAttribute("GlassOrientation") or "NS"
+		if orientation == "corner" or orientation == "tee" or orientation == "4way" then
+			-- L / T / + shapes: rely on the model's own parts.
+			markAllQueryable()
+			return
+		end
+
+		-- Flat pane: thin hitbox sized to the pane orientation.
+		markAllQueryable()
+		local PANE_THICKNESS = 0.6
+		local hitboxSize
+		if orientation == "EW" then
+			hitboxSize = Vector3.new(PANE_THICKNESS, BLOCK_SIZE, BLOCK_SIZE)
+		else -- "NS" or default
+			hitboxSize = Vector3.new(BLOCK_SIZE, BLOCK_SIZE, PANE_THICKNESS)
+		end
+
+		local hitbox = Instance.new("Part")
+		hitbox.Name = "Hitbox"
+		hitbox.Anchored = true
+		hitbox.CanCollide = false
+		hitbox.CanQuery = true
+		hitbox.CanTouch = false
+		hitbox.CastShadow = false
+		hitbox.Transparency = 1
+		hitbox.Size = hitboxSize
+		hitbox.CFrame = CFrame.new(gridPosition)
+		hitbox.Parent = block
+		return
+	end
 	
 	local hitbox = Instance.new("Part")
 	hitbox.Name = "Hitbox"
@@ -769,7 +920,7 @@ local function setBlockCFrame(block, cframe, usedBlockModel, blockId)
 			-- Crafting table: center pivot, no offset needed (full-size block)
 			block:PivotTo(cframe)
 		elseif blockId and BlockPresets and BlockPresets.IsBed and BlockPresets.IsBed(blockId) then
-			-- Beds: calculate offset from bounding box so bottom sits on cell floor
+			-- Beds: model is 6 studs long with pivot at its center.
 			local _, bbSize = block:GetBoundingBox()
 			local pivotY = block.WorldPivot.Position.Y
 			local bbCFrameLocal = block:GetBoundingBox()
@@ -779,6 +930,9 @@ local function setBlockCFrame(block, cframe, usedBlockModel, blockId)
 		elseif blockId and BlockPresets and BlockPresets.IsChest and BlockPresets.IsChest(blockId) then
 			-- Chests: PivotTo with Y offset to sit flush on cell floor
 			block:PivotTo(cframe * CFrame.new(0, -0.25, 0))
+		elseif blockId and BlockPresets and BlockPresets.IsFurnace and BlockPresets.IsFurnace(blockId) then
+			-- Furnace: center pivot, no offset needed (full-size block like crafting table)
+			block:PivotTo(cframe)
 		elseif not isSurfaceBlock and not isFence and not isGlass and not isLadder and not isTorch and not isLantern and not isSign then
 			-- Multi-block Models (doors, pistons) need offset to account for bottom-center pivots
 			local offsetCFrame = cframe * CFrame.new(0, -BLOCK_SIZE / 2, 0)
@@ -825,14 +979,23 @@ local function replaceStairWithCorner(adjacentStair, adjacentPos, newCornerType,
 	local isArchBlock = oldBlock:GetAttribute("IsArch") or StairPlacement.IsArchType(oldBlockType or "")
 	local templateName, newBlock
 	
-	local frameOuterRotationOffset = 0
+	local frameOuterRotationOffset = 0  -- Used for both: regular frame outer stair corners AND all arch frame corners
 	if isFrameStair then
 		if isArchBlock then
 			-- Arch frame corners: ArchInnerFrame / ArchOuterFrame (or ArchLarge variants)
 			local archTemplates = StairPlacement.GetArchTemplateNames(oldBlockType)
 			local frameCornerName = newCornerType == "inner" and (archTemplates.Inner .. "Frame") or (archTemplates.Outer .. "Frame")
 			newBlock = createBlockFromTemplate(nil, oldBlockType, false, frameCornerName, "FrameBlocks")
-			print(string.format("[ARCH] replaceStairWithCorner frame: type=%s corner=%s template=%s", oldBlockType, newCornerType, frameCornerName))
+			if DEBUG_ARCH then
+				print(string.format("[ARCH] replaceStairWithCorner frame: type=%s corner=%s template=%s", oldBlockType, newCornerType, frameCornerName))
+			end
+			-- Arch frame corner offsets: upright+inner=+90, upright+outer=0,
+			-- upside-down+inner=+270, upside-down+outer=0.
+			if oldUpsideDown then
+				frameOuterRotationOffset = (newCornerType == "inner") and 270 or 0
+			else
+				frameOuterRotationOffset = (newCornerType == "inner") and 90 or 0
+			end
 		else
 			local frameCornerName = newCornerType == "inner" and "FrameStairsCornerInner" or "FrameStairsCornerOuter"
 			newBlock = createBlockFromTemplate(nil, oldBlockType, false, frameCornerName, "FrameBlocks")
@@ -845,7 +1008,9 @@ local function replaceStairWithCorner(adjacentStair, adjacentPos, newCornerType,
 		local archTemplates = StairPlacement.GetArchTemplateNames(oldBlockType)
 		templateName = newCornerType == "inner" and archTemplates.Inner or archTemplates.Outer
 		newBlock = createBlockFromTemplate(templateName, oldBlockType)
-		print(string.format("[ARCH] replaceStairWithCorner solid: type=%s corner=%s template=%s", oldBlockType, newCornerType, templateName))
+		if DEBUG_ARCH then
+			print(string.format("[ARCH] replaceStairWithCorner solid: type=%s corner=%s template=%s", oldBlockType, newCornerType, templateName))
+		end
 	else
 		templateName = newCornerType == "inner" and "StairInnerCorner" or "StairOuterCorner"
 		newBlock = createBlockFromTemplate(templateName, oldBlockType)
@@ -865,7 +1030,7 @@ local function replaceStairWithCorner(adjacentStair, adjacentPos, newCornerType,
 		local adjustedRotation = (cornerRotation + frameOuterRotationOffset) % 360
 		-- All stair/arch unions have consistent bottom-center pivots
 		local cframe = StairPlacement.GetStairCFrame(adjacentPos, adjustedRotation, oldUpsideDown)
-		if isArchBlock then
+		if isArchBlock and DEBUG_ARCH then
 			print(string.format("[ARCH] replaceStairWithCorner CFrame: rot=%d upsideDown=%s corner=%s", adjustedRotation, tostring(oldUpsideDown), newCornerType))
 		end
 		setBlockCFrame(newBlock, cframe)
@@ -1234,6 +1399,8 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	local isChest = BlockPresets.IsChest and BlockPresets.IsChest(data.BlockType)
 	local isBed = BlockPresets.IsBed and BlockPresets.IsBed(data.BlockType)
 	local isCraftingTable = BlockPresets.IsCraftingTable and BlockPresets.IsCraftingTable(data.BlockType)
+	local isFurnace = BlockPresets.IsFurnace and BlockPresets.IsFurnace(data.BlockType)
+	local isTextBlock = BlockPresets.IsTextBlock and BlockPresets.IsTextBlock(data.BlockType)
 	local isArch = StairPlacement.IsArchType(data.BlockType)
 	local upsideDown = false
 	local direction = nil
@@ -1249,6 +1416,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	local glassRotationCFrame = CFrame.new() -- Default glass rotation
 	local glassOrientation = "NS" -- Default glass orientation (NS or EW)
 	local glassPositionOffset = nil -- Position offset for corner pieces
+	local glassRotationDegrees = 0 -- Rotation degrees for special connections (corner/tee/4way)
 	local ladderFace = "North" -- Default ladder face
 	local ladderRotation = 0 -- Default ladder rotation
 	local vineFace = "North" -- Default vine face
@@ -1322,13 +1490,15 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	
 	-- Process stair-specific data (arches use the same placement system)
 	if (isStair or isArch) and data.StairData then
-		if isArch then
-			print(string.format("[ARCH-DBG] === Arch Placement Start === type=%s", data.BlockType))
-			print(string.format("[ARCH-DBG] StairData received: HitPos=%s HitNormal=%s HitBlockPos=%s LookVector=%s",
+		if isArch and DEBUG_ARCH then
+			print(string.format("[ARCH-DBG] === Arch Placement Start === type=%s gridPos=%s", data.BlockType, gridFmt(position)))
+			print(string.format("[ARCH-DBG] StairData: HitPos=%s HitNormal=%s HitBlockPos=%s LookVec=%s -> player facing %s",
 				tostring(data.StairData.HitPosition),
 				tostring(data.StairData.HitNormal),
 				tostring(data.StairData.HitBlockPosition),
-				tostring(data.StairData.LookVector)))
+				tostring(data.StairData.LookVector),
+				vectorToCompass(data.StairData.LookVector)))
+			print(string.format("[ARCH-DBG] Client-sent rotation=%d (from inventory R-key)", rotation))
 		end
 		
 		-- Get upside-down from hit data
@@ -1338,7 +1508,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			data.StairData.HitBlockPosition
 		)
 		
-		if isArch then
+		if isArch and DEBUG_ARCH then
 			print(string.format("[ARCH-DBG] ShouldBeUpsideDown => %s", tostring(upsideDown)))
 		end
 		
@@ -1347,7 +1517,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			local lookVector = data.StairData.LookVector
 			if typeof(lookVector) == "Vector3" then
 				direction = StairPlacement.GetDirectionFromLookVector(lookVector)
-				if isArch then
+				if isArch and DEBUG_ARCH then
 					print(string.format("[ARCH-DBG] Direction from LookVector => %s (%s)",
 						tostring(direction), StairPlacement.GetDirectionName(direction)))
 				end
@@ -1357,7 +1527,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		-- Fallback to rotation-based direction
 		if direction == nil then
 			direction = StairPlacement.RotationToDirection(rotation)
-			if isArch then
+			if isArch and DEBUG_ARCH then
 				print(string.format("[ARCH-DBG] Direction from rotation fallback => %s (%s)",
 					tostring(direction), StairPlacement.GetDirectionName(direction)))
 			end
@@ -1410,7 +1580,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		finalRotation = placementInfo.rotation
 		direction = placementInfo.direction
 		
-		if isArch then
+		if isArch and DEBUG_ARCH then
 			print(string.format("[ARCH-DBG] PlacementInfo => template=%s corner=%s rotation=%d direction=%s upsideDown=%s",
 				tostring(templateName), tostring(cornerType), finalRotation,
 				StairPlacement.GetDirectionName(direction), tostring(upsideDown)))
@@ -1463,16 +1633,17 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		)
 		
 		if cornerPlacementInfo then
-			-- This is a corner! Use corner template
+			-- This is a corner / tee / 4-way! Use the appropriate template
 			templateName = cornerPlacementInfo.templateName
 			glassConnectionType = cornerPlacementInfo.cornerType
 			glassRotationCFrame = cornerPlacementInfo.rotationCFrame
 			glassPositionOffset = cornerPlacementInfo.positionOffset -- Store offset for corner alignment
-			glassOrientation = "corner" -- Mark as corner piece
+			glassOrientation = cornerPlacementInfo.cornerType -- Mark with actual type: corner / tee / 4way
+			glassRotationDegrees = cornerPlacementInfo.rotationDegrees -- Track for fixups
 			
 			if DEBUG_GLASS then
-				print(string.format("[Glass] CORNER detected! Using template: %s, rotation: %d°", 
-					templateName, cornerPlacementInfo.rotationDegrees))
+				print(string.format("[Glass] %s detected! Using template: %s, rotation: %d°", 
+					string.upper(cornerPlacementInfo.cornerType), templateName, cornerPlacementInfo.rotationDegrees))
 			end
 		else
 			-- Standard glass placement (vertical connections)
@@ -1664,6 +1835,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	local collisionExtraData = {
 		orientation = slabOrientation,
 		isDoor = isDoor,
+		isBed = isBed, -- Tells BlockCollision to use the bed-specific (more permissive) skip list
 		basePlate = basePlateData,
 	}
 	
@@ -1678,6 +1850,23 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			print(string.format("[Collision] BLOCKED placement of %s at (%.1f, %.1f, %.1f): %s",
 				data.BlockType, position.X, position.Y, position.Z, collisionReason or "overlap"))
 		end
+		-- Always log the reason (even without DEBUG_COLLISION) so players can see WHY a placement failed.
+		print(string.format("[BB-NET] BLOCKED place of %s at (%.1f, %.1f, %.1f): %s",
+			data.BlockType, position.X, position.Y, position.Z, collisionReason or "overlap"))
+		-- Also print what's at that cell so we can diagnose unexpected collisions (e.g., stale bed registrations)
+		local spatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
+		if spatialIndex then
+			local whatsThere = spatialIndex:GetBlocksAt(position)
+			for _, b in ipairs(whatsThere) do
+				local bType = b:GetAttribute("BlockType") or "?"
+				local isBed = b:GetAttribute("IsBed") and " (bed)" or ""
+				local bx = b:GetAttribute("BlockPosX") or -9999
+				local by = b:GetAttribute("BlockPosY") or -9999
+				local bz = b:GetAttribute("BlockPosZ") or -9999
+				print(string.format("[BB-NET]   Cell occupied by %s%s (primary=(%.1f,%.1f,%.1f))", bType, isBed, bx, by, bz))
+			end
+		end
+		BuildRejected:FireClient(player, "place", position)
 		return -- Don't place the block
 	end
 	
@@ -1874,7 +2063,24 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		end
 		useBlockModelFolder = "FrameBlocks"
 		useBlockId = preset.Id
-		print(string.format("[ARCH] Frame corner model: %s from %s", tostring(useBlockModelName), useBlockModelFolder))
+		-- Arch frame corner rotation offsets, by case:
+		--   upright + inner: +90
+		--   upright + outer: no offset
+		--   upside-down + inner: +270
+		--   upside-down + outer: no offset (+270 - 270 effective wrap)
+		-- (Templates are authored with different orientations per case.)
+		local rotationBefore = finalRotation
+		if upsideDown then
+			if cornerType == "inner" then
+				finalRotation = (finalRotation + 270) % 360
+			end
+		elseif cornerType == "inner" then
+			finalRotation = (finalRotation + 90) % 360
+		end
+		if DEBUG_ARCH then
+			print(string.format("[ARCH] Frame corner model: %s from %s | rotation offset: %d -> %d (upsideDown=%s)",
+				tostring(useBlockModelName), useBlockModelFolder, rotationBefore, finalRotation, tostring(upsideDown)))
+		end
 	end
 	
 	local block, usedBlockModel = createBlockFromTemplate(
@@ -1904,12 +2110,14 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		-- All stair/arch unions have consistent bottom-center pivots
 		cframe = StairPlacement.GetStairCFrame(position, finalRotation, upsideDown)
 		-- Straight arch templates are inverted vs stairs: local X(180) fixes both facing and vertical
+		local appliedX180 = false
 		if isArch and cornerType == "normal" then
 			cframe = cframe * CFrame.Angles(math.rad(180), 0, 0)
+			appliedX180 = true
 		end
-		if isArch then
-			print(string.format("[ARCH] Placement CFrame: pos=%s rot=%d upsideDown=%s corner=%s",
-				tostring(position), finalRotation, tostring(upsideDown), tostring(cornerType)))
+		if isArch and DEBUG_ARCH then
+			print(string.format("[ARCH] Placement CFrame: gridPos=%s rot=%d upsideDown=%s corner=%s appliedX180=%s",
+				gridFmt(position), finalRotation, tostring(upsideDown), tostring(cornerType), tostring(appliedX180)))
 		end
 	elseif usesAxisRotation then
 		-- Use directional rotation for pistons, regular axis for logs
@@ -1982,7 +2190,10 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			cframe = CFrame.new(position) * CFrame.Angles(0, math.rad(rotation), 0)
 		end
 	elseif isBed then
-		-- Beds face toward the player (snap to nearest 90°)
+		-- Beds: pillow at click point, bed extends TOWARD the player (foot near camera).
+		-- We compute lookDir from player→click, then snap to 90°; this makes the bed's
+		-- forward axis point at the click. To extend the bed toward the player, the
+		-- foot offset uses the OPPOSITE direction (player→click reversed).
 		local character = player.Character
 		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
 		if rootPart then
@@ -1999,28 +2210,51 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			cframe = CFrame.new(position)
 		end
 		
-		-- Check the foot cell (1 block behind the pillow in the direction the bed extends)
+		-- Foot cell is one block TOWARD the player from the pillow (head at click point,
+		-- foot extends back toward camera). We only care about whether the foot cell is
+		-- blocked — the head cell (where the player clicked) is allowed to overlap.
 		local bedSnapped = math.rad(finalRotation or 0)
 		local footOffset = Vector3.new(
-			math.round(math.sin(bedSnapped)) * BLOCK_SIZE,
+			-math.round(math.sin(bedSnapped)) * BLOCK_SIZE,
 			0,
-			math.round(math.cos(bedSnapped)) * BLOCK_SIZE
+			-math.round(math.cos(bedSnapped)) * BLOCK_SIZE
 		)
 		local footPosition = position + footOffset
 		
-		-- Verify foot cell is free (allow decorations, water, snow layers)
-		local bedSpatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
-		if bedSpatialIndex then
-			local footBlocks = bedSpatialIndex:GetBlocksAt(footPosition)
-			for _, existing in ipairs(footBlocks) do
-				local isWater = existing:GetAttribute("IsWater")
-				local isDeco = existing:GetAttribute("IsDecoration")
-				local isSnowLayer = existing:GetAttribute("SnowLayers") ~= nil
-				if not isWater and not isDeco and not isSnowLayer then
-					print("[Bed] Cannot place - foot cell blocked at", footPosition)
-					return
+		-- Check if anything is in the foot cell at the same height
+		local footSpatialIndex = BlockSpatialIndex and BlockSpatialIndex.GetOrCreate(blocksFolder)
+		local blocksAtFoot
+		if footSpatialIndex then
+			blocksAtFoot = footSpatialIndex:GetBlocksAt(footPosition)
+		else
+			blocksAtFoot = {}
+			for _, b in ipairs(blocksFolder:GetChildren()) do
+				local bp = b.PrimaryPart and b.PrimaryPart.Position or (b:IsA("BasePart") and b.Position)
+				if bp and (bp - footPosition).Magnitude < (BLOCK_SIZE * 0.5) then
+					table.insert(blocksAtFoot, b)
 				end
 			end
+		end
+		
+		for _, existingBlock in ipairs(blocksAtFoot) do
+			-- Skip blocks that don't meaningfully fill the foot cell at bed level
+			if existingBlock:GetAttribute("IsDecoration") then continue end
+			if existingBlock:GetAttribute("IsSurfaceBlock") then continue end
+			if existingBlock:GetAttribute("IsWater") then continue end
+			if existingBlock:GetAttribute("IsBed") then continue end
+			if existingBlock:GetAttribute("IsWallpaperFrame") then continue end
+			if existingBlock:GetAttribute("IsVine") then continue end
+			if existingBlock:GetAttribute("IsLadder") then continue end
+			if existingBlock:GetAttribute("IsSignStanding") then continue end
+			if existingBlock:GetAttribute("IsWallSign") then continue end
+			if existingBlock:GetAttribute("IsCarpet") then continue end
+			if existingBlock:GetAttribute("IsTorch") then continue end
+			if existingBlock:GetAttribute("IsLantern") then continue end
+			-- A solid block occupies the foot cell — refuse placement.
+			local blockingType = existingBlock:GetAttribute("BlockType") or "block"
+			print(string.format("[Bed] Foot cell blocked by %s at (%.0f,%.0f,%.0f); refusing placement",
+				tostring(blockingType), footPosition.X, footPosition.Y, footPosition.Z))
+			return false, "Bed foot would overlap with an existing block"
 		end
 	elseif isCraftingTable then
 		-- Crafting tables face toward the player (snap to nearest 90°), no Y offset
@@ -2040,10 +2274,55 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		else
 			cframe = CFrame.new(position) * CFrame.Angles(0, math.rad(rotation), 0)
 		end
+	elseif isFurnace then
+		-- Furnaces face toward the player (snap to nearest 90°), no Y offset.
+		-- Same pattern as crafting tables / chests / beds.
+		local character = player.Character
+		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+		if rootPart then
+			local lookDir = (position - rootPart.Position) * Vector3.new(1, 0, 1) -- flatten Y
+			if lookDir.Magnitude > 0.01 then
+				local angle = math.atan2(lookDir.X, lookDir.Z)
+				local snapped = math.round(angle / (math.pi / 2)) * (math.pi / 2)
+				cframe = CFrame.new(position) * CFrame.Angles(0, snapped, 0)
+				finalRotation = math.deg(snapped) % 360
+			else
+				cframe = CFrame.new(position)
+			end
+		else
+			cframe = CFrame.new(position) * CFrame.Angles(0, math.rad(rotation), 0)
+		end
 	else
 		cframe = CFrame.new(position) * CFrame.Angles(0, math.rad(rotation), 0)
 	end
 	setBlockCFrame(block, cframe, usedBlockModel, preset.Id)
+	
+	-- [ARCH-DBG] Smoking-gun log: read the block's ACTUAL world orientation after
+	-- setBlockCFrame is done with it. If two arch placements have the same input
+	-- direction but different `front` values here, the placement code is producing
+	-- inconsistent rotations. The `front` axis is the direction the arch's opening
+	-- faces in world space (CFrame's -Z by convention for Roblox parts).
+	if isArch and DEBUG_ARCH then
+		local finalPivot = block:GetPivot()
+		local worldLook = finalPivot.LookVector       -- forward (block-local -Z)
+		local worldRight = finalPivot.RightVector
+		local worldUp = finalPivot.UpVector
+		print(string.format(
+			"[ARCH-DBG] FINAL world orientation: gridPos=%s look=(%.2f,%.2f,%.2f) right=(%.2f,%.2f,%.2f) up=(%.2f,%.2f,%.2f) | facing %s | up %s",
+			gridFmt(position),
+			worldLook.X, worldLook.Y, worldLook.Z,
+			worldRight.X, worldRight.Y, worldRight.Z,
+			worldUp.X, worldUp.Y, worldUp.Z,
+			vectorToCompass(worldLook),
+			worldUp.Y > 0.5 and "UP (normal)" or (worldUp.Y < -0.5 and "DOWN (upside-down)" or vectorToCompass(worldUp))
+		))
+		print(string.format(
+			"[ARCH-DBG] SUMMARY: type=%s gridPos=%s storedRot=%d storedCorner=%s storedUpsideDown=%s storedDir=%s -> world-facing=%s",
+			data.BlockType, gridFmt(position), finalRotation, tostring(cornerType), tostring(upsideDown),
+			direction ~= nil and StairPlacement.GetDirectionName(direction) or "nil",
+			vectorToCompass(worldLook)
+		))
+	end
 	
 	-- Apply color/material for template blocks, or block models with ApplyColor set
 	if not usedBlockModel or preset.ApplyColor then
@@ -2182,11 +2461,13 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	
 	if isBed then
 		-- === BED PLACEMENT ===
+		-- Foot offset must match the collision check above: foot extends toward the player,
+		-- so we negate the sin/cos of finalRotation.
 		local bedSnapped = math.rad(finalRotation or 0)
 		local footOffset = Vector3.new(
-			math.round(math.sin(bedSnapped)) * BLOCK_SIZE,
+			-math.round(math.sin(bedSnapped)) * BLOCK_SIZE,
 			0,
-			math.round(math.cos(bedSnapped)) * BLOCK_SIZE
+			-math.round(math.cos(bedSnapped)) * BLOCK_SIZE
 		)
 		local footPosition = position + footOffset
 		
@@ -2216,8 +2497,34 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			block:SetAttribute("CustomColorB", math.round(preset.DefaultColor.B * 255))
 		end
 		
-		-- Add hitbox spanning both cells
-		local midpoint = (position + footPosition) / 2
+		-- Add invisible hitbox that matches the bed's visible silhouette.
+		-- We compute size/position from the actual visible parts (Frame, Sheets, Pillow)
+		-- rather than assuming cell dimensions — this way the hitbox always matches what
+		-- the player sees, and the cursor can't catch the bed from above or off the side.
+		-- IMPORTANT: We transform each part's 8 corners through its world CFrame to get
+		-- a correct world-axis AABB. Using Position ± Size/2 directly only works for
+		-- unrotated parts — at rotations 90°/270° the part's local Size axes don't align
+		-- with world axes, which would produce a hitbox roughly half the correct width
+		-- along the bed's length and let raycasts pass through the outer halves of both cells.
+		local minX, minY, minZ = math.huge, math.huge, math.huge
+		local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+		for _, descendant in ipairs(block:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				local cf = descendant.CFrame
+				local hx, hy, hz = descendant.Size.X / 2, descendant.Size.Y / 2, descendant.Size.Z / 2
+				for _, dx in ipairs({-1, 1}) do
+					for _, dy in ipairs({-1, 1}) do
+						for _, dz in ipairs({-1, 1}) do
+							local corner = cf * Vector3.new(dx * hx, dy * hy, dz * hz)
+							minX = math.min(minX, corner.X); maxX = math.max(maxX, corner.X)
+							minY = math.min(minY, corner.Y); maxY = math.max(maxY, corner.Y)
+							minZ = math.min(minZ, corner.Z); maxZ = math.max(maxZ, corner.Z)
+						end
+					end
+				end
+			end
+		end
+
 		local hitbox = Instance.new("Part")
 		hitbox.Name = "Hitbox"
 		hitbox.Anchored = true
@@ -2226,15 +2533,38 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		hitbox.CanTouch = false
 		hitbox.CastShadow = false
 		hitbox.Transparency = 1
-		-- Size spans 2 cells in the bed's length direction
-		local rot = (finalRotation or 0) % 360
-		if rot == 0 or rot == 180 then
-			hitbox.Size = Vector3.new(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE * 2)
+
+		if minX < math.huge then
+			-- Use the actual visible bounds, with a tiny margin so we don't undershoot
+			local margin = 0.05
+			hitbox.Size = Vector3.new(
+				(maxX - minX) + margin * 2,
+				(maxY - minY) + margin * 2,
+				(maxZ - minZ) + margin * 2
+			)
+			hitbox.CFrame = CFrame.new((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
 		else
-			hitbox.Size = Vector3.new(BLOCK_SIZE * 2, BLOCK_SIZE, BLOCK_SIZE)
+			-- Fallback (shouldn't happen): previous cell-spanning sizing
+			local midpoint = (position + footPosition) / 2
+			local rot = (finalRotation or 0) % 360
+			if rot == 0 or rot == 180 then
+				hitbox.Size = Vector3.new(BLOCK_SIZE, 1.6, BLOCK_SIZE * 2)
+			else
+				hitbox.Size = Vector3.new(BLOCK_SIZE * 2, 1.6, BLOCK_SIZE)
+			end
+			hitbox.CFrame = CFrame.new(midpoint.X, position.Y - BLOCK_SIZE / 2 + 0.8, midpoint.Z)
 		end
-		hitbox.CFrame = CFrame.new(midpoint)
+
 		hitbox.Parent = block
+
+		-- Make the visible bed parts non-queryable so raycasts only hit the Hitbox.
+		-- This makes the targeting region predictable and prevents stray hits on protruding geometry
+		-- (e.g. the pillow sticking up above the frame).
+		for _, descendant in ipairs(block:GetDescendants()) do
+			if descendant:IsA("BasePart") and descendant ~= hitbox then
+				descendant.CanQuery = false
+			end
+		end
 		
 		-- Register foot cell in spatial index
 		local bedSpatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
@@ -2437,6 +2767,14 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		print(string.format("[CraftingTable] Placed %s at (%.0f, %.0f, %.0f) rot=%d", preset.Id, position.X, position.Y, position.Z, finalRotation or 0))
 	end
 	
+	if isTextBlock then
+		block:SetAttribute("IsTextBlock", true)
+		block:SetAttribute("BlockPosX", position.X)
+		block:SetAttribute("BlockPosY", position.Y)
+		block:SetAttribute("BlockPosZ", position.Z)
+		print(string.format("[TextBlock] Placed at (%.0f, %.0f, %.0f)", position.X, position.Y, position.Z))
+	end
+	
 	if isArchitrave then
 		block:SetAttribute("IsArchitrave", true)
 		block:SetAttribute("ArchitraveConnectionType", architraveConnectionType)
@@ -2451,6 +2789,10 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		block:SetAttribute("IsGlass", true)
 		block:SetAttribute("GlassConnectionType", glassConnectionType)
 		block:SetAttribute("GlassOrientation", glassOrientation)
+		block:SetAttribute("GlassRotationDegrees", glassRotationDegrees)
+		block:SetAttribute("BlockPosX", position.X)
+		block:SetAttribute("BlockPosY", position.Y)
+		block:SetAttribute("BlockPosZ", position.Z)
 		-- Ensure all glass parts have collision enabled
 		if block:IsA("Model") then
 			for _, part in ipairs(block:GetDescendants()) do
@@ -3022,45 +3364,60 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		print(string.format("[Glowstone] Placed %s with color %s", preset.Id, preset.GlowstoneColor or "unknown"))
 	end
 	
-	-- Handle Rainbow blocks - set ColorMode attribute for client-side animation
-	local isRainbow = BlockPresets.IsRainbow and BlockPresets.IsRainbow(preset.Id)
+	-- Handle Rainbow / ColorCycle blocks - set ColorMode attribute for client-side animation
+	-- Driven by preset.Behavior.ColorCycle (new manifest-driven path) with a fallback
+	-- to the legacy preset.IsRainbow flag for any manually-authored presets.
+	local cycleCfg = preset.Behavior and preset.Behavior.ColorCycle
+	local isRainbow = cycleCfg ~= nil or (BlockPresets.IsRainbow and BlockPresets.IsRainbow(preset.Id))
 	if isRainbow then
 		block:SetAttribute("ColorMode", "Rainbow")
 		
-		-- For rainbow glow blocks, mark that they have a PointLight to animate
-		if preset.HasPointLight then
+		-- For blocks with an animated light, flag it so ColorCycleController also animates the PointLight
+		if (cycleCfg and cycleCfg.Light) or preset.HasPointLight then
 			block:SetAttribute("HasPointLight", true)
 		end
 		
-		-- Phase propagation: check 6 neighbors for existing rainbow blocks
-		-- If adjacent to another rainbow block, copy its phase (sync connected groups)
-		-- Otherwise, assign a random phase (isolated blocks cycle independently)
+		-- Phase propagation: check 6 neighbors for existing rainbow blocks of the SAME type
+		-- (same BlockType -> same cycle duration -> safe to share phase). Different block types
+		-- may have different Durations in their manifest, so syncing them would cause drift.
+		local syncWithNeighbors = (cycleCfg and cycleCfg.SyncWithNeighbors ~= false) or (not cycleCfg) -- default true
 		local rainbowPhase = nil
-		local spatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
-		local directions = {
-			Vector3.new(BLOCK_SIZE, 0, 0), Vector3.new(-BLOCK_SIZE, 0, 0),
-			Vector3.new(0, BLOCK_SIZE, 0), Vector3.new(0, -BLOCK_SIZE, 0),
-			Vector3.new(0, 0, BLOCK_SIZE), Vector3.new(0, 0, -BLOCK_SIZE),
-		}
-		for _, dir in ipairs(directions) do
-			local neighborPos = position + dir
-			local neighbor = spatialIndex:GetBlockAt(neighborPos)
-			if neighbor and neighbor:GetAttribute("ColorMode") == "Rainbow" then
-				rainbowPhase = neighbor:GetAttribute("RainbowPhase")
-				if rainbowPhase then break end
+		if syncWithNeighbors then
+			local spatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
+			local directions = {
+				Vector3.new(BLOCK_SIZE, 0, 0), Vector3.new(-BLOCK_SIZE, 0, 0),
+				Vector3.new(0, BLOCK_SIZE, 0), Vector3.new(0, -BLOCK_SIZE, 0),
+				Vector3.new(0, 0, BLOCK_SIZE), Vector3.new(0, 0, -BLOCK_SIZE),
+			}
+			for _, dir in ipairs(directions) do
+				local neighborPos = position + dir
+				local neighbor = spatialIndex:GetBlockAt(neighborPos)
+				if neighbor
+					and neighbor:GetAttribute("ColorMode") == "Rainbow"
+					and neighbor:GetAttribute("BlockType") == preset.Id then
+					rainbowPhase = neighbor:GetAttribute("RainbowPhase")
+					if rainbowPhase then break end
+				end
 			end
 		end
 		
 		if not rainbowPhase then
-			-- Random phase 0-6 (maps to seconds offset in a 6-second cycle)
-			rainbowPhase = math.random() * 6
+			-- Random phase offset, in seconds. Range is the block's own cycle duration so phase
+			-- covers exactly one full cycle. Defaults to 6s if no manifest config.
+			local duration = (cycleCfg and cycleCfg.Duration) or 6
+			rainbowPhase = math.random() * duration
 		end
 		block:SetAttribute("RainbowPhase", rainbowPhase)
 		
-		-- Random rotation on all axes to break up texture tiling (like grass blocks)
-		-- Uses 90-degree increments so block still aligns to grid
-		-- Only for simple cubes (not slabs, block models with Frame/Inner geometry, etc.)
-		if preset.Shape == "Block" and not preset.UseBlockModel then
+		-- Random XYZ rotation to break up texture tiling. Driven by Behavior.RandomRotation
+		-- (defaults true for legacy IsRainbow presets that have no Behavior table).
+		local wantRandomRotation
+		if preset.Behavior then
+			wantRandomRotation = preset.Behavior.RandomRotation == true
+		else
+			wantRandomRotation = true -- legacy default for IsRainbow without a Behavior table
+		end
+		if wantRandomRotation and preset.Shape == "Block" and not preset.UseBlockModel then
 			local randomRotX = math.random(0, 3)
 			local randomRotY = math.random(0, 3)
 			local randomRotZ = math.random(0, 3)
@@ -3162,6 +3519,56 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		
 		if #updatedFences > 0 then
 			print(string.format("[Fence] Updated %d adjacent fences due to solid block placement", #updatedFences))
+		end
+		
+		-- Also update adjacent glass panes (they may need to become / un-become L-corners)
+		local function createGlassBlockForSolid(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
+			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
+			if not glassFolder then return nil end
+			local template = glassFolder:FindFirstChild(glassTemplateName)
+			if not template then return nil end
+
+			local newGlass = template:Clone()
+			newGlass.Name = glassType
+
+			if newGlass:IsA("BasePart") then
+				newGlass.Anchored = true
+				newGlass.CanCollide = true
+			elseif newGlass:IsA("Model") then
+				for _, part in ipairs(newGlass:GetDescendants()) do
+					if part:IsA("BasePart") then
+						part.Anchored = true
+						part.CanCollide = true
+					end
+				end
+			end
+
+			local glassCFrame = GlassPlacement.GetGlassCFrame(glassPos, glassRotationCF, nil, connectionType)
+			if newGlass:IsA("BasePart") then
+				newGlass.CFrame = glassCFrame
+			elseif newGlass:IsA("Model") then
+				newGlass:PivotTo(glassCFrame)
+			end
+
+			newGlass:SetAttribute("BlockType", glassType)
+			newGlass:SetAttribute("PlacedBy", placedBy)
+			newGlass:SetAttribute("IsGlass", true)
+			newGlass:SetAttribute("GlassConnectionType", connectionType)
+			newGlass:SetAttribute("GlassPrimaryDir", primaryDir)
+			newGlass:SetAttribute("GlassSecondaryDir", secondaryDir)
+			newGlass:SetAttribute("GlassOrientation", orientation or "NS")
+			newGlass:SetAttribute("BlockPosX", glassPos.X)
+			newGlass:SetAttribute("BlockPosY", glassPos.Y)
+			newGlass:SetAttribute("BlockPosZ", glassPos.Z)
+
+			newGlass.Parent = blocksFolder
+			addBlockHitbox(newGlass, glassPos)
+			return newGlass
+		end
+
+		local updatedGlass = GlassPlacement.UpdateGlassNearSolidBlock(position, blocksFolder, createGlassBlockForSolid)
+		if #updatedGlass > 0 then
+			print(string.format("[Glass] Updated %d adjacent glass panes due to solid block placement", #updatedGlass))
 		end
 	end
 	
@@ -3376,6 +3783,9 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			newGlass:SetAttribute("GlassPrimaryDir", primaryDir)
 			newGlass:SetAttribute("GlassSecondaryDir", secondaryDir)
 			newGlass:SetAttribute("GlassOrientation", orientation or "NS")
+			newGlass:SetAttribute("BlockPosX", glassPos.X)
+			newGlass:SetAttribute("BlockPosY", glassPos.Y)
+			newGlass:SetAttribute("BlockPosZ", glassPos.Z)
 			
 			newGlass.Parent = blocksFolder
 			addBlockHitbox(newGlass, glassPos)
@@ -3389,8 +3799,16 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			print(string.format("[Glass] Updated %d vertical neighbors", #updatedGlass))
 		end
 		
-		-- Check if adjacent glass should become corners (horizontal corner conversion)
-		if glassOrientation ~= "corner" then
+		-- Re-evaluate the just-placed pane itself in case the perpendicular-stub
+		-- corner rule applies (flat pane oriented perpendicular to its sole neighbor).
+		if glassOrientation == "NS" or glassOrientation == "EW" then
+			GlassPlacement.FixupGlassAtPosition(position, blocksFolder, createGlassBlock)
+		end
+		
+		-- Check if adjacent glass should become a special connection (corner / tee / 4-way)
+		-- NOTE: UpdateAdjacentGlass above already handles most of this. This pass is
+		--       idempotent and catches anything missed.
+		do
 			local toConvert = GlassPlacement.GetAdjacentGlassToConvertToCorners(position, glassOrientation, blocksFolder)
 			
 			for _, convertData in ipairs(toConvert) do
@@ -3402,11 +3820,26 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 				local oldBlockType = oldGlass:GetAttribute("BlockType")
 				local oldPlacedBy = oldGlass:GetAttribute("PlacedBy")
 				
+				-- Capture per-part appearance (Outer/Inner colors and materials) before destroying
+				local perPartAppearance = {}
+				local fallbackColor = nil
+				if oldGlass:IsA("BasePart") then
+					fallbackColor = oldGlass.Color
+					perPartAppearance["__root__"] = { color = oldGlass.Color, material = oldGlass.Material, materialVariant = oldGlass.MaterialVariant }
+				elseif oldGlass:IsA("Model") then
+					for _, p in ipairs(oldGlass:GetDescendants()) do
+						if p:IsA("BasePart") then
+							perPartAppearance[p.Name] = { color = p.Color, material = p.Material, materialVariant = p.MaterialVariant }
+							if not fallbackColor then fallbackColor = p.Color end
+						end
+					end
+				end
+				
 				-- Destroy old glass
 				oldGlass:Destroy()
 				
-				-- Create new corner glass
-				local newCornerGlass = createGlassBlock(
+				-- Create new special-connection glass (corner / tee / 4way)
+				local newSpecialGlass = createGlassBlock(
 					cornerInfo.templateName,
 					oldBlockType,
 					adjPos,
@@ -3414,12 +3847,36 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 					oldPlacedBy,
 					cornerInfo.cornerType,
 					nil, nil,
-					"corner"
+					cornerInfo.cornerType
 				)
 				
-				if newCornerGlass and DEBUG_GLASS then
-					print(string.format("[Glass] Converted neighbor at (%.1f, %.1f, %.1f) to corner!",
-						adjPos.X, adjPos.Y, adjPos.Z))
+				if newSpecialGlass then
+					-- Reapply preserved appearance per-part
+					local function applyTo(part)
+						local app = perPartAppearance[part.Name] or perPartAppearance["__root__"]
+						if app then
+							part.Color = app.color
+							part.Material = app.material
+							if app.materialVariant and app.materialVariant ~= "" then
+								part.MaterialVariant = app.materialVariant
+							end
+						elseif fallbackColor then
+							part.Color = fallbackColor
+						end
+					end
+					if newSpecialGlass:IsA("BasePart") then
+						applyTo(newSpecialGlass)
+					elseif newSpecialGlass:IsA("Model") then
+						for _, p in ipairs(newSpecialGlass:GetDescendants()) do
+							if p:IsA("BasePart") then applyTo(p) end
+						end
+					end
+					
+					newSpecialGlass:SetAttribute("GlassRotationDegrees", cornerInfo.rotationDegrees)
+					if DEBUG_GLASS then
+						print(string.format("[Glass] Converted neighbor at (%.1f, %.1f, %.1f) to %s!",
+							adjPos.X, adjPos.Y, adjPos.Z, cornerInfo.cornerType))
+					end
 				end
 			end
 		end
@@ -3498,6 +3955,22 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 	if not blocksFolder then return end
 	
 	if block.Parent ~= blocksFolder then return end
+	
+	-- FIRE: extinguished by a single break. It's a standalone block sitting on
+	-- top of another - no attached items, not terrain, no lazy-load needed. Just
+	-- destroy it cleanly (no drop, no break particles, no terrain refill).
+	if block:GetAttribute("IsFire") or block:GetAttribute("BlockType") == "Fire" then
+		-- [BB-FIRE-PERF] Timing instrumentation to find the extinguish hitch.
+		-- Logs how long the destroy takes and how heavy the fire model is
+		-- (descendant count). Remove once the lag source is identified.
+		local descCount = #block:GetDescendants()
+		local t0 = os.clock()
+		block:Destroy()
+		local destroyMs = (os.clock() - t0) * 1000
+		print(string.format("[BB-FIRE-PERF] Extinguish by %s | descendants=%d | Destroy()=%.2fms",
+			player.Name, descCount, destroyMs))
+		return
+	end
 	
 	-- Get block position before destroying
 	-- Use stored grid position attributes for accuracy (models have bottom-center pivots)
@@ -3601,8 +4074,26 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 		local blockGridY = math.round(blockPos.Y / BLOCK_SIZE) * BLOCK_SIZE
 		local blockGridZ = math.round(blockPos.Z / BLOCK_SIZE) * BLOCK_SIZE
 		local blockGridPos = Vector3.new(blockGridX, blockGridY, blockGridZ)
-		
+
+		-- Most blocks occupy one grid cell. Double chests occupy two (primary + secondary),
+		-- so attached items on either cell need to be cleaned up when the chest breaks.
+		-- We accumulate every host grid cell here and run the same offset sweep for each.
+		local hostGridCells = { blockGridPos }
+		if block:GetAttribute("IsDoubleChest") then
+			local sx = block:GetAttribute("ChestSecondaryX")
+			local sy = block:GetAttribute("ChestSecondaryY")
+			local sz = block:GetAttribute("ChestSecondaryZ")
+			if sx and sy and sz then
+				table.insert(hostGridCells, Vector3.new(
+					math.round(sx / BLOCK_SIZE) * BLOCK_SIZE,
+					math.round(sy / BLOCK_SIZE) * BLOCK_SIZE,
+					math.round(sz / BLOCK_SIZE) * BLOCK_SIZE
+				))
+			end
+		end
+
 		local itemsToDestroy = {}
+		local seenItems = {} -- dedupe across host cells (an item adjacent to both cells)
 		local spatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
 		
 		if spatialIndex then
@@ -3621,68 +4112,93 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 				Vector3.new(0, BLOCK_SIZE, BLOCK_SIZE),  -- above +Z
 				Vector3.new(0, BLOCK_SIZE, -BLOCK_SIZE), -- above -Z
 			}
-			
-			for _, offset in ipairs(checkOffsets) do
-				local checkPos = blockGridPos + offset
-				for _, item in ipairs(spatialIndex:GetBlocksAt(checkPos)) do
-					-- Check if this item is attached to the broken block
-					if item:GetAttribute("IsDecoration") then
-						local px = item:GetAttribute("ParentBlockX")
-						local py = item:GetAttribute("ParentBlockY")
-						local pz = item:GetAttribute("ParentBlockZ")
-						if px and py and pz then
-							if (Vector3.new(px, py, pz) - blockPos).Magnitude < 1 then
-								table.insert(itemsToDestroy, item)
+
+			for _, hostCell in ipairs(hostGridCells) do
+				for _, offset in ipairs(checkOffsets) do
+					local checkPos = hostCell + offset
+					for _, item in ipairs(spatialIndex:GetBlocksAt(checkPos)) do
+						if seenItems[item] then continue end
+						-- Check if this item is attached to the broken block
+						if item:GetAttribute("IsDecoration") then
+							local px = item:GetAttribute("ParentBlockX")
+							local py = item:GetAttribute("ParentBlockY")
+							local pz = item:GetAttribute("ParentBlockZ")
+							if px and py and pz then
+								if (Vector3.new(px, py, pz) - hostCell).Magnitude < 1 then
+									seenItems[item] = true
+									table.insert(itemsToDestroy, item)
+								end
 							end
-						end
-					elseif item:GetAttribute("IsTorch") then
-						local hx = item:GetAttribute("HostBlockX")
-						local hy = item:GetAttribute("HostBlockY")
-						local hz = item:GetAttribute("HostBlockZ")
-						if hx and hy and hz then
-							local hostGridPos = Vector3.new(
-								math.round(hx / BLOCK_SIZE) * BLOCK_SIZE,
-								math.round(hy / BLOCK_SIZE) * BLOCK_SIZE,
-								math.round(hz / BLOCK_SIZE) * BLOCK_SIZE
-							)
-							if (hostGridPos - blockGridPos).Magnitude < 0.5 then
-								table.insert(itemsToDestroy, item)
+						elseif item:GetAttribute("IsTorch") then
+							local hx = item:GetAttribute("HostBlockX")
+							local hy = item:GetAttribute("HostBlockY")
+							local hz = item:GetAttribute("HostBlockZ")
+							if hx and hy and hz then
+								local hostGridPos = Vector3.new(
+									math.round(hx / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(hy / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(hz / BLOCK_SIZE) * BLOCK_SIZE
+								)
+								if (hostGridPos - hostCell).Magnitude < 0.5 then
+									seenItems[item] = true
+									table.insert(itemsToDestroy, item)
+								end
 							end
-						end
-					elseif item:GetAttribute("IsLantern") then
-						local hx = item:GetAttribute("HostBlockX")
-						local hy = item:GetAttribute("HostBlockY")
-						local hz = item:GetAttribute("HostBlockZ")
-						if hx and hy and hz then
-							if (Vector3.new(hx, hy, hz) - blockPos).Magnitude < BLOCK_SIZE then
-								table.insert(itemsToDestroy, item)
+						elseif item:GetAttribute("IsFire") then
+							-- Fire is extinguished if the block it rests on is removed.
+							-- It stores HostBlockX/Y/Z = its support's grid center.
+							local hx = item:GetAttribute("HostBlockX")
+							local hy = item:GetAttribute("HostBlockY")
+							local hz = item:GetAttribute("HostBlockZ")
+							if hx and hy and hz then
+								local hostGridPos = Vector3.new(
+									math.round(hx / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(hy / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(hz / BLOCK_SIZE) * BLOCK_SIZE
+								)
+								if (hostGridPos - hostCell).Magnitude < 0.5 then
+									seenItems[item] = true
+									table.insert(itemsToDestroy, item)
+								end
 							end
-						end
-					elseif item:GetAttribute("IsSignStanding") or item:GetAttribute("IsWallSign") then
-						local hx = item:GetAttribute("HostBlockX")
-						local hy = item:GetAttribute("HostBlockY")
-						local hz = item:GetAttribute("HostBlockZ")
-						if hx and hy and hz then
-							local hostGridPos = Vector3.new(
-								math.round(hx / BLOCK_SIZE) * BLOCK_SIZE,
-								math.round(hy / BLOCK_SIZE) * BLOCK_SIZE,
-								math.round(hz / BLOCK_SIZE) * BLOCK_SIZE
-							)
-							if (hostGridPos - blockGridPos).Magnitude < 0.5 then
-								table.insert(itemsToDestroy, item)
+						elseif item:GetAttribute("IsLantern") then
+							local hx = item:GetAttribute("HostBlockX")
+							local hy = item:GetAttribute("HostBlockY")
+							local hz = item:GetAttribute("HostBlockZ")
+							if hx and hy and hz then
+								if (Vector3.new(hx, hy, hz) - hostCell).Magnitude < BLOCK_SIZE then
+									seenItems[item] = true
+									table.insert(itemsToDestroy, item)
+								end
 							end
-						end
-					elseif item:GetAttribute("IsCarpet") then
-						-- Carpet breaks if the block directly below it is removed
-						local cpx = item:GetAttribute("BlockPosX")
-						local cpy = item:GetAttribute("BlockPosY")
-						local cpz = item:GetAttribute("BlockPosZ")
-						if cpx and cpy and cpz then
-							local carpetGridPos = Vector3.new(cpx, cpy, cpz)
-							-- Carpet is one grid cell above its support block
-							local expectedSupport = carpetGridPos - Vector3.new(0, BLOCK_SIZE, 0)
-							if (expectedSupport - blockPos).Magnitude < 1 then
-								table.insert(itemsToDestroy, item)
+						elseif item:GetAttribute("IsSignStanding") or item:GetAttribute("IsWallSign") then
+							local hx = item:GetAttribute("HostBlockX")
+							local hy = item:GetAttribute("HostBlockY")
+							local hz = item:GetAttribute("HostBlockZ")
+							if hx and hy and hz then
+								local hostGridPos = Vector3.new(
+									math.round(hx / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(hy / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(hz / BLOCK_SIZE) * BLOCK_SIZE
+								)
+								if (hostGridPos - hostCell).Magnitude < 0.5 then
+									seenItems[item] = true
+									table.insert(itemsToDestroy, item)
+								end
+							end
+						elseif item:GetAttribute("IsCarpet") then
+							-- Carpet breaks if the block directly below it is removed
+							local cpx = item:GetAttribute("BlockPosX")
+							local cpy = item:GetAttribute("BlockPosY")
+							local cpz = item:GetAttribute("BlockPosZ")
+							if cpx and cpy and cpz then
+								local carpetGridPos = Vector3.new(cpx, cpy, cpz)
+								-- Carpet is one grid cell above its support block
+								local expectedSupport = carpetGridPos - Vector3.new(0, BLOCK_SIZE, 0)
+								if (expectedSupport - hostCell).Magnitude < 1 then
+									seenItems[item] = true
+									table.insert(itemsToDestroy, item)
+								end
 							end
 						end
 					end
@@ -3698,7 +4214,7 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 					if px and py and pz and (Vector3.new(px, py, pz) - blockPos).Magnitude < 1 then
 						table.insert(itemsToDestroy, item)
 					end
-				elseif item:GetAttribute("IsTorch") or item:GetAttribute("IsLantern") or item:GetAttribute("IsSignStanding") or item:GetAttribute("IsWallSign") then
+				elseif item:GetAttribute("IsTorch") or item:GetAttribute("IsLantern") or item:GetAttribute("IsSignStanding") or item:GetAttribute("IsWallSign") or item:GetAttribute("IsFire") then
 					local hx = item:GetAttribute("HostBlockX")
 					local hy = item:GetAttribute("HostBlockY")
 					local hz = item:GetAttribute("HostBlockZ")
@@ -3728,7 +4244,25 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 	-- Client handles instant visual feedback via ClientPrediction.SpawnTerrainPrediction
 	-- Server spawns the real blocks which will replace client's temporary ones
 	-- NOTE: Skip for path blocks - they use pathBasePosition instead (handled below)
-	if isTerrainBlock and blockPos and TerrainGenerator and not isDecoration and not isPathBlock then
+
+	-- NETHER dig-reveal: a block broken inside a NetherPlot routes to the nether
+	-- oracle instead of the overworld terrain logic. Netherrack isn't tagged
+	-- IsTerrainBlock, so it never hits the overworld branch; this is its
+	-- equivalent. Uses the 100+N key (same convention as getBuildAreaAtPosition
+	-- and GenerateNetherBubble) so DugPositions/seed line up.
+	if blockPos and TerrainGenerator and TerrainGenerator.OnNetherBlockBroken
+		and not isDecoration
+		and string.match(buildArea.Name, "^" .. NetherConfig.NETHER_PLOT_PREFIX .. "%d+$") then
+		local overworldNumber = getPlotNumberFromBuildArea(buildArea)
+		if overworldNumber then
+			local netherKey = overworldNumber + 100
+			local spawned = TerrainGenerator.OnNetherBlockBroken(blockPos, buildArea, netherKey)
+			if spawned and spawned > 0 then
+				print(string.format("[BB-NETHER] dig-reveal spawned %d block(s) at (%.1f,%.1f,%.1f)",
+					spawned, blockPos.X, blockPos.Y, blockPos.Z))
+			end
+		end
+	elseif isTerrainBlock and blockPos and TerrainGenerator and not isDecoration and not isPathBlock then
 		local plotNumber = getPlotNumberFromBuildArea(buildArea)
 		TerrainGenerator.OnTerrainBlockBroken(blockPos, buildArea, plotNumber)
 		-- Tell client ALL dug positions in a cube around the break point.
@@ -3971,9 +4505,62 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 		return -- Double chest handled, skip normal destroy
 	end
 	
+	-- Capture vine info BEFORE destroying, so we can cascade-break free-hanging
+	-- vines below this one. (Vines that spread downward past their host wall have
+	-- no support of their own — breaking the vine above them should drop the
+	-- whole hanging chain.)
+	local wasVine = block:GetAttribute("IsVine")
+	local cascadeVineFace = wasVine and block:GetAttribute("VineFace") or nil
+	
 	-- Destroy the block
 	print(string.format("[BB-NET] SERVER => RemoveBlock SUCCESS type=%s pos=(%.1f,%.1f,%.1f) player=%s", tostring(blockType), blockPos.X, blockPos.Y, blockPos.Z, player.Name))
 	block:Destroy()
+
+	-- If the broken block was part of a portal frame (obsidian) or a portal block
+	-- itself, put out the connected portal sheet. Runs only for those two types so
+	-- normal block breaks pay nothing; the flood fill is O(portal size).
+	if PortalHandler and blockPos and (blockType == "Obsidian" or blockType == "NetherPortal") then
+		local removed = PortalHandler.ExtinguishAround(blocksFolder, blockPos)
+		if removed > 0 then
+			print(string.format("[BB-PORTAL] Extinguished %d portal block(s) after breaking %s", removed, tostring(blockType)))
+		end
+	end
+	
+	-- Cascade-break free-hanging vines below the broken vine. Walks downward
+	-- from the broken vine's position; for each vine on the same face, if it
+	-- has no solid host wall behind it (free-hanging), destroy it and continue.
+	-- Stops at the first walled vine, a different-face vine, or empty cell.
+	if wasVine and cascadeVineFace and blockPos then
+		local currentPos = blockPos - Vector3.new(0, BLOCK_SIZE, 0)
+		local breakCount = 0
+		local MAX_CASCADE = 50 -- safety bound (max vine chain length)
+		local oppositeFace = VinePlacement.GetOppositeFace(cascadeVineFace)
+		local hostOffsetDir = VinePlacement.GetFaceOffset(oppositeFace)
+		
+		for _ = 1, MAX_CASCADE do
+			local vineBelow = VinePlacement.GetVineAtPosition(currentPos, blocksFolder)
+			if not vineBelow then break end
+			if vineBelow.face ~= cascadeVineFace then break end
+			
+			-- If this vine has its own host wall, it's still anchored — stop here
+			local hostPos = currentPos + hostOffsetDir * BLOCK_SIZE
+			if VinePlacement.HasSolidBlockAt(hostPos, blocksFolder) then
+				break
+			end
+			
+			-- Free-hanging: destroy and continue down the chain
+			if vineBelow.instance and vineBelow.instance.Parent then
+				vineBelow.instance:Destroy()
+				breakCount = breakCount + 1
+			end
+			currentPos = currentPos - Vector3.new(0, BLOCK_SIZE, 0)
+		end
+		
+		if breakCount > 0 then
+			print(string.format("[Vine] Cascade-broke %d free-hanging vine(s) below (%.1f,%.1f,%.1f) face=%s",
+				breakCount, blockPos.X, blockPos.Y, blockPos.Z, cascadeVineFace))
+		end
+	end
 	
 	-- If solid block was broken, update adjacent fences
 	if wasSolidBlock and blockPos and not isFence then
@@ -4032,6 +4619,58 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 			local updatedFences = FencePlacement.UpdateFencesNearSolidBlock(blockPos, blocksFolder, BlockTemplates, createFenceBlockForSolid)
 			if #updatedFences > 0 then
 				print(string.format("[Fence] Updated %d adjacent fences due to solid block removal", #updatedFences))
+			end
+		end)
+
+		-- Also update adjacent glass panes (corner anchors may have been removed)
+		local function createGlassBlockForSolid(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
+			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
+			if not glassFolder then return nil end
+			local template = glassFolder:FindFirstChild(glassTemplateName)
+			if not template then return nil end
+
+			local newGlass = template:Clone()
+			newGlass.Name = glassType
+
+			if newGlass:IsA("BasePart") then
+				newGlass.Anchored = true
+				newGlass.CanCollide = true
+			elseif newGlass:IsA("Model") then
+				for _, part in ipairs(newGlass:GetDescendants()) do
+					if part:IsA("BasePart") then
+						part.Anchored = true
+						part.CanCollide = true
+					end
+				end
+			end
+
+			local glassCFrame = GlassPlacement.GetGlassCFrame(glassPos, glassRotationCF, nil, connectionType)
+			if newGlass:IsA("BasePart") then
+				newGlass.CFrame = glassCFrame
+			elseif newGlass:IsA("Model") then
+				newGlass:PivotTo(glassCFrame)
+			end
+
+			newGlass:SetAttribute("BlockType", glassType)
+			newGlass:SetAttribute("PlacedBy", placedBy)
+			newGlass:SetAttribute("IsGlass", true)
+			newGlass:SetAttribute("GlassConnectionType", connectionType)
+			newGlass:SetAttribute("GlassPrimaryDir", primaryDir)
+			newGlass:SetAttribute("GlassSecondaryDir", secondaryDir)
+			newGlass:SetAttribute("GlassOrientation", orientation or "NS")
+			newGlass:SetAttribute("BlockPosX", glassPos.X)
+			newGlass:SetAttribute("BlockPosY", glassPos.Y)
+			newGlass:SetAttribute("BlockPosZ", glassPos.Z)
+
+			newGlass.Parent = blocksFolder
+			addBlockHitbox(newGlass, glassPos)
+			return newGlass
+		end
+
+		task.defer(function()
+			local updatedGlass = GlassPlacement.UpdateGlassNearSolidBlock(blockPos, blocksFolder, createGlassBlockForSolid)
+			if #updatedGlass > 0 then
+				print(string.format("[Glass] Updated %d adjacent glass panes due to solid block removal", #updatedGlass))
 			end
 		end)
 	end
@@ -4144,6 +4783,9 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 			newGlass:SetAttribute("GlassPrimaryDir", primaryDir)
 			newGlass:SetAttribute("GlassSecondaryDir", secondaryDir)
 			newGlass:SetAttribute("GlassOrientation", orientation or "NS")
+			newGlass:SetAttribute("BlockPosX", glassPos.X)
+			newGlass:SetAttribute("BlockPosY", glassPos.Y)
+			newGlass:SetAttribute("BlockPosZ", glassPos.Z)
 			
 			newGlass.Parent = blocksFolder
 			addBlockHitbox(newGlass, glassPos)
@@ -4446,6 +5088,13 @@ FillFrameBlock.OnServerEvent:Connect(function(player, targetBlock, fillBlockId)
 		print("[FrameFill] ABORT: Model blocks (Furnace/Chest/CraftingTable) cannot be used as fill")
 		return
 	end
+	-- Defense in depth: surface-mounted types (vines, ladders, decorations) must not
+	-- fill frame blocks. They get placed ON the frame's face by the normal placement
+	-- pipeline; the client should already exclude them from TryFillFrameBlock.
+	if fillPreset.IsVine or fillPreset.IsLadder or fillPreset.IsDecoration then
+		print("[FrameFill] ABORT: " .. tostring(fillBlockId) .. " cannot fill frame blocks (mounts on faces instead)")
+		return
+	end
 	
 	-- Verify player has build permission at target location
 	local targetPos = targetBlock:IsA("Model") and targetBlock:GetPivot().Position or targetBlock.Position
@@ -4697,6 +5346,17 @@ FillFrameBlock.OnServerEvent:Connect(function(player, targetBlock, fillBlockId)
 				storedRotation = (storedRotation + 90) % 360
 			end
 		end
+		-- Arch INNER corner fills: reverse the placement-time offset that was baked into
+		-- the stored rotation to make the frame template look correct. The solid inner
+		-- template doesn't have that authoring offset, so we undo it here.
+		-- (Upright inner placement added +90; upside-down inner placement added +270.)
+		if cornerType == "inner" and isArchFill then
+			if isUpsideDown then
+				storedRotation = (storedRotation - 270) % 360
+			else
+				storedRotation = (storedRotation - 90) % 360
+			end
+		end
 		local gridPos
 		local bpx = targetBlock:GetAttribute("BlockPosX")
 		local bpy = targetBlock:GetAttribute("BlockPosY")
@@ -4709,25 +5369,67 @@ FillFrameBlock.OnServerEvent:Connect(function(player, targetBlock, fillBlockId)
 			gridPos = targetBlock.Position
 		end
 		-- All unions now have consistent bottom-center pivots, so just use GetStairCFrame
+		local originalStoredRotation = targetBlock:GetAttribute("Rotation") or 0
 		local newCFrame = StairPlacement.GetStairCFrame(gridPos, storedRotation, isUpsideDown)
 		-- Solid arch fills orientation fixes
+		local archFinalAdjustment = "none"
 		if isArchFill then
-			print(string.format("[ArchFill] cornerType=%s storedRot=%d upsideDown=%s gridPos=%s",
-				tostring(cornerType), storedRotation, tostring(isUpsideDown), tostring(gridPos)))
 			if cornerType == "outer" then
 				if isUpsideDown then
-					newCFrame = newCFrame * CFrame.Angles(math.rad(-90), math.rad(-90), 0)
+					newCFrame = newCFrame
+						* CFrame.Angles(math.rad(-90), math.rad(-90), 0)
+						* CFrame.Angles(0, 0, math.rad(180))
+					archFinalAdjustment = "X(-90)*Y(-90)*Z(180)"
 				else
 					newCFrame = newCFrame * CFrame.Angles(math.rad(90), math.rad(-90), 0)
+					archFinalAdjustment = "X(90)*Y(-90)"
+				end
+			elseif cornerType == "inner" then
+				-- Inner solid template is authored on its side (like outer), needs tipping up.
+				-- X tilt is opposite sign from outer (inner curve faces the other way).
+				if isUpsideDown then
+					-- Computed delta from observed (0, 0, -90) to desired (0, 180, 90) orientation = local Y(180).
+					newCFrame = newCFrame
+						* CFrame.Angles(math.rad(90), math.rad(-90), 0)
+						* CFrame.Angles(math.rad(180), math.rad(180), 0)
+						* CFrame.Angles(0, math.rad(180), 0)
+					archFinalAdjustment = "X(90)*Y(-90)*X(180)*Y(180)*Y(180)"
+				else
+					newCFrame = newCFrame
+						* CFrame.Angles(math.rad(-90), math.rad(-90), 0)
+						* CFrame.Angles(math.rad(180), math.rad(180), 0)
+						* CFrame.Angles(math.rad(90), 0, 0)
+						* CFrame.Angles(math.rad(90), 0, 0)
+					archFinalAdjustment = "X(-90)*Y(-90)*X(180)*Y(180)*X(90)*X(90)"
 				end
 			elseif not cornerType or cornerType == "normal" then
 				newCFrame = newCFrame * CFrame.Angles(0, math.rad(180), 0)
+				archFinalAdjustment = "Y(180)"
 			end
 		end
 		if newBlock:IsA("Model") then
 			newBlock:PivotTo(newCFrame)
 		else
 			newBlock.CFrame = newCFrame
+		end
+		-- [ARCH-FILL] Log inputs and final world orientation after CFrame applied.
+		-- Lets us see, per case (upright/inverted x inner/outer/normal), exactly what
+		-- rotation went in and what facing came out, so we can spot the broken case.
+		if isArchFill and DEBUG_ARCH_FILL then
+			local finalPivot = newBlock:GetPivot()
+			local worldLook = finalPivot.LookVector
+			local worldUp = finalPivot.UpVector
+			print(string.format(
+				"[ARCH-FILL] type=%s gridPos=%s cornerType=%s upsideDown=%s | storedRot: %d -> %d (compensated) | finalAdjust=%s",
+				frameType, gridFmt(gridPos), tostring(cornerType), tostring(isUpsideDown),
+				originalStoredRotation, storedRotation, archFinalAdjustment))
+			print(string.format(
+				"[ARCH-FILL] FINAL world: look=(%.2f,%.2f,%.2f) up=(%.2f,%.2f,%.2f) | facing %s | up %s",
+				worldLook.X, worldLook.Y, worldLook.Z,
+				worldUp.X, worldUp.Y, worldUp.Z,
+				vectorToCompass(worldLook),
+				worldUp.Y > 0.5 and "UP (normal)" or (worldUp.Y < -0.5 and "DOWN (upside-down)" or vectorToCompass(worldUp))
+			))
 		end
 	elseif isDoorFill then
 		-- For doors, reconstruct CFrame from stored door attributes
@@ -4974,13 +5676,18 @@ FillFrameBlock.OnServerEvent:Connect(function(player, targetBlock, fillBlockId)
 		newBlock:SetAttribute("FrameFillMaterialVariant", nil)
 	end
 	
-	-- Rainbow fill: propagate ColorMode and phase so ColorCycleController animates the filled frame
-	if fillPreset.IsRainbow then
+	-- Rainbow / ColorCycle fill: propagate ColorMode and phase so ColorCycleController animates the filled frame
+	local fillCycleCfg = fillPreset.Behavior and fillPreset.Behavior.ColorCycle
+	if fillCycleCfg or fillPreset.IsRainbow then
 		newBlock:SetAttribute("ColorMode", "Rainbow")
-		-- Copy phase from the old frame block's neighbors or assign random
+		if (fillCycleCfg and fillCycleCfg.Light) or fillPreset.HasPointLight then
+			newBlock:SetAttribute("HasPointLight", true)
+		end
+		-- Inherit phase from the old frame block if present, else random within the block's own cycle
 		local phase = targetBlock:GetAttribute("RainbowPhase")
 		if not phase then
-			phase = math.random() * 6
+			local duration = (fillCycleCfg and fillCycleCfg.Duration) or 6
+			phase = math.random() * duration
 		end
 		newBlock:SetAttribute("RainbowPhase", phase)
 	end

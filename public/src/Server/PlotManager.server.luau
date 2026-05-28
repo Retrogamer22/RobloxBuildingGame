@@ -41,13 +41,11 @@ do
 		if snowyGrassModule then
 			SnowyGrassManager = require(snowyGrassModule)
 			SnowyGrassManager.Initialize()
-			print("[PlotManager] SnowyGrassManager loaded")
 		end
 		
 		local weatherModule = modulesFolder:WaitForChild("WeatherManager", 10)
 		if weatherModule then
 			WeatherManager = require(weatherModule)
-			print("[PlotManager] WeatherManager loaded")
 		end
 	end
 end
@@ -142,17 +140,14 @@ local function assignPlot(player, plotNumber)
 			local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
 			local defaultTerrainStyle = "Flat"
 			
-			print("[PlotManager] Generating terrain on-demand for plot " .. plotNumber)
 			TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
 			
 			buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
 			buildArea:SetAttribute("CurrentBiome", defaultBiome)
 			PlotTerrainReady[plotNumber] = true
-			print("[PlotManager] Plot " .. plotNumber .. " terrain ready for " .. player.Name)
 		end
 	end
 	
-	print(player.Name .. " assigned to plot " .. plotNumber)
 	PlotAssigned:FireClient(player, plotNumber, buildArea)
 	
 	-- Register plot for grass spreading
@@ -178,9 +173,7 @@ local function assignPlot(player, plotNumber)
 		if AutoLoadPlot then
 			local success, result = AutoLoadPlot:Invoke(player, buildArea, plotNumber)
 			if success then
-				print("[PlotManager] Auto-loaded save for " .. player.Name)
 			else
-				print("[PlotManager] No save to load for " .. player.Name .. " (" .. tostring(result) .. ")")
 			end
 		else
 			warn("[PlotManager] AutoLoadPlot not found after 10s timeout - SaveManager may have failed to initialize")
@@ -271,13 +264,11 @@ local function releasePlot(player)
 				local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
 				local defaultTerrainStyle = "Flat"
 				
-				print("[PlotManager] Regenerating terrain for released plot " .. plotNumber)
 				TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
 				
 				buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
 				buildArea:SetAttribute("CurrentBiome", defaultBiome)
 				PlotTerrainReady[plotNumber] = true
-				print("[PlotManager] Plot " .. plotNumber .. " terrain regenerated")
 			end)
 		else
 			PlotTerrainReady[plotNumber] = false
@@ -286,13 +277,11 @@ local function releasePlot(player)
 	
 	PlotOwners[plotNumber] = nil
 	PlayerPlots[player] = nil
-	print(player.Name .. " released plot " .. plotNumber)
 end
 
 local function teleportToPlot(player)
 	-- Skip teleport if MegaPlot mode is active - MegaPlotVisibility handles spawning
 	if isMegaPlotMode() then
-		print("[PlotManager] Skipping teleport for", player.Name, "- MegaPlot mode active")
 		return
 	end
 	
@@ -349,7 +338,6 @@ local function teleportToPlot(player)
 	
 	-- Teleport
 	character:PivotTo(CFrame.new(spawnPos))
-	print("[PlotManager] Teleported", player.Name, "to plot", plotNumber)
 	
 	-- Wait a moment for terrain to register, then unanchor
 	task.delay(0.3, function()
@@ -443,7 +431,6 @@ Players.PlayerAdded:Connect(function(player)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	print("[PlotManager] Player leaving: " .. player.Name .. " - starting save-before-release")
 	
 	-- IMPORTANT: Wait for SaveManager to finish auto-save BEFORE clearing the plot
 	-- Otherwise the save happens while blocks are being destroyed, corrupting dug detection
@@ -455,7 +442,6 @@ Players.PlayerRemoving:Connect(function(player)
 		end)
 		local saveTime = tick() - saveStart
 		if success then
-			print(string.format("[PlotManager] SavePlotSync completed for %s in %.2fs", player.Name, saveTime))
 		else
 			warn(string.format("[PlotManager] SavePlotSync FAILED for %s after %.2fs: %s", player.Name, saveTime, tostring(err)))
 		end
@@ -464,7 +450,6 @@ Players.PlayerRemoving:Connect(function(player)
 	end
 	
 	releasePlot(player)
-	print("[PlotManager] Plot released for " .. player.Name)
 end)
 
 GetPlotInfo.OnServerInvoke = function(player)
@@ -500,7 +485,6 @@ CheckOwnership.OnInvoke = doesPlayerOwnPosition
 -- ============================================
 
 local function initializeAllPlots()
-	print("[PlotManager] Preparing " .. GridConfig.TOTAL_PLOTS .. " plots (terrain deferred until player joins)...")
 	
 	for i = 1, GridConfig.TOTAL_PLOTS do
 		local buildArea = getBuildArea(i)
@@ -534,11 +518,9 @@ local function initializeAllPlots()
 				blocksFolder.Parent = buildArea
 			end
 			
-			print("[PlotManager] Plot " .. i .. " prepared (no terrain yet)")
 		end
 	end
 	
-	print("[PlotManager] All plots prepared! Terrain will generate on-demand when players join.")
 end
 
 -- Shared state: clients can check this on join to know if loading screen is needed
@@ -573,19 +555,16 @@ local function startBackgroundTerrainGen()
 		local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
 		local defaultTerrainStyle = "Flat"
 		
-		print("[PlotManager] Starting background terrain generation for unclaimed plots...")
 		
 		for i = 1, GridConfig.TOTAL_PLOTS do
 			-- Skip plots that already have terrain (claimed by a player)
 			if not PlotTerrainReady[i] then
 				local buildArea = getBuildArea(i)
 				if buildArea and TerrainGenerator then
-					print("[PlotManager] Background generating terrain for plot " .. i)
 					TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, i, defaultBiome, defaultTerrainStyle)
 					buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
 					buildArea:SetAttribute("CurrentBiome", defaultBiome)
 					PlotTerrainReady[i] = true
-					print("[PlotManager] Plot " .. i .. " background terrain ready")
 					
 					-- Send progress to all clients showing loading screen
 					local readyCount = 0
@@ -603,7 +582,6 @@ local function startBackgroundTerrainGen()
 		-- Signal all clients that plots are ready
 		allPlotsReadyValue.Value = true
 		PlotsReady:FireAllClients("ready")
-		print("[PlotManager] Background terrain generation complete!")
 	end)
 end
 
@@ -618,5 +596,3 @@ backgroundGenConnection = Players.PlayerAdded:Connect(function()
 		backgroundGenConnection = nil
 	end
 end)
-
-print("PlotManager initialized with " .. GridConfig.TOTAL_PLOTS .. " plots")

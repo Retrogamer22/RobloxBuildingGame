@@ -486,12 +486,15 @@ local function convertGrassToDirt(grassBlock, blocksFolder)
 		dirtBlock:SetAttribute("PlacedBy", placedBy)
 	end
 	
-	if isTerrainBlock then
+	-- FIX: A block with no PlacedBy is natural terrain. Always flag decayed dirt as terrain
+	-- so its lineage isn't lost (which previously orphaned grass that later regrew on it).
+	local treatAsTerrain = isTerrainBlock or not placedBy
+	if treatAsTerrain then
 		dirtBlock:SetAttribute("IsTerrainBlock", true)
 		dirtBlock:SetAttribute("TerrainDepth", 1) -- Now underground
 	end
 	
-	if isLazyLoaded then
+	if isLazyLoaded or treatAsTerrain then
 		dirtBlock:SetAttribute("IsLazyLoaded", true)
 	end
 	
@@ -667,12 +670,21 @@ local function convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName
 		grassBlock:SetAttribute("PlacedBy", placedBy)
 	end
 	
-	if isTerrainBlock then
+	-- FIX: A block with no PlacedBy is, by definition, natural terrain. Always flag it as
+	-- terrain so that breaking it routes through OnTerrainBlockBroken (marks the position
+	-- dug). Previously this was inherited only if the source dirt still had IsTerrainBlock,
+	-- so a grass block whose lineage lost the flag during decay/spread became an orphan:
+	-- not saved, not mark-dug, and thus regenerated on every load.
+	local treatAsTerrain = isTerrainBlock or not placedBy
+	if treatAsTerrain then
 		grassBlock:SetAttribute("IsTerrainBlock", true)
 		grassBlock:SetAttribute("TerrainDepth", 0) -- Grass is always surface
 	end
 	
-	if isLazyLoaded then
+	-- Grown grass is a state change from the originally generated surface, so it must be
+	-- saved to persist. Lazy-load it if it was already lazy OR if it's terrain (so the
+	-- grown state round-trips and the block is mark-dug correctly when broken).
+	if isLazyLoaded or treatAsTerrain then
 		grassBlock:SetAttribute("IsLazyLoaded", true)
 	end
 	

@@ -57,6 +57,19 @@ local SlabPlacement = require(ReplicatedStorage:WaitForChild("SlabPlacement", 10
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local FencePlacement = require(ReplicatedStorage:WaitForChild("FencePlacement", 10))
 local GlassPlacement = require(ReplicatedStorage:WaitForChild("GlassPlacement", 10))
+
+-- Resolve a glass-style block's template Model from its type + generic shape name.
+-- Mirrors the helper in SaveManager/BlockHandler. Standard glass -> Decorations/Glass;
+-- glass-style reward sets (CandyLattice) -> their RewardSets folder. Returns Instance or nil.
+local function resolveGlassTemplate(glassType, genericTemplateName)
+	local folderPath, modelName = GlassPlacement.ResolveTemplate(glassType, genericTemplateName)
+	local folder = ReplicatedStorage
+	for _, folderName in ipairs(string.split(folderPath, "/")) do
+		folder = folder and folder:FindFirstChild(folderName)
+	end
+	if not folder then return nil end
+	return folder:FindFirstChild(modelName)
+end
 local LadderPlacement = require(ReplicatedStorage:WaitForChild("LadderPlacement", 10))
 local TorchPlacement = require(ReplicatedStorage:WaitForChild("TorchPlacement", 10))
 local LanternPlacement = require(ReplicatedStorage:WaitForChild("LanternPlacement", 10))
@@ -474,8 +487,7 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 			if BlockTemplates then template = BlockTemplates:FindFirstChild(templateName) end
 		end
 	elseif isGlass then
-		local glassFolder = DecorationsSourceFolder and DecorationsSourceFolder:FindFirstChild("Glass")
-		if glassFolder then template = glassFolder:FindFirstChild(templateName) end
+		template = resolveGlassTemplate(blockData.blockType, templateName)
 	elseif isColumn then
 		if BlocksSourceFolder then
 			template = BlocksSourceFolder:FindFirstChild(columnModelName)
@@ -1521,10 +1533,6 @@ end
 -- ============================================
 
 local function reconnectGlass(blocksFolder)
-	local DecorationsSourceFolder = getDecorationsFolder()
-	local glassFolder = DecorationsSourceFolder and DecorationsSourceFolder:FindFirstChild("Glass")
-	if not glassFolder then return end
-
 	local function snapToGrid(pos)
 		return Vector3.new(
 			math.round(pos.X / BLOCK_SIZE) * BLOCK_SIZE,
@@ -1553,7 +1561,7 @@ local function reconnectGlass(blocksFolder)
 
 			if newInfo.connectionType ~= currentType then
 				glass:Destroy()
-				local newTemplate = glassFolder:FindFirstChild(newInfo.templateName)
+				local newTemplate = resolveGlassTemplate(glassType, newInfo.templateName)
 				if newTemplate then
 					local newGlass = newTemplate:Clone()
 					newGlass.Name = glassType

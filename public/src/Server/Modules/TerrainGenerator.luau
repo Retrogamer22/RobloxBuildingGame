@@ -682,6 +682,50 @@ function TerrainGenerator.OnTerrainBlockBroken(position, buildArea, plotNumber, 
 		if DEBUG_TERRAIN_NET then print(string.format("[BB-NET] TERRAIN marked as dug: key=%s", getPositionKey(snappedPos))) end
 	end
 	
+	-- Clean up orphaned spread-grass left floating above the dug cell. When dirt is
+	-- removed from under a block of GrownFromSpread grass, that grass has no support
+	-- and should fall away too (otherwise it becomes a floating phantom that persists
+	-- in the save via IsLazyLoaded and reappears every load). We walk upward from the
+	-- dug position and remove each consecutive GrownFromSpread grass block that now has
+	-- nothing solid directly below it. Hand-placed grass never has GrownFromSpread, so
+	-- this can only ever remove auto-spread debris, never an intentional build.
+	if BlockSpatialIndex then
+		local index = BlockSpatialIndex.GetOrCreate(blocksFolder)
+		if index then
+			local function isSpreadGrass(b)
+				if not b or not b:GetAttribute("GrownFromSpread") then return false end
+				local bt = b:GetAttribute("BlockType")
+				return bt == "GrassBlock" or bt == "SnowyGrassBlock"
+					or bt == "SnowGrassBlock" or bt == "TaigaGrassBlock"
+			end
+			-- Track cells we clear this pass; the spatial index's ChildRemoved update is
+			-- deferred, so we can't rely on it reflecting our removals mid-loop.
+			local clearedThisPass = {}
+			local function cellEmpty(p)
+				if clearedThisPass[getPositionKey(p)] then return true end
+				return not index:HasBlockAt(p)
+			end
+			clearedThisPass[getPositionKey(snappedPos)] = true -- the cell we just dug
+			local checkPos = snappedPos + Vector3.new(0, BLOCK_SIZE, 0)
+			local belowPos = snappedPos
+			local guard = 0
+			while guard < TERRAIN.MAX_DEPTH + 2 do
+				guard += 1
+				-- Only remove if the cell directly below is unsupported (empty / dug).
+				if not cellEmpty(belowPos) then break end
+				local above = index:GetBlockAt(checkPos)
+				if not isSpreadGrass(above) then break end
+				if DEBUG_LAZY_LOAD then
+					print(string.format("[LazyLoad] Removing orphaned spread-grass at (%.1f,%.1f,%.1f)", checkPos.X, checkPos.Y, checkPos.Z))
+				end
+				above:Destroy()
+				clearedThisPass[getPositionKey(checkPos)] = true
+				belowPos = checkPos
+				checkPos = checkPos + Vector3.new(0, BLOCK_SIZE, 0)
+			end
+		end
+	end
+	
 	local blocksSpawned = 0
 	local skippedDugPositions = {} -- Track positions skipped because they're dug (for client prediction cleanup)
 	local surfaceY = getSurfaceYAtPosition(snappedPos, buildArea)
@@ -1091,16 +1135,10 @@ local function spawnBlocksInChunks(params)
 			task.wait()
 		end
 		
-		-- Progress logging every 25%
-		if chunkIndex == 1 or chunkIndex == totalChunks or chunkIndex % math.max(1, math.floor(totalChunks / 4)) == 0 then
-			print(string.format("[TerrainGenerator] Chunk %d/%d spawned (%d blocks)", chunkIndex, totalChunks, spawnedCount))
-		end
 	end
 	
 	if progressValue then progressValue.Value = 1 end
 	
-	print(string.format("[TerrainGenerator] Chunk loading complete: %d terrain + %d deco + %d tree blocks",
-		blocksCreated, decorationsCreated, treeBlocksCreated))
 	
 	return blocksCreated, decorationsCreated, treeBlocksCreated
 end
@@ -1173,7 +1211,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	-- FLAT TERRAIN: Simple grass-only generation
 	-- ============================================
 	if terrainStyle == "Flat" then
-		print("[TerrainGenerator] Generating flat grass terrain (Season: " .. currentSeason .. ")...")
 		
 		local grassType = TERRAIN.GRASS_BLOCK
 		local blocksCreated = 0
@@ -1197,7 +1234,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 		end
 		
 		local elapsed = tick() - startTime
-		print(string.format("[TerrainGenerator] Done! %d grass blocks in %.2fs", blocksCreated, elapsed))
 		GeneratingPlots[plotNumber] = nil  -- Mark generation complete
 		buildArea:SetAttribute("TerrainGenerationInProgress", nil)  -- Clear flag
 		BulkOperationFlags.EndBulkOperation(buildArea)  -- Re-enable handlers
@@ -1208,7 +1244,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	-- NATURAL TERRAIN: Full biome with hills, trees, decorations
 	-- ============================================
 	if not biomeConfig then
-		print("[TerrainGenerator] No biome config found, falling back to flat terrain")
 		-- Fall back to flat if no biome config
 		GeneratedPlots[plotNumber] = nil
 		return TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, biomeName, "Flat", savedSeed)
@@ -1219,9 +1254,7 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	local useFastMode = isMegaPlot and GENERATION_SETTINGS.MEGA_PLOT_FAST_MODE
 	
 	if useFastMode then
-		print("[TerrainGenerator] Generating " .. biomeName .. " (Natural) - FAST MODE for MegaPlot...")
 	else
-		print("[TerrainGenerator] Generating " .. biomeName .. " (Natural) 3D-printer style...")
 	end
 	
 	-- Noise settings from biome
@@ -1233,7 +1266,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	
 	buildArea:SetAttribute("TerrainSeed", noiseSeed)
 	terrainRng = Random.new(noiseSeed)  -- Isolated RNG for deterministic generation
-	print("[TerrainGenerator] Using seed: " .. noiseSeed)
 	
 	-- Pre-calculate height map (or restore from saved data for exact terrain reproduction)
 	local heightMap = {}
@@ -1258,14 +1290,11 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		print(string.format("[TerrainGenerator] Using SAVED height map for exact terrain restoration (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	else
 		-- Generate new height map from noise (first-time generation)
 		if savedHeightMapStr then
 			-- Clear stale height map that doesn't match current grid dimensions
 			buildArea:SetAttribute("TerrainHeightMap", nil)
-			print("[TerrainGenerator] Cleared stale saved height map (grid size mismatch)")
 		end
 		
 		local terrainShape = biomeConfig.TerrainShape  -- Optional shaping curve
@@ -1320,9 +1349,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		
-		print(string.format("[TerrainGenerator] Generated NEW height map from noise (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	end
 	
 	-- Collect all blocks by Y level (terrain + trees)
@@ -1539,7 +1565,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	-- Edge walls disabled - floor is deep enough now that they aren't needed
 	local edgeBlocksCreated = 0
 	if false then -- Previously: not isMegaPlot
-		print("[TerrainGenerator] Spawning edge walls for individual plot...")
 		local edgeBatchCount = 0
 		local edgeYieldInterval = 50
 		
@@ -1605,7 +1630,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 			if gridX % 10 == 0 then task.wait() end
 		end
 	else
-		print("[TerrainGenerator] MegaPlot: Skipping edge walls")
 	end
 	
 	-- ============================================
@@ -1649,8 +1673,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	buildArea:SetAttribute("TerrainHeightMap", table.concat(heightData, ","))
 	
 	local elapsed = tick() - startTime
-	print(string.format("[TerrainGenerator] Done! %d terrain + %d edge + %d deco + %d tree/log/cactus blocks (%d trees, %d fallen logs, %d cacti) in %.2fs",
-		blocksCreated, edgeBlocksCreated, decorationsCreated, treeBlocksCreated, treesPlanned, fallenLogsPlanned, cactusPlanned, elapsed))
 	
 	if LeafDecayManager and treesPlanned > 0 then
 		LeafDecayManager.Initialize(buildArea)
@@ -1707,7 +1729,6 @@ function TerrainGenerator.GenerateFlatTerrain(buildArea, plotNumber)
 	-- Initialize decoration cleanup
 	TerrainGenerator.InitializeDecorationCleanup(buildArea)
 	
-	print("[TerrainGenerator] Flat terrain: " .. blocksCreated .. " blocks")
 	return blocksCreated
 end
 
@@ -1921,8 +1942,6 @@ function TerrainGenerator.UpdateTerrainColors(buildArea, biomeName, seasonName)
 	end
 	
 	local biomeColors = BiomeConfig.GetBiomeColors(biomeName)
-	print(string.format("[TerrainGenerator] UpdateTerrainColors: biome=%s season=%s grassColor=%s",
-		biomeName, seasonName, biomeColors.GrassColor and tostring(biomeColors.GrassColor) or "nil"))
 	
 	local updated = 0
 	local skipped = 0
@@ -1937,7 +1956,6 @@ function TerrainGenerator.UpdateTerrainColors(buildArea, biomeName, seasonName)
 	}
 	
 	local children = blocksFolder:GetChildren()
-	print("[TerrainGenerator] Total children in Blocks folder:", #children)
 	
 	for i, child in ipairs(children) do
 		local blockType = child:GetAttribute("BlockType")
@@ -1958,8 +1976,6 @@ function TerrainGenerator.UpdateTerrainColors(buildArea, biomeName, seasonName)
 		-- Yield occasionally to avoid freezing on large plots
 		if i % 500 == 0 then task.wait() end
 	end
-	
-	print(string.format("[TerrainGenerator] Color update done: %d updated, %d skipped (biome=%s season=%s)", updated, skipped, biomeName, seasonName))
 	return updated
 end
 
@@ -2108,9 +2124,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 	
 	local numBiomes = #selectedBiomes
 	
-	print("[TerrainGenerator] Default terrain with biomes: " .. table.concat(selectedBiomes, ", "))
-	print("[TerrainGenerator] Using seed: " .. noiseSeed)
-	
 	-- Generate Voronoi control points for biome regions
 	local biomePoints = {}
 	for i, biomeName in ipairs(selectedBiomes) do
@@ -2235,7 +2248,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 	local useFastMode = isMegaPlot and GENERATION_SETTINGS.MEGA_PLOT_FAST_MODE
 	
 	local startTime = tick()
-	print("[TerrainGenerator] Generating Default multi-biome terrain (Season: " .. currentSeason .. ")...")
 	
 	-- Pre-calculate height map using per-cell biome settings
 	-- Heights are blended at biome borders for smooth transitions
@@ -2261,13 +2273,10 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		print(string.format("[TerrainGenerator] Default: Using SAVED height map for exact terrain restoration (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	else
 		-- Generate new height map from noise (first-time generation)
 		if savedHeightMapStr then
 			buildArea:SetAttribute("TerrainHeightMap", nil)
-			print("[TerrainGenerator] Default: Cleared stale saved height map (grid size mismatch)")
 		end
 		
 		-- Helper: compute raw height for a biome config at world position
@@ -2347,9 +2356,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		
-		print(string.format("[TerrainGenerator] Default: Generated NEW height map from noise (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	end
 	
 	-- Store height map
@@ -2584,9 +2590,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 	})
 	
 	local elapsed = tick() - startTime
-	print(string.format("[TerrainGenerator] Default terrain done! %d terrain + %d deco + %d tree/cactus blocks (%d trees, %d logs, %d cacti) in %.2fs",
-		blocksCreated, decorationsCreated, treeBlocksCreated, treesPlanned, fallenLogsPlanned, cactusPlanned, elapsed))
-	print("[TerrainGenerator] Biomes: " .. table.concat(selectedBiomes, ", "))
 	
 	if LeafDecayManager and treesPlanned > 0 then
 		LeafDecayManager.Initialize(buildArea)
@@ -2822,6 +2825,20 @@ function TerrainGenerator.GetSurfaceY(buildArea)
 	return buildArea:GetAttribute("TerrainSurfaceY") or 0
 end
 
+-- Public, lazy-aware check: has the given world position been dug out on this plot?
+-- Snaps to the terrain grid first so callers can pass any nearby world position.
+-- Used by cleanup tools to tell "floating debris" (terrain below was dug) apart from
+-- grass resting on lazy terrain that simply hasn't spawned yet.
+function TerrainGenerator.IsPositionDug(position, plotNumber, buildArea)
+	if not plotNumber then return false end
+	local checkPos = position
+	if buildArea then
+		local ok, snapped = pcall(snapToTerrainGrid, position, buildArea)
+		if ok and snapped then checkPos = snapped end
+	end
+	return isPositionDug(checkPos, plotNumber)
+end
+
 function TerrainGenerator.GetTerrainDepth()
 	return TERRAIN.MAX_DEPTH
 end
@@ -2978,11 +2995,20 @@ function TerrainGenerator.RepairMissingTerrain(buildArea, plotNumber)
 					local worldZ = startZ + gz * BLOCK_SIZE
 					local worldPos = Vector3.new(worldX, expectedSurfaceY, worldZ)
 					
-					local grassType = TERRAIN.GRASS_BLOCK
-					local block = createBlock(grassType, worldPos, blocksFolder, 0, false, currentBiome, currentSeason)
-					if block then
-						block:SetAttribute("SurfaceY", expectedSurfaceY)
-						repaired = repaired + 1
+					-- GUARD: never "repair" a surface cell the player deliberately dug out.
+					-- A dug pit has nothing below it within range, which looks identical to a
+					-- strip bug to the hasBlocksBelow heuristic. DugPositions is the authoritative
+					-- record of intentional digging; restoring grass here is exactly what created
+					-- floating grass over hollowed pits. Genuine strip-bug cells were never dug,
+					-- so they aren't in DugPositions and still get repaired below.
+					local isDug = plotNumber and isPositionDug(worldPos, plotNumber)
+					if not isDug then
+						local grassType = TERRAIN.GRASS_BLOCK
+						local block = createBlock(grassType, worldPos, blocksFolder, 0, false, currentBiome, currentSeason)
+						if block then
+							block:SetAttribute("SurfaceY", expectedSurfaceY)
+							repaired = repaired + 1
+						end
 					end
 				end
 			end

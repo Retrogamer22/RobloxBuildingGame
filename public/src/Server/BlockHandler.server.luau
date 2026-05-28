@@ -28,6 +28,29 @@ local WallpaperPlacement = require(ReplicatedStorage:WaitForChild("WallpaperPlac
 local CarpetPlacement = require(ReplicatedStorage:WaitForChild("CarpetPlacement", 10))
 local VinePlacement = require(ReplicatedStorage:WaitForChild("VinePlacement", 10))
 local ColumnPlacement = require(ReplicatedStorage:WaitForChild("ColumnPlacement", 10))
+
+-- Resolve a glass-style block's template Model from its type + generic shape name.
+-- Standard glass lives in Decorations/Glass; glass-style reward sets (CandyLattice)
+-- live in their RewardSets folder. GlassPlacement.ResolveTemplate is the single
+-- source of truth for the folder + model name per type. Returns the template
+-- Instance or nil. Used by the in-place glass-rebuild closures below.
+local function resolveGlassTemplate(glassType, genericTemplateName)
+	local folderPath, modelName = GlassPlacement.ResolveTemplate(glassType, genericTemplateName)
+	local folder = ReplicatedStorage
+	for _, folderName in ipairs(string.split(folderPath, "/")) do
+		folder = folder and folder:FindFirstChild(folderName)
+	end
+	if not folder then
+		warn(string.format("[Glass] Folder not found: %s (type=%s)", tostring(folderPath), tostring(glassType)))
+		return nil
+	end
+	local template = folder:FindFirstChild(modelName)
+	if not template then
+		warn(string.format("[Glass] Template not found: %s in %s (type=%s)", tostring(modelName), tostring(folderPath), tostring(glassType)))
+		return nil
+	end
+	return template
+end
 local ArchitravePlacement = require(ReplicatedStorage:WaitForChild("ArchitravePlacement", 10))
 local BlockCollision = require(ReplicatedStorage:WaitForChild("BlockCollision", 10))
 local BlockTemplates = ReplicatedStorage:WaitForChild("BlockTemplates", 10)
@@ -566,7 +589,7 @@ local function applyColorToBlock(block, color, material, materialVariant)
 	end
 end
 
-local function createBlockFromTemplate(templateName, blockId, useBlockModel, blockModelName, blockModelFolder, applyColor, defaultColor, customVariantChild, presetMaterial, presetMaterialVariant)
+local function createBlockFromTemplate(templateName, blockId, useBlockModel, blockModelName, blockModelFolder, applyColor, defaultColor, customVariantChild, presetMaterial, presetMaterialVariant, stripeColorMode)
 	local template
 	local actuallyUsedBlockModel = false
 	
@@ -634,6 +657,50 @@ local function createBlockFromTemplate(templateName, blockId, useBlockModel, blo
 	
 	local block = template:Clone()
 	block.Name = blockId or templateName
+	
+	-- TEXTURE mode (stripeColorMode == "Texture"): the block's grayscale Texture
+	-- children carry the stripe pattern; tinting them produces the colored variant.
+	-- Tint targets:
+	--   * Every Texture/Decal descendant (the stripes)
+	--   * Any Part named "Core" (the swirl on candy-cane log end caps)
+	-- Everything else (the white "Bark" part) keeps its template color so the
+	-- background between stripes stays white. Used by Candy Cane variants.
+	if stripeColorMode == "Texture" then
+		if block:IsA("BasePart") then
+			block.Anchored = true
+		elseif block:IsA("Model") then
+			for _, part in ipairs(block:GetDescendants()) do
+				if part:IsA("BasePart") then part.Anchored = true end
+			end
+		end
+		if applyColor and defaultColor then
+			-- Tint all Texture/Decal descendants (the stripes painted on the bark/faces).
+			for _, desc in ipairs(block:GetDescendants()) do
+				if desc:IsA("Texture") or desc:IsA("Decal") then
+					desc.Color3 = defaultColor
+				end
+			end
+			-- Tint Parts NAMED "Core" — the swirl-pattern end-caps of a candy-cane log.
+			-- The body (Bark) intentionally stays its template color (white) so the
+			-- background between stripes remains white.
+			for _, desc in ipairs(block:GetDescendants()) do
+				if desc:IsA("BasePart") and desc.Name == "Core" then
+					desc.Color = defaultColor
+				end
+			end
+			-- Top-level Texture/Decal children on a Part template (CandyCaneFull is a
+			-- Union with Texture children directly).
+			if block:IsA("BasePart") then
+				for _, child in ipairs(block:GetChildren()) do
+					if child:IsA("Texture") or child:IsA("Decal") then
+						child.Color3 = defaultColor
+					end
+				end
+			end
+		end
+		print("[Server] Created block: " .. tostring(blockId or templateName) .. " | UsedBlockModel: " .. tostring(actuallyUsedBlockModel) .. " | ApplyColor: " .. tostring(applyColor) .. " (Texture mode)")
+		return block, actuallyUsedBlockModel
+	end
 	
 	if block:IsA("BasePart") then
 		block.Anchored = true
@@ -747,15 +814,34 @@ local function createBlockFromTemplate(templateName, blockId, useBlockModel, blo
 	return block, actuallyUsedBlockModel
 end
 
-local function createDecorationFromTemplate(decorationName)
-	if not DecorationsFolder then
+local function createDecorationFromTemplate(decorationName, customFolder)
+	-- customFolder (optional): nested path like "RewardSets/CandyBlocks" that
+	-- overrides the default Decorations folder. Used by reward-set decorations
+	-- (e.g. CandyCaneSapling) which live alongside their themed pack rather
+	-- than in the global Decorations folder.
+	local sourceFolder = DecorationsFolder
+	if customFolder then
+		local folder = ReplicatedStorage
+		for _, folderName in ipairs(string.split(customFolder, "/")) do
+			folder = folder:FindFirstChild(folderName)
+			if not folder then break end
+		end
+		if folder then
+			sourceFolder = folder
+		else
+			warn("[Server] Decoration custom folder not found: " .. tostring(customFolder))
+		end
+	end
+	
+	if not sourceFolder then
 		warn("[Server] Decorations folder not found!")
 		return nil
 	end
 	
-	local template = DecorationsFolder:FindFirstChild(decorationName)
+	local template = sourceFolder:FindFirstChild(decorationName)
 	if not template then
-		warn("[Server] Decoration template not found: " .. tostring(decorationName))
+		warn("[Server] Decoration template not found: " .. tostring(decorationName)
+			.. " (folder: " .. (customFolder or "Decorations") .. ")")
 		return nil
 	end
 	
@@ -1098,7 +1184,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		local decoName = data.DecorationData.DecorationName
 		local decoOffset = data.DecorationData.Offset or Vector3.new(0, 0, 0)
 		
-		local decoration = createDecorationFromTemplate(decoName)
+		local decoration = createDecorationFromTemplate(decoName, preset.BlockModelFolder)
 		if not decoration then return end
 		
 		-- Calculate final position with offset
@@ -1902,10 +1988,14 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	local useBlockModelName = (not isFence and not isGlass and not isArchitrave) and preset.BlockModelName or nil
 	local useBlockId = (not isFence and not isGlass and not isArchitrave) and preset.Id or nil
 	
-	-- For glass, look in Decorations/Glass folder
+	-- For glass, resolve the model folder + name from the glass-type registry.
+	-- Standard glass -> Decorations/Glass; CandyLattice -> RewardSets/CandyBlocks; etc.
+	-- templateName here is the generic shape name (Glass_0 / Glass_Corner / ...);
+	-- ResolveTemplate translates it to the real model name for this block's type.
 	if isGlass then
-		useBlockModelFolder = "Decorations/Glass"
-		useBlockModelName = templateName -- e.g. "Glass_2" or "Glass_3"
+		local glassFolderPath, glassModelName = GlassPlacement.ResolveTemplate(data.BlockType, templateName)
+		useBlockModelFolder = glassFolderPath
+		useBlockModelName = glassModelName
 	end
 	
 	-- For torches, look in Decorations folder and use the correct model (TorchStraight or TorchAngled)
@@ -2015,7 +2105,8 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		preset.DefaultColor,
 		preset.CustomVariantChild, -- For custom Union stair/slab models
 		preset.Material,
-		preset.MaterialVariant
+		preset.MaterialVariant,
+		preset.StripeColorMode  -- "Texture" tints Texture descendants instead of the Part
 	)
 	if not block then return end
 	
@@ -2246,8 +2337,12 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		))
 	end
 	
-	-- Apply color/material for template blocks, or block models with ApplyColor set
-	if not usedBlockModel or preset.ApplyColor then
+	-- Apply color/material for template blocks, or block models with ApplyColor set.
+	-- BUT skip this entirely for Texture-mode blocks (candy canes etc.): their
+	-- coloring was already done correctly inside createBlockFromTemplate, which
+	-- tints only Texture descendants + the Core part — NOT the white Bark.
+	-- applyColorToBlock would naively tint every part, undoing that work.
+	if (not usedBlockModel or preset.ApplyColor) and preset.StripeColorMode ~= "Texture" then
 		local material = preset.Material
 		if data.MaterialName and type(data.MaterialName) == "string" then
 			local success, result = pcall(function()
@@ -3437,9 +3532,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		
 		-- Also update adjacent glass panes (they may need to become / un-become L-corners)
 		local function createGlassBlockForSolid(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then return nil end
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then return nil end
 
 			local newGlass = template:Clone()
@@ -3653,16 +3746,9 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	if isGlass then
 		-- Create a function to create glass blocks for the update
 		local function createGlassBlock(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			-- Look for template in Decorations/Glass folder
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then
-				warn("[Glass] Glass folder not found in Decorations!")
-				return nil
-			end
-			
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			-- Resolve template from the glass-type registry (Decorations/Glass, RewardSets, etc.)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then
-				warn("[Glass] Template not found: " .. tostring(glassTemplateName))
 				return nil
 			end
 			
@@ -4022,7 +4108,18 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 							local py = item:GetAttribute("ParentBlockY")
 							local pz = item:GetAttribute("ParentBlockZ")
 							if px and py and pz then
-								if (Vector3.new(px, py, pz) - hostCell).Magnitude < 1 then
+								-- Snap the stored ParentBlock to the grid the SAME way hostCell
+								-- is snapped before comparing. ParentBlockX/Y/Z were stored as
+								-- math.round(worldPos) at placement, which on an off-grid plot
+								-- doesn't equal the multiple-of-BLOCK_SIZE hostCell. Snapping both
+								-- sides puts them in the same space so saplings/decorations on
+								-- off-grid blocks (e.g. candy cane saplings) still get cleaned up.
+								local snappedParent = Vector3.new(
+									math.round(px / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(py / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(pz / BLOCK_SIZE) * BLOCK_SIZE
+								)
+								if (snappedParent - hostCell).Magnitude < 1 then
 									seenItems[item] = true
 									table.insert(itemsToDestroy, item)
 								end
@@ -4092,8 +4189,22 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 					local px = item:GetAttribute("ParentBlockX")
 					local py = item:GetAttribute("ParentBlockY")
 					local pz = item:GetAttribute("ParentBlockZ")
-					if px and py and pz and (Vector3.new(px, py, pz) - blockPos).Magnitude < 1 then
-						table.insert(itemsToDestroy, item)
+					if px and py and pz then
+						-- Grid-snap both sides before comparing (see note in the spatial-index
+						-- path above) so decorations on off-grid blocks still match.
+						local snappedParent = Vector3.new(
+							math.round(px / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(py / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(pz / BLOCK_SIZE) * BLOCK_SIZE
+						)
+						local snappedBlock = Vector3.new(
+							math.round(blockPos.X / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(blockPos.Y / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(blockPos.Z / BLOCK_SIZE) * BLOCK_SIZE
+						)
+						if (snappedParent - snappedBlock).Magnitude < 1 then
+							table.insert(itemsToDestroy, item)
+						end
 					end
 				elseif item:GetAttribute("IsTorch") or item:GetAttribute("IsLantern") or item:GetAttribute("IsSignStanding") or item:GetAttribute("IsWallSign") then
 					local hx = item:GetAttribute("HostBlockX")
@@ -4477,9 +4588,7 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 
 		-- Also update adjacent glass panes (corner anchors may have been removed)
 		local function createGlassBlockForSolid(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then return nil end
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then return nil end
 
 			local newGlass = template:Clone()
@@ -4592,16 +4701,9 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 	-- If glass was broken, update adjacent glass
 	if isGlass and blockPos then
 		local function createGlassBlock(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			-- Look for template in Decorations/Glass folder
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then
-				warn("[Glass] Glass folder not found in Decorations!")
-				return nil
-			end
-			
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			-- Resolve template from the glass-type registry (Decorations/Glass, RewardSets, etc.)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then
-				warn("[Glass] Template not found: " .. tostring(glassTemplateName))
 				return nil
 			end
 			

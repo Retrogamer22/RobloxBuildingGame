@@ -49,10 +49,58 @@ GlassPlacement.TEMPLATE_NAME = "Glass_0"
 -- Map glass block IDs to their base type
 GlassPlacement.GLASS_BASE_TYPES = {
 	["Glass"] = "Glass",
+	["CandyLattice"] = "CandyLattice",
 	-- Add colored glass variants here later if needed
 	-- ["RedGlass"] = "Glass",
 	-- ["BlueGlass"] = "Glass",
 }
+
+-- Per-type model source: which folder the pane/corner/tee/cross models live in,
+-- and the actual model names for each connection shape. The connection-detection
+-- functions below all speak the generic Glass_0 / Glass_Corner / Glass_Tee /
+-- Glass_4_Way vocabulary; ResolveTemplate() translates that into the real folder
+-- + model name for whatever glass-style block is being placed. This keeps the
+-- whole engine generic so new glass-style sets (CandyLattice, future tinted
+-- panes) need only an entry here -- no BlockHandler changes.
+--
+-- folder is relative to ReplicatedStorage (matches preset.BlockModelFolder).
+GlassPlacement.GLASS_TYPE_CONFIG = {
+	Glass = {
+		folder = "Decorations/Glass",
+		single  = "Glass_0",
+		corner  = "Glass_Corner",
+		tee     = "Glass_Tee",
+		fourway = "Glass_4_Way",
+	},
+	CandyLattice = {
+		folder = "RewardSets/CandyBlocks",
+		single  = "CandyLattice",
+		corner  = "CandyLatticeCorner",
+		tee     = "CandyLatticeT",
+		fourway = "CandyLatticeCross",
+	},
+}
+
+-- Map a generic template name (as produced by the connection-detection code)
+-- to the config key holding the real model name.
+local GENERIC_TEMPLATE_TO_KEY = {
+	["Glass_0"]     = "single",
+	["Glass_Corner"] = "corner",
+	["Glass_Tee"]   = "tee",
+	["Glass_4_Way"] = "fourway",
+}
+
+-- Resolve a glass type + generic template name into the real folder + model name.
+-- glassType: the block's BlockType (e.g. "Glass", "CandyLattice").
+-- genericName: one of Glass_0 / Glass_Corner / Glass_Tee / Glass_4_Way.
+-- Returns folder (string, relative to ReplicatedStorage) and modelName (string).
+-- Falls back to the Glass config for unknown types so existing glass is unaffected.
+function GlassPlacement.ResolveTemplate(glassType, genericName)
+	local baseType = GlassPlacement.GLASS_BASE_TYPES[glassType] or "Glass"
+	local cfg = GlassPlacement.GLASS_TYPE_CONFIG[baseType] or GlassPlacement.GLASS_TYPE_CONFIG.Glass
+	local key = GENERIC_TEMPLATE_TO_KEY[genericName] or "single"
+	return cfg.folder, cfg[key]
+end
 
 -- Valid orientations
 GlassPlacement.Orientations = {
@@ -193,7 +241,6 @@ function GlassPlacement.GetPlacementInfo(blockType, position, blocksFolder, orie
 	
 	-- Summary logging at level 1+
 	if debugOutput or DEBUG_GLASS_LEVEL >= 1 then
-		print(string.format("[Glass] PlacementInfo: template=Glass_0, orientation=%s", orientation))
 	end
 	
 	return {
@@ -216,9 +263,6 @@ function GlassPlacement.GetGlassCFrame(position, rotationCFrame, positionOffset,
 	
 	-- Summary logging at level 1+
 	if DEBUG_GLASS_LEVEL >= 1 then
-		print(string.format("[Glass] GetGlassCFrame: inputPos=(%.2f,%.2f,%.2f) finalPos=(%.2f,%.2f,%.2f)",
-			position.X, position.Y, position.Z,
-			finalPosition.X, finalPosition.Y, finalPosition.Z))
 	end
 	
 	return CFrame.new(finalPosition) * rotationCFrame

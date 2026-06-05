@@ -385,9 +385,11 @@ end
 -- never chars/consumes them and never goes out on its own (only manual
 -- extinguish removes it), but it STILL ignites nearby flammable blocks. These
 -- types are also never valid ignition targets themselves (so fire won't spread
--- between them). Netherrack is the classic example.
+-- between them). Netherrack is the classic example; SoulSand carries the blue
+-- "soul fire" variant the same way.
 local ETERNAL_FIRE_TYPES = {
 	["Netherrack"] = true,
+	["SoulSand"]   = true,
 }
 
 local function isEternalFireHost(blockType)
@@ -493,24 +495,38 @@ end
 --   "PosX"/"NegX"/"PosZ"/"NegZ" (mounted flat on that wall).
 -- hostCenter is the grid centre of the burning block. The fire records its host
 -- and its face so the tick/extinguish logic can find its support correctly.
-local function buildFireBlock(blocksFolder, hostCenter, placedByUserId, face)
+local function buildFireBlock(blocksFolder, hostCenter, placedByUserId, face, variant)
 	face = face or "Top"
+	variant = variant or "Normal"
+
+	-- Pick the template family from the variant (mirrors ToolHandler -- Three-File Rule).
+	local prefix = (variant == "Blue") and "FireBlue" or "Fire"
 
 	-- Pick the variant template for this face.
 	local templateName
 	if face == "Top" then
-		templateName = "Fire"
+		templateName = prefix
 	elseif face == "Bottom" then
-		templateName = "FireBottom"
+		templateName = prefix .. "Bottom"
 	else
-		templateName = "FireSide"
+		templateName = prefix .. "Side"
 	end
 
 	local template = BlockTemplates:FindFirstChild(templateName)
 	if not template then
+		-- Try the same face on the normal family before falling back to the Top cube,
+		-- so a missing FireBlue still spreads as a normal fire of the correct face.
+		if variant == "Blue" then
+			warn(string.format("[BB-FIRE] BlockTemplates.%s missing; falling back to normal Fire family", templateName))
+			local normalName
+			if face == "Top" then normalName = "Fire"
+			elseif face == "Bottom" then normalName = "FireBottom"
+			else normalName = "FireSide" end
+			template = BlockTemplates:FindFirstChild(normalName)
+		end
 		-- Fall back to the top cube if a variant model isn't present yet (e.g. not
 		-- synced from Studio), so spread never silently no-ops.
-		if templateName ~= "Fire" then
+		if not template and templateName ~= "Fire" then
 			warn(string.format("[BB-FIRE] BlockTemplates.%s missing; falling back to Fire cube", templateName))
 			template = BlockTemplates:FindFirstChild("Fire")
 			face = "Top"
@@ -590,6 +606,9 @@ local function buildFireBlock(blocksFolder, hostCenter, placedByUserId, face)
 	fire:SetAttribute("BlockType", "Fire")
 	fire:SetAttribute("IsFire", true)
 	fire:SetAttribute("FireFace", face)
+	if variant == "Blue" then
+		fire:SetAttribute("FireVariant", "Blue") -- preserved by save/load and used by spread
+	end
 	fire:SetAttribute("BlockPosX", gridPos.X)
 	fire:SetAttribute("BlockPosY", gridPos.Y)
 	fire:SetAttribute("BlockPosZ", gridPos.Z)
@@ -1862,5 +1881,85 @@ workspace.ChildAdded:Connect(function(child)
 		end
 	end
 end)
+
+-- ============================================
+-- PUBLIC API (_G.FireHandler)
+-- ============================================
+-- Exposed so other server scripts (notably LavaHandler) can ask whether a
+-- block type burns and start fires on specific faces of a host block. We keep
+-- this MINIMAL on purpose — the FireHandler still owns spread, charring,
+-- cooling, collapse, etc. Callers just hand us a hostBlock + face and we drop
+-- a Fire on it; the normal tick takes over from there.
+--
+-- IsFlammable(blockType: string) -> bool
+--   Mirrors the internal isFlammable() so callers get the SAME flammability
+--   rules without duplicating the FLAMMABLE_EXACT/SUFFIXES/PREFIXES lists.
+--
+-- IgniteBlock(hostBlock: Instance, face: string?, placedBy: number?) -> Fire?
+--   Light hostBlock on the given face ("Top"|"Bottom"|"PosX"|"NegX"|"PosZ"|
+--   "NegZ"). face defaults to "Top". Returns the created Fire instance, or nil
+--   if the host wasn't flammable / the face was already lit / templates were
+--   missing. The fire's PlacedBy attribute is set so save/load + permissions
+--   stay consistent (0 = system-spawned, like natural spread).
+_G.FireHandler = _G.FireHandler or {}
+
+_G.FireHandler.IsFlammable = function(blockType)
+	return isFlammable(blockType)
+end
+
+_G.FireHandler.IgniteBlock = function(hostBlock, face, placedBy)
+	if not hostBlock or not hostBlock.Parent then return nil end
+	face = face or "Top"
+	if not FACE_NORMAL[face] then
+		warn(string.format("[BB-FIRE] IgniteBlock: invalid face %q", tostring(face)))
+		return nil
+	end
+	
+	-- Only ignite flammable hosts. (Eternal-fire hosts like Netherrack are NOT
+	-- valid ignition targets here either — they're meant for fire that was lit
+	-- by other means and burns forever; lava-ignition should target real fuel.)
+	local hostType = hostBlock:GetAttribute("BlockType") or hostBlock.Name
+	if not isFlammable(hostType) then return nil end
+	if hostBlock:GetAttribute("FullyCharred") then return nil end
+	
+	-- Resolve the host's grid center using the same fallback chain as the
+	-- charred-sources pass (some placed blocks lack BlockPosX/Y/Z attributes).
+	local cx = hostBlock:GetAttribute("BlockPosX")
+	local cy = hostBlock:GetAttribute("BlockPosY")
+	local cz = hostBlock:GetAttribute("BlockPosZ")
+	local hostCenter
+	if cx and cy and cz then
+		hostCenter = Vector3.new(cx, cy, cz)
+	elseif hostBlock:IsA("BasePart") then
+		hostCenter = hostBlock.Position
+	elseif hostBlock:IsA("Model") then
+		local pivot = hostBlock:GetPivot().Position
+		if hostBlock:GetAttribute("IsFence") or hostBlock:GetAttribute("IsGlass") then
+			hostCenter = pivot
+		else
+			hostCenter = pivot + Vector3.new(0, BLOCK_SIZE / 2, 0)
+		end
+	end
+	if not hostCenter then return nil end
+	
+	-- Locate the plot the host lives in via the blocks folder (the host's parent).
+	local blocksFolder = hostBlock.Parent
+	if not blocksFolder then return nil end
+	
+	-- Make sure the spatial index knows this folder, and check the face isn't
+	-- already lit + the fire-cell isn't occupied (mirrors tryLightFace's guards).
+	local index = BlockSpatialIndex.GetOrCreate(blocksFolder)
+	if not index then return nil end
+	if hostHasFireOnFace(hostCenter, face, index) then return nil end
+	local fireCell = hostCenter + FACE_NORMAL[face] * BLOCK_SIZE
+	if index:HasBlockAt(fireCell) then return nil end
+	
+	local fire = buildFireBlock(blocksFolder, hostCenter, placedBy or 0, face)
+	if fire and DEBUG_FIRE then
+		print(string.format("[BB-FIRE] External ignite (lava?) lit %s face=%s at (%.1f,%.1f,%.1f)",
+			tostring(hostType), face, hostCenter.X, hostCenter.Y, hostCenter.Z))
+	end
+	return fire
+end
 
 print("[FireHandler] Fire spread system loaded")

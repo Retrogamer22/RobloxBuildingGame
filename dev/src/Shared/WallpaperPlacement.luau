@@ -86,16 +86,19 @@ function WallpaperPlacement.IsValidHost(hitBlock, face)
 			end
 		end
 		
-		-- Map stair direction to the back wall face name
-		-- Direction 0 (NORTH, open +Z): back wall = "North" (-Z face)
-		-- Direction 1 (EAST, open +X): back wall = "West" (-X face)
-		-- Direction 2 (SOUTH, open -Z): back wall = "South" (+Z face)
-		-- Direction 3 (WEST, open -X): back wall = "East" (+X face)
+		-- Map stair direction to the back wall (tall flat solid side, opposite the
+		-- stepped/open side). Verified against live StairDirection values: e.g. dir 2
+		-- has its solid back on the -Z (North) face. The previous table was 180 deg
+		-- off, which silently rejected the real back wall on every orientation.
+		-- Dir 0: back wall = "South" (+Z)
+		-- Dir 1: back wall = "East"  (+X)
+		-- Dir 2: back wall = "North" (-Z)
+		-- Dir 3: back wall = "West"  (-X)
 		local backWallFaces = {
-			[0] = "North",
-			[1] = "West",
-			[2] = "South",
-			[3] = "East",
+			[0] = "South",
+			[1] = "East",
+			[2] = "North",
+			[3] = "West",
 		}
 		local backFace = backWallFaces[stairDir]
 		return face == backFace
@@ -185,8 +188,20 @@ end
 function WallpaperPlacement.GetPlacementInfo(hitBlock, hitPosition, hitNormal, hitBlockPosition)
 	local face = WallpaperPlacement.GetFaceFromNormal(hitNormal)
 	
+	-- [BB-WPDEBUG] TEMP diagnostic for wallpaper-on-stair placement. Remove after fix.
+	local _valid = WallpaperPlacement.IsValidHost(hitBlock, face)
+	print(string.format("[BB-WPDEBUG] host=%s type=%s shape=%s isStairAttr=%s stairDir=%s rot=%s normal=(%.3f,%.3f,%.3f) face=%s valid=%s",
+		hitBlock and hitBlock.Name or "nil",
+		tostring(hitBlock and hitBlock:GetAttribute("BlockType")),
+		tostring(hitBlock and hitBlock:GetAttribute("Shape")),
+		tostring(hitBlock and hitBlock:GetAttribute("IsStair")),
+		tostring(hitBlock and hitBlock:GetAttribute("StairDirection")),
+		tostring(hitBlock and hitBlock:GetAttribute("Rotation")),
+		hitNormal.X, hitNormal.Y, hitNormal.Z,
+		tostring(face), tostring(_valid)))
+	
 	-- Validate the host block
-	if not WallpaperPlacement.IsValidHost(hitBlock, face) then
+	if not _valid then
 		return nil
 	end
 	

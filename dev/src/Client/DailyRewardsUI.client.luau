@@ -1381,6 +1381,11 @@ end
 local DEV_MODE = RunService:IsStudio()
 local DevStreak = 0 -- Continuous streak counter for dev testing (keeps growing past 7)
 local DevRng = Random.new()
+-- Dev preview: cycle through reward sets deterministically instead of rolling random,
+-- so you can step through each set's burst/look on demand. Each set-hit claim advances
+-- to the next set in RewardSetPicker.GetAllSets() order. Studio-only.
+local DevForceSetCycle = true
+local DevSetIndex = 0
 
 local function onClaimClicked()
 	if IsClaiming then return end
@@ -1398,15 +1403,26 @@ local function onClaimClicked()
 		-- Roll loot table (week-aware set chance)
 		local setChance = LootConfig.GetSetChance(claimedDay, claimedWeek)
 		local roll = DevRng:NextNumber()
-		local gotSet = roll < setChance
+		-- When previewing via the set-cycle, force every claim to land on a set so you
+		-- don't have to keep claiming through coin rolls to see each burst.
+		local gotSet = DevForceSetCycle or (roll < setChance)
 		local rewardBlock = nil
 
 		if not gotSet then
 			print(string.format("[BB-DR] LOOT ROLL: COINS (%d) | W%d D%d setChance=%.0f%% | roll=%.2f",
 				coinReward, claimedWeek, claimedDay, setChance * 100, roll))
 		else
-			-- Dev mode: pick from RewardSets folder with no ownership filter
-			rewardBlock = RewardSetPicker.PickRandom(DevRng, nil)
+			-- Dev mode: either cycle through sets deterministically (DevForceSetCycle)
+			-- so you can preview each one in turn, or fall back to a random weighted pick.
+			if DevForceSetCycle then
+				local allSets = RewardSetPicker.GetAllSets()
+				if #allSets > 0 then
+					DevSetIndex = (DevSetIndex % #allSets) + 1
+					rewardBlock = allSets[DevSetIndex]
+				end
+			else
+				rewardBlock = RewardSetPicker.PickRandom(DevRng, nil)
+			end
 			if rewardBlock then
 				print(string.format("[BB-DR] LOOT ROLL: SET! %s (%s) | grants=%d | W%d D%d setChance=%.0f%% | roll=%.2f",
 					rewardBlock.name, rewardBlock.rarity, #rewardBlock.grants, claimedWeek, claimedDay, setChance * 100, roll))

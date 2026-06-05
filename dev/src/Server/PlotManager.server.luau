@@ -10,6 +10,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
 local NetherConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("NetherConfig"))
+local BetaConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BetaConfig"))
 
 -- Helper to check if MegaPlot mode is active
 local function isMegaPlotMode()
@@ -19,9 +20,18 @@ end
 
 -- Wait for modules folder and require modules
 local TerrainGenerator = nil
+local ChunkTerrainManager = nil
+local ChunkStreamManager = nil -- SECOND-PLACE streaming loader (shared-world)
 local GrassSpreadManager = nil
 local SnowyGrassManager = nil
 local WeatherManager = nil
+
+-- Free-build (second place) detection. The place ID lives in BetaConfig (single
+-- source of truth, shared with SaveManager's persistence gate). chunk terrain is
+-- still loaded everywhere but only invoked when isChunkPlace() is true.
+local function isChunkPlace()
+	return BetaConfig.IsFreeBuildPlace()
+end
 do
 	local modulesFolder = script.Parent:WaitForChild("Modules", 10)
 	if modulesFolder then
@@ -29,6 +39,29 @@ do
 		if terrainModule then
 			TerrainGenerator = require(terrainModule)
 			print("[PlotManager] TerrainGenerator loaded")
+		end
+
+		-- SECOND-PLACE ONLY: chunk terrain. Loaded everywhere but only invoked
+		-- when game.PlaceId matches the chunk place (see CHUNK_PLACE_IDS above).
+		local chunkModule = modulesFolder:FindFirstChild("ChunkTerrainManager")
+		if chunkModule then
+			ChunkTerrainManager = require(chunkModule)
+			if TerrainGenerator then
+				ChunkTerrainManager.Init(TerrainGenerator)
+				print("[PlotManager] ChunkTerrainManager loaded")
+			end
+		end
+
+		-- SECOND-PLACE streaming loader (shared-world). Reuses TerrainGenerator like
+		-- ChunkTerrainManager, but streams small chunks around the UNION of all players
+		-- in one shared world. Only started on chunk places (see onFreeBuildPlayerAdded).
+		local streamModule = modulesFolder:FindFirstChild("ChunkStreamManager")
+		if streamModule then
+			ChunkStreamManager = require(streamModule)
+			if ChunkStreamManager and TerrainGenerator then
+				ChunkStreamManager.Init(TerrainGenerator)
+				print("[PlotManager] ChunkStreamManager loaded")
+			end
 		end
 		
 		local grassModule = modulesFolder:WaitForChild("GrassSpreadManager", 10)
@@ -42,16 +75,22 @@ do
 		if snowyGrassModule then
 			SnowyGrassManager = require(snowyGrassModule)
 			SnowyGrassManager.Initialize()
-			print("[PlotManager] SnowyGrassManager loaded")
 		end
 		
 		local weatherModule = modulesFolder:WaitForChild("WeatherManager", 10)
 		if weatherModule then
 			WeatherManager = require(weatherModule)
-			print("[PlotManager] WeatherManager loaded")
 		end
 	end
 end
+
+-- TEMP DIAGNOSTIC: confirm chunk wiring at runtime. Remove once verified.
+print(string.format(
+	"[BB-CHUNK] startup: PlaceId=%d isChunkPlace=%s ChunkTerrainManager=%s",
+	game.PlaceId,
+	tostring(isChunkPlace()),
+	tostring(ChunkTerrainManager ~= nil)
+))
 
 -- Create Remotes folder at runtime
 local Remotes = Instance.new("Folder")
@@ -142,6 +181,11 @@ local function assignPlot(player, plotNumber)
 	PlayerPlots[player] = plotNumber
 	
 	local buildArea = getBuildArea(plotNumber)
+	-- SECOND-PLACE ONLY: no pre-placed BuildArea models exist here. Fabricate one
+	-- at the world origin so the chunk generator has a container + anchor.
+	if not buildArea and isChunkPlace() and ChunkTerrainManager then
+		buildArea = ChunkTerrainManager.EnsureCenterBuildArea(plotNumber)
+	end
 	if buildArea then
 		-- Create blocks folder if it doesn't exist
 		local blocksFolder = buildArea:FindFirstChild("Blocks")
@@ -170,13 +214,21 @@ local function assignPlot(player, plotNumber)
 			local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
 			local defaultTerrainStyle = "Flat"
 			
-			print("[PlotManager] Generating terrain on-demand for plot " .. plotNumber)
-			TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
-			
-			buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
-			buildArea:SetAttribute("CurrentBiome", defaultBiome)
+			if isChunkPlace() and ChunkTerrainManager then
+				-- SECOND-PLACE ONLY: generate the CENTER chunk now (synchronous,
+				-- one plot's worth) so the player has ground to spawn on. The
+				-- surrounding ring is generated AFTER the spawn teleport (see
+				-- PlayerAdded) so the ring's attribute-swap can't race the teleport
+				-- and drop the player into the void.
+				ChunkTerrainManager.GenerateCenterChunk(buildArea, plotNumber)
+				buildArea:SetAttribute("TerrainStyle", "Chunk")
+				buildArea:SetAttribute("CurrentBiome", defaultBiome)
+			else
+				TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
+				buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
+				buildArea:SetAttribute("CurrentBiome", defaultBiome)
+			end
 			PlotTerrainReady[plotNumber] = true
-			print("[PlotManager] Plot " .. plotNumber .. " terrain ready for " .. player.Name)
 		end
 
 		-- NOTE: the paired NETHER bubble is intentionally NOT generated here. It used
@@ -192,7 +244,6 @@ local function assignPlot(player, plotNumber)
 		-- task.spawn for the deferred, guarded generation.
 	end
 	
-	print(player.Name .. " assigned to plot " .. plotNumber)
 	PlotAssigned:FireClient(player, plotNumber, buildArea)
 	
 	-- Register plot for grass spreading
@@ -213,14 +264,20 @@ local function assignPlot(player, plotNumber)
 	
 	-- Try to auto-load saved plot data, THEN generate the nether (deferred).
 	task.spawn(function()
+		-- SECOND-PLACE: NEVER load main-game plot saves onto the chunk world, and skip
+		-- nether priming (no nether plots exist here). Shared DataStores mean loading
+		-- would drop the player's real build onto the chunk plot and a save would
+		-- overwrite it. The chunk world is self-generated; skip persistence entirely.
+		if isChunkPlace() then
+			print("[BB-CHUNK] skipping plot auto-load on chunk place")
+			return
+		end
 		-- Wait for SaveManager to create the AutoLoadPlot BindableFunction (up to 10 seconds)
 		local AutoLoadPlot = ReplicatedStorage:WaitForChild("AutoLoadPlot", 10)
 		if AutoLoadPlot then
 			local success, result = AutoLoadPlot:Invoke(player, buildArea, plotNumber)
 			if success then
-				print("[PlotManager] Auto-loaded save for " .. player.Name)
 			else
-				print("[PlotManager] No save to load for " .. player.Name .. " (" .. tostring(result) .. ")")
 			end
 		else
 			warn("[PlotManager] AutoLoadPlot not found after 10s timeout - SaveManager may have failed to initialize")
@@ -299,6 +356,22 @@ local function releasePlot(player)
 	
 	local buildArea = getBuildArea(plotNumber)
 	if buildArea then
+		-- SECOND-PLACE: the chunk world is ephemeral and self-generating. Do NOT run the
+		-- main-game clear/regenerate here. A 3x3 chunk plot is thousands of blocks; mass-
+		-- clearing it on leave storms the per-block handlers (FallingBlockHandler's
+		-- checkColumnAbove gets deferred per removal -> "script timeout"), and regenerating
+		-- flat terrain over chunk terrain is meaningless. Just drop ownership + streaming.
+		if isChunkPlace() then
+			buildArea:SetAttribute("OwnerUserId", nil)
+			buildArea:SetAttribute("OwnerName", nil)
+			if buildArea:IsA("Model") then
+				pcall(function() buildArea:RemovePersistentPlayer(player) end)
+			end
+			PlotOwners[plotNumber] = nil
+			PlayerPlots[player] = nil
+			return
+		end
+
 		-- Clear weather effects (stops lightning loops, destroys fog emitters, resets state)
 		if WeatherManager then
 			WeatherManager.ClearPlot(plotNumber)
@@ -312,6 +385,11 @@ local function releasePlot(player)
 		buildArea:SetAttribute("CurrentWeather", nil)
 		buildArea:SetAttribute("WeatherIntensity", nil)
 		
+		-- Free-build chunk world: the terrain is shared, procedural, and never saved.
+		-- Do not tear it down on player-leave. It is not a per-player plot, and destroying
+		-- the entire terrain synchronously here is what freezes the server at shutdown
+		-- (the silent hang right after Disconnect). Real plot worlds still clear normally.
+		if not isChunkPlace() then
 		-- Use TerrainGenerator's optimized clear function to avoid listener cascade
 		if TerrainGenerator then
 			TerrainGenerator.ClearAllBlocks(buildArea, plotNumber)
@@ -329,6 +407,7 @@ local function releasePlot(player)
 				newFolder.Name = "Blocks"
 				newFolder.Parent = buildArea
 			end
+		end
 		end
 		
 		buildArea:SetAttribute("OwnerUserId", nil)
@@ -356,13 +435,11 @@ local function releasePlot(player)
 				local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
 				local defaultTerrainStyle = "Flat"
 				
-				print("[PlotManager] Regenerating terrain for released plot " .. plotNumber)
 				TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
 				
 				buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
 				buildArea:SetAttribute("CurrentBiome", defaultBiome)
 				PlotTerrainReady[plotNumber] = true
-				print("[PlotManager] Plot " .. plotNumber .. " terrain regenerated")
 			end)
 		else
 			PlotTerrainReady[plotNumber] = false
@@ -371,13 +448,11 @@ local function releasePlot(player)
 	
 	PlotOwners[plotNumber] = nil
 	PlayerPlots[player] = nil
-	print(player.Name .. " released plot " .. plotNumber)
 end
 
 local function teleportToPlot(player)
 	-- Skip teleport if MegaPlot mode is active - MegaPlotVisibility handles spawning
 	if isMegaPlotMode() then
-		print("[PlotManager] Skipping teleport for", player.Name, "- MegaPlot mode active")
 		return
 	end
 	
@@ -434,7 +509,6 @@ local function teleportToPlot(player)
 	
 	-- Teleport
 	character:PivotTo(CFrame.new(spawnPos))
-	print("[PlotManager] Teleported", player.Name, "to plot", plotNumber)
 	
 	-- Wait a moment for terrain to register, then unanchor
 	task.delay(0.3, function()
@@ -492,7 +566,136 @@ local function doesPlayerOwnPosition(player, position)
 	return PlayerPlots[player] == plotNumber
 end
 
+-- ============================================
+-- SHARED FREE-BUILD WORLD (second place only)
+-- ============================================
+-- ONE shared world per server: a single container at world origin that every
+-- player occupies. No per-player plots. Created lazily on first join; the spawn
+-- chunk (0,0) is generated once (sets ChunkCenterReady for the loading screen),
+-- then ChunkStreamManager streams the rest around the UNION of all players.
+local SHARED_WORLD_PLOT = 1 -- the synthetic container reuses BuildArea1 / plot id 1
+local sharedWorldContainer = nil
+local sharedWorldReady = false
+
+local function ensureSharedWorld()
+	if sharedWorldContainer and sharedWorldContainer.Parent then
+		return sharedWorldContainer
+	end
+	if not (ChunkTerrainManager and ChunkTerrainManager.EnsureCenterBuildArea) then
+		warn("[BB-CHUNK] ChunkTerrainManager missing; cannot build shared world")
+		return nil
+	end
+
+	local container = ChunkTerrainManager.EnsureCenterBuildArea(SHARED_WORLD_PLOT)
+	if not container then return nil end
+	sharedWorldContainer = container
+
+	-- Ensure a Blocks folder exists (player builds + spawn chunk live here, shared).
+	if not container:FindFirstChild("Blocks") then
+		local blocks = Instance.new("Folder")
+		blocks.Name = "Blocks"
+		blocks.Parent = container
+	end
+
+	-- Keep the shared world always loaded on every client (it's the whole map).
+	if container:IsA("Model") then
+		pcall(function() container.ModelStreamingMode = Enum.ModelStreamingMode.Atomic end)
+	end
+
+	-- Generate the spawn chunk (0,0) once. This sets ChunkCenterReady = true (the
+	-- loading screen watches it) and gives ground at the origin to land on.
+	if not sharedWorldReady and TerrainGenerator and ChunkTerrainManager.GenerateCenterChunk then
+		ChunkTerrainManager.GenerateCenterChunk(container, SHARED_WORLD_PLOT)
+		sharedWorldReady = true
+	end
+
+	-- Start the single shared-world streaming loop (idempotent).
+	if ChunkStreamManager and ChunkStreamManager.StartStreaming then
+		ChunkStreamManager.StartStreaming(container)
+	end
+
+	return container
+end
+
+-- Teleport a player onto the shared spawn chunk, with a small scatter so multiple
+-- players don't stack on the exact same point at the origin.
+local function teleportToSharedSpawn(player)
+	local container = sharedWorldContainer
+	if not container then return end
+	local character = player.Character
+	if not character then return end
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local posX = container:GetAttribute("BasePlatePositionX") or 0
+	local posZ = container:GetAttribute("BasePlatePositionZ") or 0
+	local plateTop = container:GetAttribute("BasePlateTop")
+	if not plateTop then
+		local posY = container:GetAttribute("BasePlatePositionY") or 0
+		local sizeY = container:GetAttribute("BasePlateSizeY") or 0
+		plateTop = posY + sizeY / 2
+	end
+
+	-- Scatter within ~half a chunk so players don't spawn inside each other.
+	local scatter = (GridConfig.BLOCK_SIZE or 3) * 4
+	local offX = (math.random() * 2 - 1) * scatter
+	local offZ = (math.random() * 2 - 1) * scatter
+	local spawnPos = Vector3.new(posX + offX, plateTop + 5, posZ + offZ)
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if humanoid and humanoid.Sit then
+		humanoid.Sit = false
+		task.wait(0.1)
+	end
+
+	hrp.Anchored = true
+	local forceField = character:FindFirstChild("TeleportProtection")
+	if not forceField then
+		forceField = Instance.new("ForceField")
+		forceField.Name = "TeleportProtection"
+		forceField.Visible = false
+		forceField.Parent = character
+	end
+
+	character:PivotTo(CFrame.new(spawnPos))
+
+	task.delay(0.3, function()
+		if hrp and hrp.Parent then hrp.Anchored = false end
+		if forceField and forceField.Parent then
+			task.delay(0.5, function()
+				if forceField and forceField.Parent then forceField:Destroy() end
+			end)
+		end
+	end)
+end
+
+-- Free-build join: spawn into the ONE shared world. No plot assignment.
+local function onFreeBuildPlayerAdded(player)
+	ensureSharedWorld()
+
+	local function handleCharacter(character)
+		if isMegaPlotMode() then return end
+		local hrp = character:WaitForChild("HumanoidRootPart", 5)
+		if not hrp then return end
+		hrp.Anchored = true
+		task.wait(0.1)
+		ensureSharedWorld() -- safe/idempotent; guarantees container exists
+		teleportToSharedSpawn(player)
+	end
+
+	player.CharacterAdded:Connect(handleCharacter)
+	if player.Character then
+		task.spawn(handleCharacter, player.Character)
+	end
+end
+
 Players.PlayerAdded:Connect(function(player)
+	-- SECOND-PLACE: one shared world, no per-player plots.
+	if isChunkPlace() then
+		onFreeBuildPlayerAdded(player)
+		return
+	end
+
 	local plotNumber = findAvailablePlot()
 	
 	if plotNumber then
@@ -509,6 +712,13 @@ Players.PlayerAdded:Connect(function(player)
 				hrp.Anchored = true
 				task.wait(0.1)  -- Minimal delay
 				teleportToPlot(player)
+
+				-- SECOND-PLACE ONLY: player is now on the center chunk, so it's
+				-- safe to fill the surrounding ring (idempotent; no-op on respawn).
+				if isChunkPlace() and ChunkTerrainManager then
+					local ba = getBuildArea(plotNumber)
+					if ba then ChunkTerrainManager.GenerateRing(ba, plotNumber) end
+				end
 			end
 		end)
 		
@@ -520,6 +730,12 @@ Players.PlayerAdded:Connect(function(player)
 				end
 				task.wait(0.1)
 				teleportToPlot(player)
+
+				-- SECOND-PLACE ONLY: ring after spawn (see note in CharacterAdded).
+				if isChunkPlace() and ChunkTerrainManager then
+					local ba = getBuildArea(plotNumber)
+					if ba then ChunkTerrainManager.GenerateRing(ba, plotNumber) end
+				end
 			end
 		end
 	else
@@ -528,7 +744,15 @@ Players.PlayerAdded:Connect(function(player)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	print("[PlotManager] Player leaving: " .. player.Name .. " - starting save-before-release")
+	
+	-- SECOND-PLACE: do NOT save on the chunk world. It shares the public universe's
+	-- DataStores; saving the chunk-terrain plot would overwrite the player's real
+	-- main-game build. Just do in-memory cleanup (free the plot) and bail.
+	if isChunkPlace() then
+		print("[BB-CHUNK] skipping plot save on chunk place")
+		releasePlot(player)
+		return
+	end
 	
 	-- IMPORTANT: Wait for SaveManager to finish auto-save BEFORE clearing the plot
 	-- Otherwise the save happens while blocks are being destroyed, corrupting dug detection
@@ -540,7 +764,6 @@ Players.PlayerRemoving:Connect(function(player)
 		end)
 		local saveTime = tick() - saveStart
 		if success then
-			print(string.format("[PlotManager] SavePlotSync completed for %s in %.2fs", player.Name, saveTime))
 		else
 			warn(string.format("[PlotManager] SavePlotSync FAILED for %s after %.2fs: %s", player.Name, saveTime, tostring(err)))
 		end
@@ -549,7 +772,6 @@ Players.PlayerRemoving:Connect(function(player)
 	end
 	
 	releasePlot(player)
-	print("[PlotManager] Plot released for " .. player.Name)
 end)
 
 GetPlotInfo.OnServerInvoke = function(player)
@@ -585,7 +807,6 @@ CheckOwnership.OnInvoke = doesPlayerOwnPosition
 -- ============================================
 
 local function initializeAllPlots()
-	print("[PlotManager] Preparing " .. GridConfig.TOTAL_PLOTS .. " plots (terrain deferred until player joins)...")
 	
 	for i = 1, GridConfig.TOTAL_PLOTS do
 		local buildArea = getBuildArea(i)
@@ -619,7 +840,6 @@ local function initializeAllPlots()
 				blocksFolder.Parent = buildArea
 			end
 			
-			print("[PlotManager] Plot " .. i .. " prepared (no terrain yet)")
 		end
 
 		-- Paired NETHER plot: hide the visible baseplate, mirroring the overworld
@@ -649,7 +869,6 @@ local function initializeAllPlots()
 		end
 	end
 	
-	print("[PlotManager] All plots prepared! Terrain will generate on-demand when players join.")
 end
 
 -- Shared state: clients can check this on join to know if loading screen is needed
@@ -687,39 +906,43 @@ local function startBackgroundTerrainGen()
 		local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
 		local defaultTerrainStyle = "Flat"
 		
-		print("[PlotManager] Starting background terrain generation for unclaimed plots...")
 		
 		for i = 1, GridConfig.TOTAL_PLOTS do
 			-- Skip plots that already have terrain (claimed by a player)
 			if not PlotTerrainReady[i] then
 				local buildArea = getBuildArea(i)
 				if buildArea and TerrainGenerator then
-					print("[PlotManager] Background generating terrain for plot " .. i)
-					TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, i, defaultBiome, defaultTerrainStyle)
-					buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
-					buildArea:SetAttribute("CurrentBiome", defaultBiome)
-					PlotTerrainReady[i] = true
-					print("[PlotManager] Plot " .. i .. " background terrain ready")
-					
+					if isChunkPlace() then
+						-- SECOND-PLACE ONLY: do NOT pre-fill unclaimed plots with flat
+						-- terrain. The free-range chunk world is generated per-player on
+						-- claim (GenerateCenterChunk + GenerateRing). Just mark the plot
+						-- ready so the loading bar completes and AllPlotsReady flips.
+						PlotTerrainReady[i] = true
+					else
+						TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, i, defaultBiome, defaultTerrainStyle)
+						buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
+						buildArea:SetAttribute("CurrentBiome", defaultBiome)
+						PlotTerrainReady[i] = true
+					end
+
 					-- Send progress to all clients showing loading screen
 					local readyCount = 0
 					for j = 1, GridConfig.TOTAL_PLOTS do
 						if PlotTerrainReady[j] then readyCount = readyCount + 1 end
 					end
 					PlotsReady:FireAllClients("progress", readyCount, GridConfig.TOTAL_PLOTS)
-					
+
 					-- Brief yield between plots to spread out replication load without
-					-- making the loading bar crawl. GenerateFlatTerrainWithBiome already
-					-- yields internally, so a long fixed wait here just stalls progress.
+					-- making the loading bar crawl. On the chunk place this is a near
+					-- no-op (we only set the flag), so the bar completes promptly.
 					task.wait(0.15)
 				end
 			end
 		end
-		
+
 		-- Signal all clients that plots are ready
 		allPlotsReadyValue.Value = true
 		PlotsReady:FireAllClients("ready")
-		print("[PlotManager] Background terrain generation complete!")
 	end)
 end
 
@@ -734,5 +957,3 @@ backgroundGenConnection = Players.PlayerAdded:Connect(function()
 		backgroundGenConnection = nil
 	end
 end)
-
-print("PlotManager initialized with " .. GridConfig.TOTAL_PLOTS .. " plots")

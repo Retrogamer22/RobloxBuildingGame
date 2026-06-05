@@ -59,6 +59,8 @@ local ExtraKeyShort = {
 	["CustomColorR"] = "cr",
 	["CustomColorG"] = "cg",
 	["CustomColorB"] = "cb",
+	["IsPainted"] = "pt",  -- Paint Mod: block recolored by the paintbrush (restore cr/cg/cb on any block type)
+	["IsFlatPainted"] = "fpt",  -- Paint Mod: second coat -> flat solid finish (restore via PaintCanVisual.FlattenBlock)
 	["IsDecoration"] = "deco",
 	["IsLazyLoaded"] = "lazy",
 	["IsExtended"] = "ext",
@@ -372,7 +374,8 @@ local function serializeBlock(block, blockPos, BLOCK_SIZE, terrainOrigin)
 							 block:GetAttribute("IsLadder") or
 							 block:GetAttribute("IsGlass")
 	
-	if isTemplateBlock then
+	-- Paint Mod: also persist the color of brush-painted blocks (any type), not just templates.
+	if isTemplateBlock or block:GetAttribute("IsPainted") then
 		local color = extractBlockColor(block)
 		if color then
 			extra = extra or {}

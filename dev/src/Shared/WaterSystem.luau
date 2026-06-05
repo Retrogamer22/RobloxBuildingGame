@@ -195,10 +195,12 @@ local function isInPlotBounds(pos, buildArea)
 	return true
 end
 
--- Extended bounds for water flow: allows water to spill 1 block past the
--- plot edge horizontally so it can cascade down like a waterfall.
--- Vertically capped to a short distance below the surface.
-local WATER_EDGE_EXTENSION = BLOCK_SIZE -- 1 block past plot edge
+-- Bounds for where water can exist. EDGE_EXTENSION = 0 means water is
+-- strictly confined to the player's plot — it cannot spill or cascade past
+-- plot edges. Set to BLOCK_SIZE (or larger) if you want water to spill
+-- past the edge like a waterfall. Vertical fall depth still applies
+-- inside the plot.
+local WATER_EDGE_EXTENSION = 0
 local WATER_FALL_DEPTH = 10 * BLOCK_SIZE -- Max waterfall height
 
 local function isInWaterBounds(pos, buildArea)

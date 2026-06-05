@@ -6,10 +6,10 @@
 
 local ChangelogConfig = {
 	-- Current version (increment this with each update)
-	VERSION = 24,
+	VERSION = 25,
 	
 	-- Version display name (shown to players)
-	VERSION_NAME = "v1.7.5",
+	VERSION_NAME = "v1.7.6",
 	
 	-- Developer Notes (optional) - shown in a highlighted box above changes
 	-- Set to nil or empty string to hide the notes section
@@ -30,18 +30,9 @@ local ChangelogConfig = {
 	-- Changelog entries for the current version
 	-- Each entry is a table with: { picon = "emoji", text = "description" }
 	CHANGES = {
-		{ icon = "", text = "Added in a new coin system for future features and gameplay" },
-		{ icon = "", text = "Added in, beds, crafting tables, furnace, and chests with different variants!" },
-		{ icon = "", text = "Created community button to join from the main menu" },
-		{ icon = "", text = "Added Vines and shears to stop the vines from growing!" },
-		{ icon = "", text = "Added a new frame block variant, the arch! create more dynamic structures" },
-		{ icon = "", text = "Revamped all textures with PBR maps to add more depth and detail to the game" },
-		{ icon = "", text = "Tweaked campfire smoke and lighting system" },
-		{ icon = "", text = "Tweaked saving/loading system to be more robust" },
-		{ icon = "", text = "Fixed daily rewards system" },
-		{ icon = "", text = "Fixed terrain around the edge of the plot" },
-		{ icon = "", text = "Fixed weird grass bug" },
-		{ icon = "", text = "Fixed more bugs and issues as usual!" },
+		{ icon = "", text = "Updated the block breaking and placing system" },
+		{ icon = "", text = "Sugar cane now grows naturally and can be sheared" },
+		{ icon = "", text = "Added new particle effects" },
 	},
 	
 	-- Title shown at the top of the changelog

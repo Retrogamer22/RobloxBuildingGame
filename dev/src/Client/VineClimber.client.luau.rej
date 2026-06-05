@@ -1,0 +1,10 @@
+diff a/dev/src/Client/VineClimber.client.luau b/dev/src/Client/VineClimber.client.luau	(rejected hunks)
+@@ -99,7 +99,7 @@ end
+ -- one of the four horizontal sides. "Free-hanging" vines (no wall behind)
+ -- just slow the player a bit and don't start climbing. The vine itself is
+ -- already CanCollide=false server-side, so the player can walk through.
+-local DEBUG_VINES = true -- set to false to silence [BB-VINE] logs
++local DEBUG_VINES = false -- set to false to silence [BB-VINE] logs
+ 
+ local function getVineModel(sensor)
+ 	-- Walk up the sensor's parents to find the node with IsVine attribute.

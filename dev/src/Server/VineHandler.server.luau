@@ -16,6 +16,7 @@ local RunService = game:GetService("RunService")
 
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
 local VinePlacement = require(ReplicatedStorage:WaitForChild("VinePlacement", 10))
+local VineHalfReconciler = require(ReplicatedStorage:WaitForChild("VineHalfReconciler", 10))
 local BlockSpatialIndex = require(ReplicatedStorage:WaitForChild("BlockSpatialIndex", 10))
 local BulkOperationFlags = nil
 pcall(function()
@@ -42,13 +43,14 @@ local CONFIG = {
 	MAX_VINE_LENGTH = 24,
 }
 
--- Debug flag
-local DEBUG_VINES = false
-
 -- Track active plots for vine spreading
 local ActivePlots = {}
 local IsRunning = false
 local LastTickTime = 0
+
+-- Plots whose vines have had their one-time half/full reconcile pass (convert-on-load).
+-- Weak keys so a removed plot's Blocks folder can be collected.
+local ReconciledPlots = setmetatable({}, { __mode = "k" })
 
 -- Forward declaration for ceiling vine update (defined after createVine)
 local updateCeilingVine
@@ -210,15 +212,14 @@ local function createVine(position, face, blocksFolder, placedBy)
 	climbSensor.Parent = vine
 	
 	vine.Parent = blocksFolder
-	
+
+	-- If the host face is only filled in its bottom half (bottom slab / open stair
+	-- front), swap this freshly-spread vine for the half-height variant.
+	vine = VineHalfReconciler.Reconcile(vine, blocksFolder) or vine
+
 	-- Add ceiling piece if solid block above
 	updateCeilingVine(vine, position, blocksFolder)
-	
-	if DEBUG_VINES then
-		print(string.format("[VineHandler] Created vine at (%.1f, %.1f, %.1f) face=%s",
-			position.X, position.Y, position.Z, face))
-	end
-	
+
 	return vine
 end
 
@@ -260,17 +261,8 @@ updateCeilingVine = function(vineBlock, gridPosition, blocksFolder)
 		end
 		
 		ceiling.Parent = vineBlock
-		
-		if DEBUG_VINES then
-			print(string.format("[VineHandler] Added ceiling vine at (%.1f, %.1f, %.1f)",
-				gridPosition.X, gridPosition.Y, gridPosition.Z))
-		end
 	elseif not shouldHave and existingCeiling then
 		existingCeiling:Destroy()
-		if DEBUG_VINES then
-			print(string.format("[VineHandler] Removed ceiling vine at (%.1f, %.1f, %.1f)",
-				gridPosition.X, gridPosition.Y, gridPosition.Z))
-		end
 	end
 end
 
@@ -293,12 +285,37 @@ end
 -- SPREAD TICK
 -- ============================================
 
+-- One-time pass over every vine in a plot, swapping full<->half to match its host's
+-- shape. Handles existing saves (vines stored as "Vine" on bottom-half hosts become
+-- VineHalf when the plot first ticks after loading).
+local function reconcilePlotVines(blocksFolder)
+	if not blocksFolder then return end
+	local vines = {}
+	for _, block in ipairs(blocksFolder:GetChildren()) do
+		if block:GetAttribute("IsVine") and not block:GetAttribute("IsVineTrimmed") then
+			table.insert(vines, block)
+		end
+	end
+	for _, vine in ipairs(vines) do
+		if vine.Parent then
+			VineHalfReconciler.Reconcile(vine, blocksFolder)
+		end
+	end
+end
+
 local function processPlotVines(blocksFolder)
 	if not blocksFolder then return end
-	
+
 	local index = BlockSpatialIndex.GetOrCreate(blocksFolder)
 	if not index then return end
-	
+
+	-- Convert-on-load: first time we tick this plot (after its blocks have loaded),
+	-- reconcile every vine to the correct full/half variant for its host.
+	if not ReconciledPlots[blocksFolder] then
+		ReconciledPlots[blocksFolder] = true
+		reconcilePlotVines(blocksFolder)
+	end
+
 	-- Collect all vines
 	local vines = {}
 	for _, block in ipairs(blocksFolder:GetChildren()) do
@@ -356,10 +373,6 @@ local function processPlotVines(blocksFolder)
 				if newVine then
 					spreadCount = spreadCount + 1
 					spread = true
-					if DEBUG_VINES then
-						print(string.format("[VineHandler] Vine spread DOWN from (%.1f,%.1f,%.1f) to (%.1f,%.1f,%.1f)",
-							vinePos.X, vinePos.Y, vinePos.Z, belowPos.X, belowPos.Y, belowPos.Z))
-					end
 				end
 			end
 		end
@@ -371,17 +384,9 @@ local function processPlotVines(blocksFolder)
 				if newVine then
 					spreadCount = spreadCount + 1
 					spread = true
-					if DEBUG_VINES then
-						print(string.format("[VineHandler] Vine spread UP from (%.1f,%.1f,%.1f) to (%.1f,%.1f,%.1f)",
-							vinePos.X, vinePos.Y, vinePos.Z, abovePos.X, abovePos.Y, abovePos.Z))
-					end
 				end
 			end
 		end
-	end
-	
-	if spreadCount > 0 and DEBUG_VINES then
-		print(string.format("[VineHandler] Spread %d vines this tick", spreadCount))
 	end
 	
 	-- Update ceiling vines (handles loaded saves, block changes above vines)
@@ -428,6 +433,7 @@ end
 -- ============================================
 
 RunService.Heartbeat:Connect(function()
+	if BulkOperationFlags and BulkOperationFlags.IsShuttingDown() then return end
 	if not IsRunning then return end
 	
 	local now = tick()

@@ -314,6 +314,7 @@ local function MonitorBuildArea(buildArea: Instance)
 	
 	-- Monitor for new pressure plates
 	blocksFolder.ChildAdded:Connect(function(block)
+		if BulkOperationFlags.IsShuttingDown() then return end
 		-- Skip during bulk operations (terrain gen, save loading)
 		if BulkOperationFlags.IsBulkOperation(buildArea) then return end
 		if blocksFolder:GetAttribute("BulkOperationInProgress") then return end
@@ -327,6 +328,7 @@ local function MonitorBuildArea(buildArea: Instance)
 	
 	-- Clean up removed pressure plates
 	blocksFolder.ChildRemoved:Connect(function(block)
+		if BulkOperationFlags.IsShuttingDown() then return end
 		-- Skip during bulk operations (terrain gen, save loading)
 		if BulkOperationFlags.IsBulkOperation(buildArea) then return end
 		if blocksFolder:GetAttribute("BulkOperationInProgress") then return end

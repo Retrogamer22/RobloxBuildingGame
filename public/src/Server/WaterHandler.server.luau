@@ -609,6 +609,7 @@ local function watchBuildArea(buildArea)
 	
 	-- When a non-water block is added or removed, check if water flow needs updating
 	blocksFolder.ChildAdded:Connect(function(block)
+		if BulkOperationFlags.IsShuttingDown() then return end
 		-- Skip during bulk operations
 		if BulkOperationFlags.IsBulkOperation(buildArea) then return end
 		
@@ -640,6 +641,7 @@ local function watchBuildArea(buildArea)
 	end)
 	
 	blocksFolder.ChildRemoved:Connect(function(block)
+		if BulkOperationFlags.IsShuttingDown() then return end
 		-- Skip during bulk operations
 		if BulkOperationFlags.IsBulkOperation(buildArea) then return end
 		

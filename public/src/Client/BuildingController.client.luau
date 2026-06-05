@@ -15,6 +15,12 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("GridConfig", 10))
+-- Free-build (second) place gate. On that place there are no bounded plots --
+-- the player builds anywhere in the continuous chunk world -- so the ghost
+-- preview and client permission checks skip the footprint test and anchor the
+-- build grid to the player's own center plate. Mirrors the server gate in
+-- BlockHandler (canPlayerBuildAtPosition). Single source of truth: BetaConfig.
+local BetaConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("BetaConfig", 10))
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local LogPlacement = require(ReplicatedStorage:WaitForChild("LogPlacement", 10))
 local SlabPlacement = require(ReplicatedStorage:WaitForChild("SlabPlacement", 10))
@@ -51,6 +57,9 @@ local PickupWater = Remotes:WaitForChild("PickupWater", 5)
 
 -- Frame block remotes
 local FillFrameBlock = Remotes:WaitForChild("FillFrameBlock", 5)
+local PaintBlock = Remotes:WaitForChild("PaintBlock", 5) -- Paint Mod
+local SpongeBlock = Remotes:WaitForChild("SpongeBlock", 5) -- Paint Mod (sponge)
+local SwatchBlock = Remotes:WaitForChild("SwatchBlock", 5) -- Paint Mod (swatch color capture)
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -58,7 +67,12 @@ local Camera = workspace.CurrentCamera
 
 local BLOCK_SIZE = GridConfig.BLOCK_SIZE
 local REACH_DISTANCE = 50
-local BREAK_TIME = 0.3
+local BREAK_TIME = 0.1 -- crack/break duration: short so breaking feels near-instant and only flashes a few crack stages (raise this for survival-style slower mining)
+-- Creative-style breaking: each block breaks instantly, then a short cooldown
+-- gates the next break while the button is held (Minecraft creative uses 5 ticks,
+-- about 0.25s, so you don't accidentally chew through blocks). Tunable.
+local CREATIVE_BREAK_COOLDOWN = 0.25
+local BreakCooldownTimer = 0
 local PLACE_RATE = 0.15 -- Time between continuous placements when holding
 
 -- Ghost preview settings
@@ -296,6 +310,14 @@ end
 
 -- Get basePlate data for ANY plot at a given position (for shared building)
 local function getBasePlateAtPosition(position)
+	-- FREE-BUILD PLACE: one continuous world anchored on the player's center
+	-- plate. Every chunk shares that plate's grid origin, so we always snap off
+	-- it regardless of where `position` is -- no footprint lookup, no per-chunk
+	-- plate. (Server mirrors this in canPlayerBuildAtPosition.)
+	if BetaConfig.IsFreeBuildPlace() then
+		return getBasePlate()
+	end
+
 	-- In MegaPlot mode, always use MegaPlotBuildArea for grid alignment
 	if _G.PlotClient and _G.PlotClient.IsMegaPlotMode and _G.PlotClient.IsMegaPlotMode() then
 		local megaPlotRoom = workspace:FindFirstChild("MegaPlotRoom")
@@ -414,7 +436,7 @@ local function isWiringToolSelected()
 		local selected = _G.InventoryController.GetSelectedBlock()
 		if not selected then return false end
 		-- Water buckets are tools but need full input (not wiring tools)
-		if selected.IsWaterBucket or selected.IsEmptyBucket then return false end
+		if selected.IsWaterBucket or selected.IsEmptyBucket or selected.IsPaintbrush or selected.Id == "PaintBrush" or selected.IsSponge or selected.Id == "Sponge" or selected.IsSwatch or selected.Id == "PaintSwatch" then return false end
 		return selected.IsWiringTool or selected.IsTool
 	end
 	return false
@@ -459,7 +481,14 @@ end
 -- Check if the local player can interact (break/place) at a world position
 local function canInteractAtPosition(position)
 	if not position then return false end
-	
+
+	-- FREE-BUILD PLACE: no bounded plots -- the player may build/break anywhere
+	-- in the chunk world. Allow as long as we have our own plot assigned (the
+	-- center chunk). Server still authoritatively re-checks in BlockHandler.
+	if BetaConfig.IsFreeBuildPlace() then
+		return getBasePlate() ~= nil
+	end
+
 	-- Private server: everyone can build on all plots
 	local isPrivate = false
 	pcall(function() isPrivate = game.PrivateServerId ~= "" end)
@@ -1039,11 +1068,44 @@ end
 -- BREAKING SYSTEM
 -- ============================================
 
+-- ============================================
+-- BLOCK-BREAK CRACK OVERLAY (Minecraft destroy stages)
+-- ============================================
+-- Frames 0->9 play over the break duration on all six sides of the target. An
+-- invisible "wrapper" cube sized to the block's bounding box carries six Texture
+-- objects (one per face), so it works for plain part blocks AND multi-part models
+-- (grass blocks, chests, etc.) -- the crack sits on the outside of the whole
+-- thing. Textures tile at BLOCK_SIZE so the crack keeps the right scale on big
+-- models instead of stretching one image across the face.
+local CRACK_FRAMES = {
+	"rbxassetid://107738750300099",
+	"rbxassetid://118668832805089",
+	"rbxassetid://95687397890983",
+	"rbxassetid://91449639798909",
+	"rbxassetid://83977270074687",
+	"rbxassetid://139403604344255",
+	"rbxassetid://71625339065497",
+	"rbxassetid://113324576672842",
+	"rbxassetid://71448850706605",
+	"rbxassetid://83842727577705",
+}
+local CRACK_FACES = { Enum.NormalId.Front, Enum.NormalId.Back, Enum.NormalId.Left, Enum.NormalId.Right, Enum.NormalId.Top, Enum.NormalId.Bottom }
+
+local crackOverlayFolder = nil
+local function getCrackOverlayFolder()
+	if crackOverlayFolder and crackOverlayFolder.Parent then return crackOverlayFolder end
+	crackOverlayFolder = Instance.new("Folder")
+	crackOverlayFolder.Name = "BlockBreakCrackOverlay"
+	crackOverlayFolder.Parent = workspace.Terrain
+	return crackOverlayFolder
+end
+
+-- { part = wrapperPart, textures = {Texture...}, frame = 1 }
 local CrackOverlays = {}
 
 local function clearCrackOverlays()
-	for _, overlay in pairs(CrackOverlays) do
-		if overlay and overlay.Parent then overlay:Destroy() end
+	if CrackOverlays.part and CrackOverlays.part.Parent then
+		CrackOverlays.part:Destroy()
 	end
 	CrackOverlays = {}
 end
@@ -1051,34 +1113,71 @@ end
 local function createCrackOverlaysForBlock(block)
 	clearCrackOverlays()
 	if not block or not block.Parent then return end
-	
-	local targetPart = block
-	if block:IsA("Model") then
-		targetPart = block.PrimaryPart or block:FindFirstChildWhichIsA("BasePart")
+
+	local cf, size = getBlockBoundingBox(block)
+	if not cf or not size then return end
+
+	-- Crack tint = the block's own colour, much darker, so each crack reads as a
+	-- dark shade of that block instead of a generic grey overlay.
+	local baseColor = Color3.fromRGB(160, 160, 160)
+	if block:IsA("BasePart") then
+		baseColor = block.Color
+	else
+		local best, bestVol
+		for _, d in ipairs(block:GetDescendants()) do
+			if d:IsA("BasePart") then
+				local v = d.Size.X * d.Size.Y * d.Size.Z
+				if not bestVol or v > bestVol then bestVol, best = v, d end
+			end
+		end
+		if best then baseColor = best.Color end
 	end
-	if not targetPart then return end
-	
-	local faces = {Enum.NormalId.Front, Enum.NormalId.Back, Enum.NormalId.Left, Enum.NormalId.Right, Enum.NormalId.Top, Enum.NormalId.Bottom}
-	
-	for _, face in ipairs(faces) do
-		local surfaceGui = Instance.new("SurfaceGui")
-		surfaceGui.Name = "CrackOverlay_" .. face.Name
-		surfaceGui.Face = face
-		surfaceGui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-		surfaceGui.PixelsPerStud = 32
-		surfaceGui.LightInfluence = 0
-		surfaceGui.Adornee = targetPart
-		surfaceGui.Parent = PlayerGui
-		
-		local overlay = Instance.new("Frame")
-		overlay.Name = "Overlay"
-		overlay.Size = UDim2.new(1, 0, 1, 0)
-		overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-		overlay.BackgroundTransparency = 1
-		overlay.BorderSizePixel = 0
-		overlay.Parent = surfaceGui
-		
-		CrackOverlays[face.Name] = surfaceGui
+	local CRACK_DARKEN = 0.35 -- how much darker than the block the crack is (lower = darker)
+	local crackColor = Color3.new(baseColor.R * CRACK_DARKEN, baseColor.G * CRACK_DARKEN, baseColor.B * CRACK_DARKEN)
+
+	-- Invisible wrapper sized to the block; the Texture objects on its six faces
+	-- are what render the crack. CanQuery=false so it never blocks the break ray.
+	local wrapper = Instance.new("Part")
+	wrapper.Name = "CrackWrapper"
+	wrapper.Anchored = true
+	wrapper.CanCollide = false
+	wrapper.CanQuery = false
+	wrapper.CanTouch = false
+	wrapper.CastShadow = false
+	wrapper.Transparency = 1
+	wrapper.Size = size + Vector3.new(0.02, 0.02, 0.02) -- hug the surface; tiny offset avoids z-fighting
+	wrapper.CFrame = cf
+	wrapper.Parent = getCrackOverlayFolder()
+
+	local textures = {}
+	for _, face in ipairs(CRACK_FACES) do
+		local tex = Instance.new("Texture")
+		tex.Face = face
+		tex.Texture = CRACK_FRAMES[1]
+		-- Tile at the block grid size so the crack keeps a consistent scale on
+		-- large models rather than stretching one image across the whole face.
+		tex.StudsPerTileU = BLOCK_SIZE
+		tex.StudsPerTileV = BLOCK_SIZE
+		-- Tint each crack to a much darker shade of the block's own colour so it
+		-- blends as cracks in that block instead of a generic grey overlay.
+		tex.Color3 = crackColor
+		tex.Transparency = 0.2
+		tex.Parent = wrapper
+		table.insert(textures, tex)
+	end
+
+	CrackOverlays = { part = wrapper, textures = textures, frame = 1 }
+end
+
+-- Advance the crack texture to match break progress (0..1).
+local function updateCrackOverlayFrame(progress)
+	if not CrackOverlays.textures then return end
+	local idx = math.clamp(math.floor(progress * #CRACK_FRAMES) + 1, 1, #CRACK_FRAMES)
+	if idx == CrackOverlays.frame then return end
+	CrackOverlays.frame = idx
+	local asset = CRACK_FRAMES[idx]
+	for _, tex in ipairs(CrackOverlays.textures) do
+		tex.Texture = asset
 	end
 end
 
@@ -1092,6 +1191,9 @@ local function startBreaking(target)
 	local targetPos = getBlockWorldPosition(target)
 	if not canInteractAtPosition(targetPos) then return end
 	
+	-- Creative-style: a quick crack animation plays over BREAK_TIME, then the block
+	-- pops. Once started the break commits (it finishes even if the button is
+	-- released), so a single click reliably breaks one block; holding chains them.
 	BreakingState.isBreaking = true
 	BreakingState.target = target
 	BreakingState.progress = 0
@@ -1103,6 +1205,7 @@ local function stopBreaking()
 	BreakingState.isBreaking = false
 	BreakingState.target = nil
 	BreakingState.progress = 0
+	BreakCooldownTimer = 0
 	if BreakProgressUI then BreakProgressUI.Visible = false end
 	clearCrackOverlays()
 end
@@ -1157,14 +1260,9 @@ local function updateBreaking(deltaTime)
 	
 	BreakingState.progress = BreakingState.progress + (deltaTime / BreakingState.timeRequired)
 	
-	if BreakProgressUI then BreakProgressUI.Visible = true end
-	if ProgressFill then ProgressFill.Size = UDim2.new(BreakingState.progress, 0, 1, 0) end
-	
-	local targetTransparency = 1 - (BreakingState.progress * 0.7)
-	for _, overlay in pairs(CrackOverlays) do
-		local frame = overlay:FindFirstChild("Overlay")
-		if frame then frame.BackgroundTransparency = targetTransparency end
-	end
+	-- No survival progress bar; the crack texture is the feedback now.
+	if BreakProgressUI then BreakProgressUI.Visible = false end
+	updateCrackOverlayFrame(BreakingState.progress)
 	
 	if BreakingState.progress >= 1 then
 		local targetBlock = BreakingState.target
@@ -1223,6 +1321,7 @@ local function updateBreaking(deltaTime)
 		end
 		
 		stopBreaking()
+		BreakCooldownTimer = CREATIVE_BREAK_COOLDOWN
 		if _G.OnBlockBroken then _G.OnBlockBroken() end
 	end
 end
@@ -1308,11 +1407,60 @@ local function TryFillFrameBlock()
 	return true
 end
 
+-- Paint Mod: when the Paint Brush is selected, right-click loads from a placed
+-- PaintCanModel or paints whatever block is targeted. The server decides load-vs-paint.
+local function TryPaintbrushAction()
+	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
+	print("[BB-PAINT] RMB: selectedId=", blockData and blockData.Id, " isPaintbrush=", blockData and blockData.IsPaintbrush)
+	if not blockData or not (blockData.IsPaintbrush or blockData.Id == "PaintBrush") then return false end
+	local target, _ = getBlockTarget()
+	if not target then print("[BB-PAINT] no target") return false end
+	local targetPos = target:IsA("Model") and target:GetPivot().Position or target.Position
+	if not canInteractAtPosition(targetPos) then print("[BB-PAINT] canInteract=false") return false end
+	print("[BB-PAINT] firing PaintBlock, remoteExists=", PaintBlock ~= nil)
+	if PaintBlock then
+		PaintBlock:FireServer(target)
+	end
+	return true
+end
+
+-- Paint Mod: the sponge steps a painted block backwards (flat -> painted -> default).
+-- The server decides which step based on the block's current paint state.
+local function TrySpongeAction()
+	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
+	if not blockData or not (blockData.IsSponge or blockData.Id == "Sponge") then return false end
+	local target, _ = getBlockTarget()
+	if not target then return false end
+	local targetPos = target:IsA("Model") and target:GetPivot().Position or target.Position
+	if not canInteractAtPosition(targetPos) then return false end
+	if SpongeBlock then
+		SpongeBlock:FireServer(target)
+	end
+	return true
+end
+
+-- Paint Mod: the swatch captures a block's visible color. Right-click any block to read its
+-- color (texture color if primer-covered, else part color) onto the held swatch -- the server
+-- tints the swatch's six face-textures and stamps the captured color on the player so the mixer
+-- can pre-fill its sliders. The swatch is never consumed.
+local function TrySwatchAction()
+	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
+	if not blockData or not (blockData.IsSwatch or blockData.Id == "PaintSwatch") then return false end
+	local target, _ = getBlockTarget()
+	if not target then return false end
+	local targetPos = target:IsA("Model") and target:GetPivot().Position or target.Position
+	if not canInteractAtPosition(targetPos) then return false end
+	if SwatchBlock then
+		SwatchBlock:FireServer(target)
+	end
+	return true
+end
+
 local function placeBlock()
 	if isInventoryOpen() then return end
 	
 	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
-	if not blockData or blockData.IsTool then return end
+	if not blockData or blockData.IsTool or blockData.IsPaintbrush or blockData.Id == "PaintBrush" or blockData.IsSponge or blockData.Id == "Sponge" or blockData.IsSwatch or blockData.Id == "PaintSwatch" then return end
 	
 	-- SnowLayer stacking: right-clicking an existing SnowLayer with SnowLayer in hand
 	-- adds a layer instead of placing a new block (up to 8 layers = full block)
@@ -1946,6 +2094,10 @@ end
 -- ============================================
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		local _sb = _G.InventoryController and _G.InventoryController.GetSelectedBlock and _G.InventoryController.GetSelectedBlock()
+		print("[BB-PAINT] RMB down | sel=", _sb and _sb.Id, " IsTool=", _sb and _sb.IsTool, " IsPaintbrush=", _sb and _sb.IsPaintbrush, " wiring=", isWiringToolSelected())
+	end
 	if gameProcessed or isInventoryOpen() or isWiringToolSelected() or isBlockUIOpen() then return end
 	
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -1958,6 +2110,10 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		RightMouseDown = true
 		RightMouseHoldStart = tick()
 		PlaceCooldown = PLACE_RATE
+		-- Paint Mod: brush paints/loads with priority over block interactions
+		if TryPaintbrushAction() then return end
+		if TrySpongeAction() then return end
+		if TrySwatchAction() then return end
 		-- Shift-place: holding shift bypasses the entire block-interaction priority chain
 		-- (doors, chests, crafting tables, furnaces, buttons, signs, fence toggles, etc.)
 		-- AND skips frame-block filling, so you can place a block adjacent to an empty
@@ -1986,7 +2142,8 @@ end)
 UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
 		MouseDown = false
-		stopBreaking()
+		-- Don't cancel an in-progress break on release; let it finish so a quick
+		-- single click still breaks the block (the crack commits once started).
 	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
 		RightMouseDown = false
 	end
@@ -2022,8 +2179,15 @@ UserInputService.TouchEnded:Connect(function(input)
 	
 	if not TouchState.movedTooMuch and touchDuration < TAP_MAX_TIME and not TouchState.isHeld then
 		if not isWiringToolSelected() then
-			-- Priority 1: Player-placed sign editing (highest priority for tap)
-			if _G.SignEditController and _G.SignEditController.TryEditSign() then
+			-- Paint Mod: brush paints/loads with priority over block interactions
+			if TryPaintbrushAction() then
+			-- brush painted or loaded
+			elseif TrySpongeAction() then
+			 -- sponge stepped the block back
+			elseif TrySwatchAction() then
+			 -- swatch captured the block's color
+				-- Priority 1: Player-placed sign editing (highest priority for tap)
+				elseif _G.SignEditController and _G.SignEditController.TryEditSign() then
 				-- Editing player-placed sign
 			-- Priority 2: Plot signs (biome/save/load)
 			elseif TrySignInteraction() then
@@ -2200,10 +2364,15 @@ RunService.RenderStepped:Connect(function(deltaTime)
 		end
 	end
 	
-	-- Update breaking
-	if MouseDown and BreakingState.isBreaking then
+	-- Update breaking (creative-style: a quick crack flash, then the block pops).
+	-- A break commits once started (finishes even if released), and a short cooldown
+	-- gates the NEXT break while holding so you don't chew through blocks too fast.
+	if BreakCooldownTimer > 0 then
+		BreakCooldownTimer = BreakCooldownTimer - deltaTime
+	end
+	if BreakingState.isBreaking then
 		updateBreaking(deltaTime)
-	elseif MouseDown and not BreakingState.isBreaking then
+	elseif MouseDown and BreakCooldownTimer <= 0 then
 		local t, _ = getBlockTarget()
 		if t then startBreaking(t) end
 	end

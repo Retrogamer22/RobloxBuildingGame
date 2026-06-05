@@ -23,6 +23,7 @@ local GroupService = game:GetService("GroupService")
 local Modules = ServerScriptService:WaitForChild("Modules", 10)
 local CoinManager = require(Modules:WaitForChild("CoinManager", 10))
 local CoinConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("CoinConfig"))
+local AnalyticsEvents = require(Modules:WaitForChild("AnalyticsEvents", 10))
 
 -- ============================================
 -- CREATE REMOTES
@@ -36,6 +37,33 @@ GetCoinData.Parent = Remotes
 local CoinBalanceUpdate = Instance.new("RemoteEvent")
 CoinBalanceUpdate.Name = "CoinBalanceUpdate"
 CoinBalanceUpdate.Parent = Remotes
+
+-- Client fires this whenever the shop UI is opened (any source). Server logs a
+-- `shop_open` analytics event, throttled per player so a looping client can't
+-- inflate the funnel's top number. Mirrors PlusService's PlusUIOpened pattern.
+local ShopOpened = Instance.new("RemoteEvent")
+ShopOpened.Name = "ShopOpened"
+ShopOpened.Parent = Remotes
+
+local ShopOpenThrottle = {}
+local SHOP_OPEN_MIN_GAP = 2
+
+ShopOpened.OnServerEvent:Connect(function(player)
+	if not player or not player.Parent then return end
+	local now = os.clock()
+	local last = ShopOpenThrottle[player.UserId]
+	if last and (now - last) < SHOP_OPEN_MIN_GAP then return end
+	ShopOpenThrottle[player.UserId] = now
+
+	AnalyticsEvents.Post("shop_open", {
+		userId = player.UserId,
+		username = player.Name,
+	})
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	ShopOpenThrottle[player.UserId] = nil
+end)
 
 local ClaimDailyReward = Instance.new("RemoteEvent")
 ClaimDailyReward.Name = "ClaimDailyReward"
@@ -64,6 +92,17 @@ ClaimCommunityReward.Parent = Remotes
 local CommunityRewardResult = Instance.new("RemoteEvent")
 CommunityRewardResult.Name = "CommunityRewardResult"
 CommunityRewardResult.Parent = Remotes
+
+-- Mod shop: client invokes BuyMod(modId) to purchase a mod with coins. Server
+-- validates + charges + grants, then returns a result table. GetOwnedMods lets
+-- the shop UI ask which mods the player already owns.
+local BuyMod = Instance.new("RemoteFunction")
+BuyMod.Name = "BuyMod"
+BuyMod.Parent = Remotes
+
+local GetOwnedMods = Instance.new("RemoteFunction")
+GetOwnedMods.Name = "GetOwnedMods"
+GetOwnedMods.Parent = Remotes
 
 -- Track vote coins earned this session (for cap)
 local VoteCoinsThisSession = {} -- userId -> coins earned from votes this session
@@ -131,6 +170,40 @@ GetCoinData.OnServerInvoke = function(player)
 		totalSpent = data.totalSpent,
 		dailyStatus = CoinManager.GetDailyRewardStatus(player.UserId),
 		achievements = CoinManager.GetAllAchievements(player.UserId),
+		ownedMods = CoinManager.GetOwnedMods(player.UserId),
+	}
+end
+
+-- Client requests which mods it owns (shop UI open / refresh).
+GetOwnedMods.OnServerInvoke = function(player)
+	return CoinManager.GetOwnedMods(player.UserId)
+end
+
+-- Client buys a mod with coins. Returns { ok, message, balance, owned }.
+BuyMod.OnServerInvoke = function(player, modId)
+	if type(modId) ~= "string" then
+		return { ok = false, message = "Bad request", balance = CoinManager.GetCoins(player.UserId), owned = CoinManager.GetOwnedMods(player.UserId) }
+	end
+
+	local ok, message = CoinManager.PurchaseMod(player.UserId, modId)
+	if ok then
+		-- Push updated balance so every coin display refreshes
+		CoinBalanceUpdate:FireClient(player, CoinManager.GetCoins(player.UserId))
+		-- Analytics: coin sink already logged by SpendCoins; add a mod-specific event
+		pcall(function()
+			AnalyticsEvents.Post("mod_purchase", {
+				userId = player.UserId,
+				username = player.Name,
+				modId = modId,
+			})
+		end)
+	end
+
+	return {
+		ok = ok,
+		message = message,
+		balance = CoinManager.GetCoins(player.UserId),
+		owned = CoinManager.GetOwnedMods(player.UserId),
 	}
 end
 
@@ -143,6 +216,20 @@ ClaimDailyReward.OnServerEvent:Connect(function(player)
 		-- Also push updated balance
 		CoinBalanceUpdate:FireClient(player, CoinManager.GetCoins(player.UserId))
 	end
+end)
+
+-- Daily-reward claim analytics. One `daily_claim` event per successful claim,
+-- with streak + whether it was a coin roll or a reward-set drop (and which set).
+CoinManager.OnDailyClaim(function(userId, streak, coinsAwarded, rewardSetInfo)
+	local player = Players:GetPlayerByUserId(userId)
+	AnalyticsEvents.Post("daily_claim", {
+		userId = userId,
+		username = (player and player.Name) or ("User" .. tostring(userId)),
+		streak = streak,
+		rewardType = rewardSetInfo and "block_set" or "coins",
+		setName = rewardSetInfo and rewardSetInfo.setName or nil,
+		coinAmount = coinsAwarded or 0,
+	})
 end)
 
 -- Client claims achievement reward
@@ -346,8 +433,9 @@ end)
 -- are skipped (those are the "Soon!" entries that haven't been wired to a
 -- real Developer Product yet).
 -- ============================================
-local function grantCoinPack(receiptInfo, packCoins)
+local function grantCoinPack(receiptInfo, pack)
 	local userId = receiptInfo.PlayerId
+	local packCoins = pack.coins
 
 	-- Make sure the player's coin data is loaded. PlayerAdded above kicks off
 	-- a LoadPlayerData task, but a receipt that arrives on first-join can race

@@ -13,6 +13,7 @@ local Lighting = game:GetService("Lighting")
 
 local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
 local UITheme = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("UITheme"))
+local BetaConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BetaConfig"))
 local BlockTemplates = ReplicatedStorage:WaitForChild("BlockTemplates", 10)
 local BlocksFolder = ReplicatedStorage:WaitForChild("Blocks", 10)
 local DecorationsFolder = ReplicatedStorage:WaitForChild("Decorations", 10)
@@ -216,6 +217,10 @@ local SurvivalLoaded = false
 local SurvivalRemotes = {} -- Populated in task.spawn at bottom
 local SurvivalDataCallbacks = {} -- External callbacks when survival data loads/updates
 
+-- Hotbar persistence (saves the on-screen quick-slot row across sessions/games)
+local HotbarRemotes = {} -- Populated in task.spawn at bottom
+local HotbarPersistEnabled = false -- Suppress saves during initial UI build + load apply
+
 -- ============================================
 -- "NEW" BLOCK BADGE SYSTEM
 -- Tracks which blocks are new (unseen) this session
@@ -232,6 +237,58 @@ local MarkTabSeenRemote = nil -- RemoteEvent populated on init
 local DEBUG_NEW_BLOCKS = false
 
 -- Map new block IDs to their categories/tabs so we know which tabs need "!" badges
+
+-- Single source of truth: is this preset actually visible in the inventory grid
+-- for THIS player right now? Mirrors the grid's own gating (HideFromInventory,
+-- IsRainbow unlock, IsRewardBlock unlock) so the "!" badge system and the
+-- mark-as-seen RPC never disagree with what the player can actually see.
+--
+-- Owner bypass uses BetaConfig.OWNER_USER_ID (NOT game.CreatorId) ΓÇö this is a
+-- group-owned game, so game.CreatorId returns the group id, not the user id.
+local function getOwnerUserId()
+	if BetaConfig.OWNER_USER_ID and BetaConfig.OWNER_USER_ID ~= 0 then
+		return BetaConfig.OWNER_USER_ID
+	end
+	return game.CreatorId
+end
+
+local function isPresetVisible(preset)
+	if preset.HideFromInventory then return false end
+	local isOwner = (LocalPlayer.UserId == getOwnerUserId())
+	-- Owner preview mode: pretend we're a fresh player so we can see what
+	-- the inventory looks like before unlocks. Toggled via the /preview chat
+	-- command (server-side BetaAdminCommands handler).
+	local previewingAsFresh = isOwner and (LocalPlayer:GetAttribute("PreviewAsFresh") == true)
+	local effectivelyOwner = isOwner and not previewingAsFresh
+	if preset.IsRainbow and not effectivelyOwner then
+		if not LocalPlayer:GetAttribute("RainbowBlocksUnlocked") then return false end
+	end
+	if preset.IsRewardBlock and not effectivelyOwner then
+		-- Variants of the same base block (CandyCaneLog_Red, CandyCaneLog_Blue, ...)
+		-- share an unlock under the BaseBlock name. Unlocking CandyCaneLog reveals
+		-- ALL 17 colored variants. Non-variant rewards check by their own Id.
+		local unlockKey = "Unlocked_" .. (preset.BaseBlock or preset.Id)
+		if not LocalPlayer:GetAttribute(unlockKey) then return false end
+	end
+	return true
+end
+
+-- Should a themed-pack tab (e.g. "Candy") be visible to this player right now?
+-- Visible if the player has unlocked at least one block from any set that maps
+-- to this tab ΓÇö OR if they're the owner (and not in /preview mode).
+local function isTabVisible(tabName)
+	local isOwner = (LocalPlayer.UserId == getOwnerUserId())
+	local previewingAsFresh = isOwner and (LocalPlayer:GetAttribute("PreviewAsFresh") == true)
+	if isOwner and not previewingAsFresh then return true end
+	-- Non-owner (or owner-in-preview): visible only if at least one block in the
+	-- tab is unlocked. Reuses isPresetVisible so the logic stays in one place.
+	local presets = BlockPresets.GetPresetsByCategory(tabName)
+	for _, preset in ipairs(presets) do
+		if isPresetVisible(preset) then return true end
+	end
+	return false
+end
+
 local function computeNewCategoriesFromIds()
 	NewCategories = {}
 	NewRightTabs = {}
@@ -241,7 +298,7 @@ local function computeNewCategoriesFromIds()
 	-- Check each new block ID against all presets to find its category
 	local allPresets = BlockPresets.GetAllPresets()
 	for _, preset in ipairs(allPresets) do
-		if NewBlockIds[preset.Id] and not preset.HideFromInventory then
+		if NewBlockIds[preset.Id] and isPresetVisible(preset) then
 			local cat = preset.Category
 			if cat then
 				-- Frames is a right tab, not a left category
@@ -324,10 +381,12 @@ local function markTabBlocksSeen(categoryOrTabName)
 	local presets = BlockPresets.GetPresetsByCategory(categoryOrTabName)
 	if not presets or #presets == 0 then return end
 	
-	-- Only send IDs that are actually new (minimize network payload)
+	-- Only send IDs that are actually new AND visible to this player.
+	-- Locked reward/rainbow blocks stay "new" until they actually appear in
+	-- the grid for the first time, so the NEW badge fires when it should.
 	local idsToMark = {}
 	for _, preset in ipairs(presets) do
-		if NewBlockIds[preset.Id] then
+		if NewBlockIds[preset.Id] and isPresetVisible(preset) then
 			table.insert(idsToMark, preset.Id)
 		end
 	end
@@ -374,7 +433,7 @@ local function findTemplate(templateName)
 	return BlockTemplates:FindFirstChild(templateName)
 end
 
-local function setupViewportModel(viewport, templateName, color, material, materialVariant, useBlockModel, blockModelName, isDecoration, decorationName, blockModelFolder, applyColor, leatherTint, isRainbow)
+local function setupViewportModel(viewport, templateName, color, material, materialVariant, useBlockModel, blockModelName, isDecoration, decorationName, blockModelFolder, applyColor, leatherTint, isRainbow, stripeColorMode)
 	local worldModel = viewport:FindFirstChild("World")
 	if not worldModel then return nil end
 	
@@ -385,6 +444,13 @@ local function setupViewportModel(viewport, templateName, color, material, mater
 	local model
 	local isBlockModel = false
 	local shouldApplyColor = applyColor -- Whether to apply the preset color
+	-- Texture mode: skip Part/Model coloring; we'll tint Texture descendants below
+	-- instead, so the underlying Part stays its template color and the grayscale
+	-- texture pattern takes the variant color via Texture.Color3.
+	local isTextureMode = stripeColorMode == "Texture"
+	if isTextureMode then
+		shouldApplyColor = false  -- prevent the Part-tinting branches from running
+	end
 	
 	-- Use decoration from Decorations folder if specified
 	if isDecoration and decorationName and DecorationsFolder then
@@ -715,6 +781,7 @@ local function setupViewportModel(viewport, templateName, color, material, mater
 	end
 
 	local camera = viewport.CurrentCamera
+	local isCandySapling = blockModelName == "CandyCaneSapling"
 	if camera then
 		-- Check if this is a door (needs camera further back)
 		local isDoorModel = blockModelName and (string.find(blockModelName, "Door") ~= nil)
@@ -723,6 +790,9 @@ local function setupViewportModel(viewport, templateName, color, material, mater
 		if isToolModel then
 			-- Tools: look straight at the flat face (matches hotbar tool rendering)
 			camera.CFrame = CFrame.new(Vector3.new(0, 0, 5), Vector3.new(0, 0, 0))
+		elseif isCandySapling then
+			-- Candy sapling: straight-on (no 45 degrees) so the stripes read cleanly in the slot
+			camera.CFrame = CFrame.new(Vector3.new(0, 0, 6), Vector3.new(0, 0, 0))
 		elseif isDoorModel then
 			camera.CFrame = CFrame.new(Vector3.new(5.5, 5.5, 5.5), Vector3.new(0, 0, 0))
 		elseif isLadderModel then
@@ -731,6 +801,46 @@ local function setupViewportModel(viewport, templateName, color, material, mater
 		else
 			-- Standard camera for blocks
 			camera.CFrame = CFrame.new(Vector3.new(4.5, 3.6, 4.5), Vector3.new(0, 0, 0))
+		end
+	end
+	
+	-- Candy sapling inventory icon: tint Background parts red so it reads as a
+	-- classic red+white candy cane (the live placed sapling tints to its random
+	-- grow-color instead; this is just the inventory/hotbar default appearance).
+	if isCandySapling and model then
+		local red = Color3.fromRGB(240, 30, 50)
+		local function tintBg(inst)
+			if inst:IsA("BasePart") and inst.Name == "Background" then
+				inst.Color = red
+			elseif (inst:IsA("Texture") or inst:IsA("Decal")) and inst.Parent and inst.Parent.Name == "Background" then
+				inst.Color3 = red
+			elseif inst:IsA("SurfaceAppearance") and inst.Parent and inst.Parent.Name == "Background" then
+				inst.Color = red
+			end
+		end
+		if model:IsA("BasePart") then tintBg(model) end
+		for _, desc in ipairs(model:GetDescendants()) do tintBg(desc) end
+	end
+	
+	-- Texture-mode tinting: walk descendants for Textures/Decals (the stripes)
+	-- AND any Part named "Core" (the swirl on a candy-cane log's end caps).
+	-- Other Parts (e.g. "Bark") keep their template color so the background
+	-- between stripes stays white. Done after model creation so children are
+	-- visible to GetDescendants().
+	if isTextureMode and model and applyColor and color then
+		for _, desc in ipairs(model:GetDescendants()) do
+			if desc:IsA("Texture") or desc:IsA("Decal") then
+				desc.Color3 = color
+			elseif desc:IsA("BasePart") and desc.Name == "Core" then
+				desc.Color = color
+			end
+		end
+		if model:IsA("BasePart") then
+			for _, child in ipairs(model:GetChildren()) do
+				if child:IsA("Texture") or child:IsA("Decal") then
+					child.Color3 = color
+				end
+			end
 		end
 	end
 	
@@ -887,7 +997,38 @@ local function selectToolSlot(slotNumber)
 	updateSelection()
 end
 
+-- Push a single hotbar slot's current contents to the server for cross-session
+-- persistence. No-op until HotbarPersistEnabled is set (after the initial load)
+-- and the remote exists, so it won't fire during UI build or while applying a
+-- freshly-loaded hotbar.
+local function persistHotbarSlot(slotNumber)
+	if not HotbarPersistEnabled then return end
+	local remote = HotbarRemotes.UpdateHotbarSlot
+	if not remote then return end
+	local data = Hotbar[slotNumber]
+	local payload
+	if not data then
+		payload = false -- empty slot -> server clears it
+	elseif data.IsTool then
+		payload = { t = data.ToolName }
+	else
+		local c = nil
+		if data.Color then
+			c = {
+				math.floor(data.Color.R * 255 + 0.5),
+				math.floor(data.Color.G * 255 + 0.5),
+				math.floor(data.Color.B * 255 + 0.5),
+			}
+		end
+		payload = { p = data.PresetId, c = c, n = data.Count or 1 }
+	end
+	remote:FireServer(slotNumber, payload)
+end
+
 local function updateHotbarSlotViewport(slotNumber)
+	-- Persist whatever change just landed in this slot (guarded internally).
+	persistHotbarSlot(slotNumber)
+
 	local slot = SlotFrames[slotNumber]
 	if not slot then return end
 	
@@ -957,7 +1098,8 @@ local function updateHotbarSlotViewport(slotNumber)
 				preset.BlockModelFolder,
 				preset.ApplyColor,
 				preset.LeatherTint,
-				preset.IsRainbow
+				preset.IsRainbow,
+				preset.StripeColorMode
 			)
 			end
 		end
@@ -1187,7 +1329,8 @@ local function createHeldItemUI(presetId, count)
 			preset.BlockModelFolder,
 			preset.ApplyColor,
 			preset.LeatherTint,
-			preset.IsRainbow
+			preset.IsRainbow,
+			preset.StripeColorMode
 		)
 	end
 	
@@ -1387,7 +1530,9 @@ local function getSelectedBlock()
 	
 	if not data then return nil end
 	
-	-- Water bucket tools return special data for placement
+	-- Bucket tools return special data so BuildingController's TryBucketAction
+	-- can pick them up. Without this branch the bucket is treated as a generic
+	-- tool and right-clicks fall through to the (no-op) UseTool path.
 	if data.IsTool then
 		if data.ToolName == "WaterBucket" then
 			return {
@@ -1402,6 +1547,13 @@ local function getSelectedBlock()
 				Name = "Empty Bucket",
 				IsTool = true,
 				IsEmptyBucket = true,
+			}
+		elseif data.ToolName == "LavaBucket" then
+			return {
+				Id = "LavaBucket",
+				Name = "Lava Bucket",
+				IsTool = true,
+				IsLavaBucket = true,
 			}
 		end
 		return nil -- Regular tools don't place blocks
@@ -1873,7 +2025,8 @@ local function createPresetButton(preset, parent)
 			preset.BlockModelFolder,
 			preset.ApplyColor,
 			preset.LeatherTint,
-			preset.IsRainbow
+			preset.IsRainbow,
+			preset.StripeColorMode
 		)
 	end
 	
@@ -2130,7 +2283,8 @@ local function updateSurvivalSlotViewport(slotIndex)
 			preset.BlockModelFolder,
 			preset.ApplyColor,
 			preset.LeatherTint,
-			preset.IsRainbow
+			preset.IsRainbow,
+			preset.StripeColorMode
 		)
 	end
 end
@@ -2503,7 +2657,7 @@ local function refreshPresetDisplay()
 	end
 	
 	if SelectedRightTab == "Frames" then
-		-- Show frame block presets from the Frames category
+		-- Frames is a built-in right-tab. Show frame block presets from the Frames category.
 		local framePresets = BlockPresets.GetPresetsByCategory("Frames")
 		for _, preset in ipairs(framePresets) do
 			if not hasSearch or preset.Name:lower():find(searchLower, 1, true) then
@@ -2515,10 +2669,34 @@ local function refreshPresetDisplay()
 		return
 	end
 	
+	-- Themed-pack right-tabs (Candy, future Roman, etc). Same rendering as a normal
+	-- left category -- just routed through the right side. Locked blocks within the
+	-- tab are still filtered by isRewardUnlocked below.
+	if SelectedRightTab then
+		local themedTabs = BlockPresets.GetThemedPackTabs and BlockPresets.GetThemedPackTabs() or {}
+		for _, tab in ipairs(themedTabs) do
+			if tab.Name == SelectedRightTab then
+				local presets = BlockPresets.GetPresetsByCategory(SelectedRightTab)
+				for _, preset in ipairs(presets) do
+					if (not hasSearch or preset.Name:lower():find(searchLower, 1, true)) then
+						local btn = createPresetButton(preset, PresetsContainer)
+						btn.LayoutOrder = layoutOrder
+						layoutOrder = layoutOrder + 1
+					end
+				end
+				return
+			end
+		end
+	end
+	
 	-- Normal block preset display
 	-- Helper: check if a preset should be hidden (rainbow blocks require unlock)
-	local rainbowUnlocked = LocalPlayer:GetAttribute("RainbowBlocksUnlocked") or LocalPlayer.UserId == game.CreatorId
-	local isCreator = LocalPlayer.UserId == game.CreatorId
+	-- Owner check uses getOwnerUserId() (group-owned game). Owner in /preview mode
+	-- is treated as a fresh player so we can test the pre-unlock experience.
+	local isOwnerRaw = (LocalPlayer.UserId == getOwnerUserId())
+	local previewingAsFresh = isOwnerRaw and (LocalPlayer:GetAttribute("PreviewAsFresh") == true)
+	local isCreator = isOwnerRaw and not previewingAsFresh
+	local rainbowUnlocked = LocalPlayer:GetAttribute("RainbowBlocksUnlocked") or isCreator
 	-- Text Mod gate (same pattern as rainbow): the TextBlock stays in the
 	-- Decoration category but is hidden until the player owns the Text Mod
 	-- (TextModUnlocked attribute). Creator always sees it for testing.
@@ -2528,7 +2706,9 @@ local function refreshPresetDisplay()
 	local function isRewardUnlocked(preset)
 		if not preset.IsRewardBlock then return true end
 		if isCreator then return true end
-		return LocalPlayer:GetAttribute("Unlocked_" .. preset.Id) == true
+		-- Variants share an unlock under BaseBlock; non-variants check by their own Id.
+		local unlockKey = "Unlocked_" .. (preset.BaseBlock or preset.Id)
+		return LocalPlayer:GetAttribute(unlockKey) == true
 	end
 	
 	if hasSearch then
@@ -3242,6 +3422,125 @@ local function createInventoryUI()
 		return btn
 	end
 	
+	-- Generic themed-pack tab button (Candy, future Roman, etc). The icon comes
+	-- from the set's TabIcon model in RewardSets/<SetName>/<IconBlockName>.
+	-- Mirrors createFramesTabButton's geometry/styling.
+	local function createThemedPackTabButton(tabInfo, parent)
+		local btnSize = IsMobile and 48 or 86
+		local totalHeight = IsMobile and 48 or 64
+		
+		local btn = Instance.new("TextButton")
+		btn.Name = tabInfo.Name
+		btn.Size = UDim2.new(0, btnSize, 0, totalHeight)
+		btn.BackgroundColor3 = Colors.Surface
+		btn.BorderSizePixel = 0
+		btn.Text = ""
+		btn.AutoButtonColor = false
+		btn.Parent = parent
+		
+		addBevel(btn)
+		
+		local viewportSize = IsMobile and 32 or 56
+		local viewport = createViewportPreview(btn, UDim2.new(0, viewportSize, 0, viewportSize))
+		if IsMobile then
+			viewport.Position = UDim2.new(0.5, -viewportSize/2, 0, 4)
+		else
+			viewport.Position = UDim2.new(1, -(viewportSize + 4), 0.5, -viewportSize/2)
+		end
+		
+		-- Locate the icon model: RewardSets/<SetName>/<TabIcon or first block>
+		local rewardSets = ReplicatedStorage:FindFirstChild("RewardSets")
+		local setFolder = rewardSets and rewardSets:FindFirstChild(tabInfo.SetName)
+		local iconTemplate = nil
+		if setFolder then
+			if tabInfo.IconBlockName then
+				iconTemplate = setFolder:FindFirstChild(tabInfo.IconBlockName)
+			end
+			-- Fallback: first model in the set folder (skip the Manifest ModuleScript)
+			if not iconTemplate then
+				for _, child in ipairs(setFolder:GetChildren()) do
+					if child:IsA("Model") or child:IsA("BasePart") then
+						iconTemplate = child
+						break
+					end
+				end
+			end
+		end
+		
+		if iconTemplate then
+			local worldModel = viewport:FindFirstChild("World")
+			if worldModel then
+				local model = iconTemplate:Clone()
+				if model:IsA("BasePart") then
+					model.Anchored = true
+					model.CFrame = CFrame.new(0, 0, 0)
+				elseif model:IsA("Model") then
+					for _, part in ipairs(model:GetDescendants()) do
+						if part:IsA("BasePart") then
+							part.Anchored = true
+						end
+					end
+					-- Leave the model wherever its pivot puts it; the camera below frames
+					-- to the model's real bounding-box center, so no pre-centering needed.
+				end
+				model.Parent = worldModel
+				
+				local camera = viewport.CurrentCamera
+				if camera then
+					-- Frame the camera to the model's actual size so any icon model
+					-- (CandyBricks now, future Roman columns, etc.) fills the viewport
+					-- uniformly instead of relying on a fixed distance tuned to a 3x3x3
+					-- block. Distance = boundingRadius / sin(FOV/2), times a small pad.
+					local radius = 2.6 -- fallback ~ half-diagonal of a 3-stud cube
+					local center = Vector3.new(0, 0, 0)
+					if model:IsA("Model") then
+						local okb, bbCF, bbSize = pcall(function() return model:GetBoundingBox() end)
+						if okb then
+							radius = bbSize.Magnitude / 2
+							center = bbCF.Position
+						end
+					elseif model:IsA("BasePart") then
+						radius = model.Size.Magnitude / 2
+						center = model.Position
+					end
+					local fov = math.rad(camera.FieldOfView)
+					local dist = (radius / math.sin(fov / 2)) * 1.15 -- 1.15 = breathing room
+					-- Same isometric view direction as before (down a (1, 0.8, 1) diagonal).
+					local dir = Vector3.new(1, 0.8, 1).Unit
+					camera.CFrame = CFrame.new(center + dir * dist, center)
+				end
+			end
+		end
+		
+		btn.MouseButton1Click:Connect(function()
+			showRightTab(tabInfo.Name)
+		end)
+		
+		btn.MouseEnter:Connect(function()
+			if SelectedRightTab ~= tabInfo.Name then
+				TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = Colors.SurfaceHover}):Play()
+			end
+			if CategoryTooltip and not IsMobile then
+				CategoryTooltipText.Text = tabInfo.Name
+				local btnPos = btn.AbsolutePosition
+				local btnSizeAbs = btn.AbsoluteSize
+				CategoryTooltip.Position = UDim2.new(0, btnPos.X - CategoryTooltip.AbsoluteSize.X - 8, 0, btnPos.Y + btnSizeAbs.Y/2 - 12)
+				CategoryTooltip.Visible = true
+			end
+		end)
+		
+		btn.MouseLeave:Connect(function()
+			if SelectedRightTab ~= tabInfo.Name then
+				TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = Colors.Surface}):Play()
+			end
+			if CategoryTooltip and not IsMobile then
+				CategoryTooltip.Visible = false
+			end
+		end)
+		
+		return btn
+	end
+	
 	local framesTabBtn = createFramesTabButton(rightTabsFrame)
 	framesTabBtn.LayoutOrder = 0
 	RightTabButtons["Frames"] = framesTabBtn
@@ -3254,6 +3553,40 @@ local function createInventoryUI()
 	toolsTabBtn.LayoutOrder = 1
 	RightTabButtons["Tools"] = toolsTabBtn
 	
+	-- Themed-pack tabs (Candy, future Roman, etc). Each tab is only shown if the
+	-- player has unlocked at least one block from the set (owner sees them all,
+	-- unless in /preview mode). The buttons are CREATED here but their .Visible
+	-- property is toggled at startup AND whenever a relevant attribute changes,
+	-- by refreshThemedPackTabVisibility() below.
+	local ThemedPackTabButtons = {}  -- { [tabName] = button }
+	local themedTabsLayoutStart = 2
+	local themedTabsList = BlockPresets.GetThemedPackTabs and BlockPresets.GetThemedPackTabs() or {}
+	for i, tabInfo in ipairs(themedTabsList) do
+		local btn = createThemedPackTabButton(tabInfo, rightTabsFrame)
+		btn.LayoutOrder = themedTabsLayoutStart + (i - 1)
+		RightTabButtons[tabInfo.Name] = btn
+		ThemedPackTabButtons[tabInfo.Name] = btn
+		if NewRightTabs[tabInfo.Name] then
+			addTabNotificationBadge(btn, "right")
+		end
+	end
+	
+	-- Apply initial visibility, plus a refresh on player attribute changes
+	local function refreshThemedPackTabVisibility()
+		for tabName, btn in pairs(ThemedPackTabButtons) do
+			local shouldShow = isTabVisible(tabName)
+			btn.Visible = shouldShow
+			-- If the player is currently looking at a tab that just became hidden
+			-- (e.g. they toggled /preview on), bounce them back to a safe default.
+			if not shouldShow and SelectedRightTab == tabName then
+				SelectedCategory = "Building"
+				SelectedRightTab = nil
+				refreshPresetDisplay()
+			end
+		end
+	end
+	refreshThemedPackTabVisibility()
+	
 	-- Listen for Rainbow Blocks unlock during session (daily reward claim, etc.)
 	-- When unlocked, refresh the display so rainbow blocks appear in Colors tab
 	LocalPlayer.AttributeChanged:Connect(function(attrName)
@@ -3265,6 +3598,13 @@ local function createInventoryUI()
 		-- Reward-set block unlocks (Unlocked_<BlockId>) - refresh inventory so the new block appears
 		if string.sub(attrName, 1, 9) == "Unlocked_" then
 			refreshPresetDisplay()
+			-- A new unlock may make a previously-hidden themed-pack tab appear.
+			refreshThemedPackTabVisibility()
+		end
+		-- Owner preview toggle: re-evaluate the whole inventory's visibility.
+		if attrName == "PreviewAsFresh" then
+			refreshPresetDisplay()
+			refreshThemedPackTabVisibility()
 		end
 	end)
 	
@@ -3557,6 +3897,15 @@ end
 local function useToolOnBlock()
 	local toolName = getSelectedToolFromHotbar()
 	if not toolName then return false end
+	
+	-- Buckets have their own dedicated remotes (PlaceWater/PlaceLava/PickupWater
+	-- /PickupLava) handled by BuildingController.TryBucketAction. They must not
+	-- also fire the generic UseTool remote, which would just produce "Unknown
+	-- tool" warnings on the server.
+	if toolName == "WaterBucket" or toolName == "EmptyBucket" or toolName == "LavaBucket" then
+		return false
+	end
+	
 	if not UseTool then 
 		warn("[Tools] UseTool remote not found")
 		return false
@@ -3710,6 +4059,38 @@ _G.InventoryController = {
 	OnSurvivalDataLoaded = function(callback)
 		table.insert(SurvivalDataCallbacks, callback)
 	end,
+	-- Swap a hotbar tool entry to a different tool by name. Used by the bucket
+	-- system to swap LavaBucket -> EmptyBucket after placing lava, or
+	-- EmptyBucket -> WaterBucket/LavaBucket after picking up a source.
+	-- Only swaps if the slot currently holds a tool with the matching name
+	-- (avoids stomping a slot the player has since rearranged).
+	SwapToolInHotbar = function(expectedToolName, newToolName)
+		for slot = 1, HOTBAR_SLOTS do
+			local entry = Hotbar[slot]
+			if entry and entry.IsTool and entry.ToolName == expectedToolName then
+				Hotbar[slot] = { ToolName = newToolName, IsTool = true }
+				updateHotbarSlotViewport(slot)
+				if slot == CurrentSlot and not IsToolSlotSelected then
+					updateSelection()
+				end
+				return true
+			end
+		end
+		-- Also check the tool belt (3 dedicated tool slots, separate from Hotbar)
+		for slot = 1, 3 do
+			local entry = ToolBelt[slot]
+			if entry and entry.IsTool and entry.ToolName == expectedToolName then
+				ToolBelt[slot] = { ToolName = newToolName, IsTool = true }
+				-- Tool belt refresh: easiest to trigger the same path the
+				-- main hotbar uses by re-selecting if it's the active slot.
+				if slot == CurrentToolSlot and IsToolSlotSelected then
+					updateSelection()
+				end
+				return true
+			end
+		end
+		return false
+	end,
 	-- Hotbar API (for block UIs that embed the hotbar row, e.g. ChestUI)
 	-- Returns slot data in chest-compatible format: { p, c, n } for blocks,
 	-- { isTool=true, toolName=... } for tool slots, or nil if empty.
@@ -3807,6 +4188,66 @@ task.spawn(function()
 			
 			print("[SurvivalInventory] Loaded contents from server")
 		end)
+	end
+end)
+
+-- ============================================
+-- HOTBAR PERSISTENCE
+-- Load the saved hotbar from the server on join and apply it. Saving happens
+-- incrementally via persistHotbarSlot() inside updateHotbarSlotViewport().
+-- ============================================
+task.spawn(function()
+	local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+	if not remotes then return end
+
+	HotbarRemotes.RequestHotbar = remotes:WaitForChild("RequestHotbar", 10)
+	HotbarRemotes.UpdateHotbarSlot = remotes:WaitForChild("UpdateHotbarSlot", 10)
+	local HotbarResponse = remotes:WaitForChild("HotbarResponse", 10)
+
+	if HotbarResponse then
+		HotbarResponse.OnClientEvent:Connect(function(contents)
+			if not contents or type(contents) ~= "table" then return end
+
+			-- Apply server data without echoing each slot back as a "change"
+			HotbarPersistEnabled = false
+			for i = 1, HOTBAR_SLOTS do
+				local item = contents[i]
+				if type(item) == "table" and type(item.t) == "string" then
+					-- Tool slot
+					Hotbar[i] = { IsTool = true, ToolName = item.t }
+				elseif type(item) == "table" and type(item.p) == "string" then
+					-- Block slot
+					local color = nil
+					if type(item.c) == "table" then
+						color = Color3.fromRGB(item.c[1] or 255, item.c[2] or 255, item.c[3] or 255)
+					else
+						local preset = BlockPresets.GetPreset(item.p)
+						if preset then color = preset.DefaultColor end
+					end
+					Hotbar[i] = {
+						PresetId = item.p,
+						Color = color,
+						Count = item.n or 1,
+					}
+				else
+					Hotbar[i] = nil
+				end
+				updateHotbarSlotViewport(i)
+			end
+
+			-- Refresh the active slot's selection label/highlight
+			if not IsToolSlotSelected then
+				updateSelection()
+			end
+
+			-- From now on, any hotbar change is saved back to the server
+			HotbarPersistEnabled = true
+			print("[Hotbar] Loaded contents from server")
+		end)
+	end
+
+	if HotbarRemotes.RequestHotbar then
+		HotbarRemotes.RequestHotbar:FireServer()
 	end
 end)
 

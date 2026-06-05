@@ -1,0 +1,48 @@
+diff a/dev/src/Client/InventoryController.client.luau b/dev/src/Client/InventoryController.client.luau	(rejected hunks)
+@@ -2515,16 +2625,43 @@ local function refreshPresetDisplay()
+ 		return
+ 	end
+ 	
++	-- Themed-pack right-tabs (Candy, future Roman, etc). Same rendering as a normal
++	-- left category ΓÇö just routed through the right side. Locked blocks within the
++	-- tab are still filtered by isPresetVisible below.
++	if SelectedRightTab then
++		local themedTabs = BlockPresets.GetThemedPackTabs and BlockPresets.GetThemedPackTabs() or {}
++		for _, tab in ipairs(themedTabs) do
++			if tab.Name == SelectedRightTab then
++				local presets = BlockPresets.GetPresetsByCategory(SelectedRightTab)
++				for _, preset in ipairs(presets) do
++					if isPresetVisible(preset) and (not hasSearch or preset.Name:lower():find(searchLower, 1, true)) then
++						local btn = createPresetButton(preset, PresetsContainer)
++						btn.LayoutOrder = layoutOrder
++						layoutOrder = layoutOrder + 1
++					end
++				end
++				return
++			end
++		end
++	end
++	
+ 	-- Normal block preset display
+ 	-- Helper: check if a preset should be hidden (rainbow blocks require unlock)
+-	local rainbowUnlocked = LocalPlayer:GetAttribute("RainbowBlocksUnlocked") or LocalPlayer.UserId == game.CreatorId
+-	local isCreator = LocalPlayer.UserId == game.CreatorId
++	-- Owner check uses BetaConfig.OWNER_USER_ID (group-owned game; see top of file).
++	-- Owner in /preview mode is treated as a fresh player so we can test the
++	-- pre-unlock experience.
++	local isOwnerRaw = (LocalPlayer.UserId == getOwnerUserId())
++	local previewingAsFresh = isOwnerRaw and (LocalPlayer:GetAttribute("PreviewAsFresh") == true)
++	local isCreator = isOwnerRaw and not previewingAsFresh
++	local rainbowUnlocked = LocalPlayer:GetAttribute("RainbowBlocksUnlocked") or isCreator
+ 	
+ 	-- Helper: is this reward-gated preset unlocked for this player?
+ 	local function isRewardUnlocked(preset)
+ 		if not preset.IsRewardBlock then return true end
+ 		if isCreator then return true end
+-		return LocalPlayer:GetAttribute("Unlocked_" .. preset.Id) == true
++		-- Variants share an unlock under BaseBlock; non-variants check by their own Id.
++		local unlockKey = "Unlocked_" .. (preset.BaseBlock or preset.Id)
++		return LocalPlayer:GetAttribute(unlockKey) == true
+ 	end
+ 	
+ 	if hasSearch then

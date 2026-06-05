@@ -34,6 +34,20 @@ local LOG_BLOCK_NAMES = {
 	Redwood = "RedwoodLog",
 }
 
+-- Leaf block per tree type. Only Oak/Birch/Spruce have dedicated leaf blocks;
+-- every other tree type falls back to OakLeaves (see resolveLeafBlockName).
+-- The single "Leaves" block was split into these per-type variants.
+local LEAF_BLOCK_NAMES = {
+	Oak = "OakLeaves",
+	Birch = "BirchLeaves",
+	Spruce = "SpruceLeaves",
+}
+local DEFAULT_LEAF_BLOCK = "OakLeaves"
+
+local function resolveLeafBlockName(leafType)
+	return LEAF_BLOCK_NAMES[leafType] or DEFAULT_LEAF_BLOCK
+end
+
 -- Create a log block at position (position = top of block)
 function TreeGenerator.CreateLog(position, parent, woodType)
 	local blocks = waitForBlocks()
@@ -82,9 +96,10 @@ function TreeGenerator.CreateLeaves(position, parent, leafType, isGenerated, bio
 	local blocks = waitForBlocks()
 	if not blocks then return nil end
 	
-	local template = blocks:FindFirstChild("Leaves")
+	local leafBlockName = resolveLeafBlockName(leafType)
+	local template = blocks:FindFirstChild(leafBlockName)
 	if not template then
-		warn("[TreeGenerator] Leaves template not found!")
+		warn("[TreeGenerator] " .. leafBlockName .. " template not found!")
 		return nil
 	end
 	
@@ -101,6 +116,15 @@ function TreeGenerator.CreateLeaves(position, parent, leafType, isGenerated, bio
 		leafColor = leafConfig.Color
 		-- Still apply random variation even without biome
 		leafColor = BiomeConfig.GetRandomizedLeafColor(leafColor)
+	end
+	
+	-- The per-type leaf blocks are textured on all 6 faces; the visible colour comes
+	-- from those Texture/Decal faces, not the part .Color. Tint every face so the
+	-- per-block random/biome variation actually shows (restores the old look).
+	for _, d in ipairs(leaves:GetDescendants()) do
+		if d:IsA("Decal") then  -- Texture is a subclass of Decal, so this covers both
+			d.Color3 = leafColor
+		end
 	end
 	
 	if leaves:IsA("BasePart") then
@@ -121,7 +145,7 @@ function TreeGenerator.CreateLeaves(position, parent, leafType, isGenerated, bio
 		end
 	end
 	
-	leaves:SetAttribute("BlockType", "Leaves")
+	leaves:SetAttribute("BlockType", leafBlockName)
 	leaves:SetAttribute("TreeType", leafType)
 	leaves:SetAttribute("IsTreeBlock", true)
 	leaves:SetAttribute("BlockPosX", position.X)
@@ -337,6 +361,40 @@ function TreeGenerator.GetTreeBlocks(basePosition, treeType, blocksFolder, biome
 					end
 				end
 			end
+		end
+	end
+	
+	-- SNOWY BIOME: cap the sky-exposed top leaves with a thin SnowLayer (the same
+	-- block snow-on-grass uses). A leaf is "sky-exposed" when it's the highest tree
+	-- block in its X/Z column; the cap goes in the cell above and the spawner drops
+	-- it to rest on the leaf's top face. Only the canopy crown gets snow, not leaves
+	-- buried under an overhang.
+	if biomeName == "Snowy" then
+		local function colKey(p)
+			return string.format("%d_%d", math.round(p.X / BLOCK_SIZE), math.round(p.Z / BLOCK_SIZE))
+		end
+		local topY = {}
+		for _, b in ipairs(blocks) do
+			if b.blockType == "L" or b.blockType == "l" then
+				local k = colKey(b.position)
+				if not topY[k] or b.position.Y > topY[k] then topY[k] = b.position.Y end
+			end
+		end
+		local snowCaps = {}
+		for _, b in ipairs(blocks) do
+			if b.blockType == "l" and topY[colKey(b.position)]
+				and math.abs(b.position.Y - topY[colKey(b.position)]) < BLOCK_SIZE * 0.5 then
+				table.insert(snowCaps, {
+					position = b.position + Vector3.new(0, BLOCK_SIZE, 0),
+					blockType = "SnowLayer",
+					treeType = treeType,
+					biomeName = biomeName,
+					seasonName = seasonName,
+				})
+			end
+		end
+		for _, cap in ipairs(snowCaps) do
+			table.insert(blocks, cap)
 		end
 	end
 	

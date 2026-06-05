@@ -12,6 +12,16 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- SECOND-PLACE ONLY: the chunk place has no "9 plots generating" phase, so this
+-- whole loading screen is meaningless there -- ChunkLoadingScreen handles it
+-- instead. Bail out before creating anything so the two screens never stack.
+local CHUNK_PLACE_IDS = {
+	[117001994964531] = true, -- BuildBlox Free Build (public universe)
+}
+if CHUNK_PLACE_IDS[game.PlaceId] then
+	return
+end
+
 -- Wait for remote
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
 if not Remotes then return end

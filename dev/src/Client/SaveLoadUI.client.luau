@@ -17,6 +17,7 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
 local OpenSaveLoadUI = Remotes:WaitForChild("OpenSaveLoadUI", 10)
 local SavePlot = Remotes:WaitForChild("SavePlot", 10)
 local LoadPlot = Remotes:WaitForChild("LoadPlot", 10)
+local LoadAutosave = Remotes:WaitForChild("LoadAutosave", 10)
 local SaveLoadResult = Remotes:WaitForChild("SaveLoadResult", 10)
 local GetSlotInfo = Remotes:WaitForChild("GetSlotInfo", 10)
 local DeleteSlot = Remotes:WaitForChild("DeleteSlot", 10)
@@ -71,6 +72,12 @@ local COLORS = {
 	loadHover = Color3.fromRGB(70, 120, 170),
 	loadHighlight = Color3.fromRGB(90, 150, 200),
 	loadShadow = Color3.fromRGB(25, 50, 80),
+	
+	-- Autosave restore button: amber/teal so it reads as "recovery", distinct from blue Load
+	autosaveNormal = Color3.fromRGB(150, 110, 40),
+	autosaveHover = Color3.fromRGB(175, 130, 55),
+	autosaveHighlight = Color3.fromRGB(205, 160, 75),
+	autosaveShadow = Color3.fromRGB(80, 58, 20),
 	
 	deleteNormal = Color3.fromRGB(140, 50, 50),
 	deleteHover = Color3.fromRGB(160, 60, 60),
@@ -908,6 +915,26 @@ local function updateSlotSelection(newSelectedSlot, ui)
 					setButtonDisabled(deleteBtn, true)
 				end
 			end
+			-- Restore Auto: only enabled when this slot has an autosave snapshot
+			-- (slotInfo.autosaveTime is set server-side once the autosave loop has run).
+			local restoreBtn = buttonRow:FindFirstChild("RestoreAutoButton")
+			if restoreBtn then
+				local selInfo = selectedSlot and slotFrames[selectedSlot] and slotFrames[selectedSlot].slotInfo
+				local hasAutosave = selInfo and selInfo.autosaveTime ~= nil
+				if hasAutosave then
+					setButtonDisabled(restoreBtn, false)
+					restoreBtn.BackgroundColor3 = COLORS.autosaveNormal
+					for _, child in restoreBtn:GetChildren() do
+						if child.Name == "BorderTop" or child.Name == "BorderLeft" then
+							child.BackgroundColor3 = COLORS.autosaveHighlight
+						elseif child.Name == "BorderBottom" or child.Name == "BorderRight" then
+							child.BackgroundColor3 = COLORS.autosaveShadow
+						end
+					end
+				else
+					setButtonDisabled(restoreBtn, true)
+				end
+			end
 		end
 	end
 end
@@ -1048,24 +1075,28 @@ local function createUI()
 			normal = COLORS.loadNormal, hover = COLORS.loadHover,
 			highlight = COLORS.loadHighlight, shadow = COLORS.loadShadow,
 		})
-		createMCButton("DeleteButton", "Delete", buttonColumn, btnSize, 3, {
+		createMCButton("RestoreAutoButton", "Restore Auto", buttonColumn, btnSize, 3, {
+			normal = COLORS.autosaveNormal, hover = COLORS.autosaveHover,
+			highlight = COLORS.autosaveHighlight, shadow = COLORS.autosaveShadow,
+		})
+		createMCButton("DeleteButton", "Delete", buttonColumn, btnSize, 4, {
 			normal = COLORS.deleteNormal, hover = COLORS.deleteHover,
 			highlight = COLORS.deleteHighlight, shadow = COLORS.deleteShadow,
 		})
 		
-		local purchaseRobuxBtn = createMCButton("PurchaseRobux", "Buy (" .. ROBUX_ICON .. SLOT_PRICE_ROBUX .. ")", buttonColumn, btnSize, 4, {
+		local purchaseRobuxBtn = createMCButton("PurchaseRobux", "Buy (" .. ROBUX_ICON .. SLOT_PRICE_ROBUX .. ")", buttonColumn, btnSize, 5, {
 			normal = COLORS.purchaseRobuxNormal, hover = COLORS.purchaseRobuxHover,
 			highlight = COLORS.purchaseRobuxHighlight, shadow = COLORS.purchaseRobuxShadow,
 		})
 		purchaseRobuxBtn.Visible = false
 		
-		local purchaseCoinsBtn = createMCButton("PurchaseCoins", SLOT_PRICE_COINS .. " Coins", buttonColumn, btnSize, 5, {
+		local purchaseCoinsBtn = createMCButton("PurchaseCoins", SLOT_PRICE_COINS .. " Coins", buttonColumn, btnSize, 6, {
 			normal = COLORS.purchaseNormal, hover = COLORS.purchaseHover,
 			highlight = COLORS.purchaseHighlight, shadow = COLORS.purchaseShadow,
 		})
 		purchaseCoinsBtn.Visible = false
 		
-		createMCButton("CloseButton", "Close", buttonColumn, btnSize, 6, {
+		createMCButton("CloseButton", "Close", buttonColumn, btnSize, 7, {
 			normal = COLORS.closeNormal, hover = COLORS.closeHover,
 			highlight = COLORS.closeHighlight, shadow = COLORS.closeShadow,
 		})
@@ -1075,7 +1106,7 @@ local function createUI()
 		-- Slots wrapper (holds borders so they don't interfere with UIListLayout)
 		local slotsWrapper = Instance.new("Frame")
 		slotsWrapper.Name = "SlotsWrapper"
-		slotsWrapper.Size = UDim2.new(1, -20, 1, -200)
+		slotsWrapper.Size = UDim2.new(1, -20, 1, -242)
 		slotsWrapper.Position = UDim2.new(0, 10, 0, 58)
 		slotsWrapper.BackgroundColor3 = COLORS.innerBg
 		slotsWrapper.BorderSizePixel = 0
@@ -1103,22 +1134,27 @@ local function createUI()
 		slotsPadding.PaddingBottom = UDim.new(0, 8)
 		slotsPadding.Parent = slotsContainer
 		
-		-- Button row (Save, Load, Delete)
+		-- Button grid (2 columns x 2 rows): Save, Load / Restore, Delete.
+		-- All four stay direct children of ButtonRow so existing lookups still resolve;
+		-- a UIGridLayout wraps them into two rows without nested frames.
 		local buttonRow = Instance.new("Frame")
 		buttonRow.Name = "ButtonRow"
-		buttonRow.Size = UDim2.new(1, -20, 0, 44)
-		buttonRow.Position = UDim2.new(0, 10, 1, -138)
+		buttonRow.Size = UDim2.new(0, 366, 0, 86)
+		buttonRow.Position = UDim2.new(0.5, 0, 1, -180)
+		buttonRow.AnchorPoint = Vector2.new(0.5, 0)
 		buttonRow.BackgroundTransparency = 1
 		buttonRow.Parent = panel
 		
-		local buttonLayout = Instance.new("UIListLayout")
-		buttonLayout.FillDirection = Enum.FillDirection.Horizontal
-		buttonLayout.Padding = UDim.new(0, 6)
+		local buttonLayout = Instance.new("UIGridLayout")
+		buttonLayout.CellSize = UDim2.new(0, 180, 0, 40)
+		buttonLayout.CellPadding = UDim2.new(0, 6, 0, 6)
+		buttonLayout.FillDirectionMaxCells = 2 -- 2 per row -> wraps to a second row
 		buttonLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		buttonLayout.VerticalAlignment = Enum.VerticalAlignment.Top
 		buttonLayout.SortOrder = Enum.SortOrder.LayoutOrder
 		buttonLayout.Parent = buttonRow
 		
-		local btnSize = UDim2.new(0, 118, 0, 40)
+		local btnSize = UDim2.new(0, 180, 0, 40) -- ignored by UIGridLayout but kept for clarity
 		
 		createMCButton("SaveButton", "Save", buttonRow, btnSize, 1, {
 			normal = COLORS.saveNormal, hover = COLORS.saveHover,
@@ -1128,7 +1164,11 @@ local function createUI()
 			normal = COLORS.loadNormal, hover = COLORS.loadHover,
 			highlight = COLORS.loadHighlight, shadow = COLORS.loadShadow,
 		})
-		createMCButton("DeleteButton", "Delete", buttonRow, btnSize, 3, {
+		createMCButton("RestoreAutoButton", "Restore Auto", buttonRow, btnSize, 3, {
+			normal = COLORS.autosaveNormal, hover = COLORS.autosaveHover,
+			highlight = COLORS.autosaveHighlight, shadow = COLORS.autosaveShadow,
+		})
+		createMCButton("DeleteButton", "Delete", buttonRow, btnSize, 4, {
 			normal = COLORS.deleteNormal, hover = COLORS.deleteHover,
 			highlight = COLORS.deleteHighlight, shadow = COLORS.deleteShadow,
 		})
@@ -1306,6 +1346,43 @@ local function setupButtons(ui, activeSlot)
 		
 		LoadPlot:FireServer(selectedSlot)
 	end)
+	
+	-- Restore Auto (with confirmation) -- loads the independent autosave snapshot
+	local restoreBtn = buttonRow:FindFirstChild("RestoreAutoButton")
+	local restoreConfirmPending = false
+	if restoreBtn then
+		restoreBtn.MouseButton1Click:Connect(function()
+			if isProcessing or not selectedSlot then return end
+			if restoreBtn:GetAttribute("Disabled") then return end
+			
+			local slotInfo = slotFrames[selectedSlot] and slotFrames[selectedSlot].slotInfo
+			if not (slotInfo and slotInfo.autosaveTime) then return end
+			
+			if not restoreConfirmPending then
+				restoreConfirmPending = true
+				setButtonText(restoreBtn, "Confirm?")
+				status.Text = "Restore autosave from " .. formatTimeAgo(slotInfo.autosaveTime) .. "? Click again."
+				status.TextColor3 = COLORS.textWarning
+				
+				task.delay(4, function()
+					if restoreConfirmPending then
+						restoreConfirmPending = false
+						setButtonText(restoreBtn, "Restore Auto")
+						status.Text = "Select a slot to save or load"
+						status.TextColor3 = COLORS.textDim
+					end
+				end)
+			else
+				restoreConfirmPending = false
+				isProcessing = true
+				setButtonText(restoreBtn, "Restoring...")
+				status.Text = "Restoring autosave for Slot " .. selectedSlot .. "..."
+				status.TextColor3 = COLORS.textDim
+				
+				LoadAutosave:FireServer(selectedSlot)
+			end
+		end)
+	end
 	
 	-- Delete (with confirmation)
 	local deleteConfirmPending = false
@@ -1574,6 +1651,10 @@ if SaveLoadResult then
 		setButtonText(saveBtn, "Save")
 		setButtonText(loadBtn, "Load")
 		setButtonText(deleteBtn, "Delete")
+		local restoreBtn = buttonRow:FindFirstChild("RestoreAutoButton")
+		if restoreBtn then
+			setButtonText(restoreBtn, "Restore Auto")
+		end
 		if purchaseRobuxBtn then
 			local robuxText = IsMobile and ("Buy (" .. ROBUX_ICON .. SLOT_PRICE_ROBUX .. ")") or (ROBUX_ICON .. SLOT_PRICE_ROBUX .. " Robux")
 			setButtonText(purchaseRobuxBtn, robuxText)

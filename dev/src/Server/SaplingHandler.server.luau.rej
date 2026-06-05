@@ -1,0 +1,276 @@
+diff a/dev/src/Server/SaplingHandler.server.luau b/dev/src/Server/SaplingHandler.server.luau	(rejected hunks)
+@@ -267,17 +335,272 @@ local function hasBlockAtPositionFast(position, posSet)
+ 	return posSet[key] == true
+ end
+ 
++-- ============================================
++-- CANDY CANE GROWTH (Step 5)
++-- ============================================
++-- Bespoke path for candy cane saplings. We DON'T go through TreeGenerator/
++-- TreeStructures because:
++--   * Candy canes are programmatically generated (random height + curl), not
++--     authored as fixed structures.
++--   * They use two block types (CandyCaneLog + CandyCaneFull) that aren't in
++--     the normal Blocks folder ΓÇö they're variant presets in the Candy reward
++--     set, with stripe colors tinted via Texture-mode.
++--   * The pole's horizontal-curl piece needs a non-Y log axis, which would
++--     require special structure character support.
++
++-- Locate the Candy reward set folder once, cached for reuse.
++local CandyBlocksFolder = nil
++local function getCandyBlocksFolder()
++	if CandyBlocksFolder and CandyBlocksFolder.Parent then return CandyBlocksFolder end
++	local rewardSets = ReplicatedStorage:FindFirstChild("RewardSets")
++	CandyBlocksFolder = rewardSets and rewardSets:FindFirstChild("CandyBlocks") or nil
++	return CandyBlocksFolder
++end
++
++-- Clone the given template (CandyCaneLog or CandyCaneFull) from the Candy set,
++-- tint its Texture descendants and any Part named "Core" to the variant color,
++-- and return the new block. Mirrors BlockHandler's Texture-mode tinting branch.
++local function buildCandyBlock(templateName, color)
++	local folder = getCandyBlocksFolder()
++	if not folder then
++		warn("[SaplingHandler] CandyBlocks folder not found in ReplicatedStorage.RewardSets")
++		return nil
++	end
++	local template = folder:FindFirstChild(templateName)
++	if not template then
++		warn("[SaplingHandler] Template missing in CandyBlocks: " .. templateName)
++		return nil
++	end
++	
++	local block = template:Clone()
++	
++	-- Anchor everything and tint stripes + Core to the chosen color.
++	local function tintAndAnchor(part)
++		if part:IsA("BasePart") then
++			part.Anchored = true
++			if part.Name == "Core" then
++				part.Color = color
++			end
++		end
++	end
++	if block:IsA("BasePart") then
++		tintAndAnchor(block)
++		for _, child in ipairs(block:GetChildren()) do
++			if child:IsA("Texture") or child:IsA("Decal") then
++				child.Color3 = color
++			end
++		end
++	elseif block:IsA("Model") then
++		for _, desc in ipairs(block:GetDescendants()) do
++			tintAndAnchor(desc)
++			if desc:IsA("Texture") or desc:IsA("Decal") then
++				desc.Color3 = color
++			end
++		end
++	end
++	
++	return block
++end
++
++-- Compute the offset from a model's pivot to its visual bounding-box center,
++-- in the model's LOCAL frame. We use this so we can place bottom-pivoted (or
++-- otherwise off-center-pivoted) models such that their visual center ends up
++-- exactly at the desired world position ΓÇö even if the model author put the
++-- pivot somewhere weird relative to the geometry. Rotates correctly with the
++-- model too, since it's a local-space offset.
++local function computeModelCenterOffset(model)
++	if not model or not model:IsA("Model") then
++		return Vector3.new(0, BLOCK_SIZE / 2, 0) -- fallback: assume bottom-pivot
++	end
++	local pivot = model:GetPivot()
++	local bbCframe = model:GetBoundingBox()
++	-- bbCframe.Position is the bb center in world space (with model in its
++	-- natural pose). PointToObjectSpace converts it to the pivot's local frame.
++	return pivot:PointToObjectSpace(bbCframe.Position)
++end
++
++-- One-time cache for the candy log's center-vs-pivot offset. Resolved on first
++-- candy growth (templates aren't guaranteed to exist at script load).
++local candyLogCenterOffsetCache = nil
++local function getCandyLogCenterOffset()
++	if candyLogCenterOffsetCache then return candyLogCenterOffsetCache end
++	local folder = getCandyBlocksFolder()
++	local template = folder and folder:FindFirstChild("CandyCaneLog")
++	candyLogCenterOffsetCache = computeModelCenterOffset(template)
++	print(string.format("[SaplingHandler] CandyCaneLog center-vs-pivot offset: (%.2f, %.2f, %.2f)",
++		candyLogCenterOffsetCache.X, candyLogCenterOffsetCache.Y, candyLogCenterOffsetCache.Z))
++	return candyLogCenterOffsetCache
++end
++
++-- Place a candy block at the given world position with optional log axis.
++-- logAxis: "X", "Y", or "Z" ΓÇö only meaningful for CandyCaneLog. Horizontal logs
++-- in the curl get "X" or "Z"; the vertical pole gets "Y" (default).
++local function placeCandyBlock(templateName, variantId, color, position, logAxis, blocksFolder, placedBy)
++	local block = buildCandyBlock(templateName, color)
++	if not block then return nil end
++	
++	block.Name = variantId .. "_" .. math.random(100000, 999999)
++	
++	-- Candy templates use TWO different pivot conventions, and we have to
++	-- account for both to get the J-shape's pieces flush with each other:
++	--
++	--   * CandyCaneLog (Model) is BOTTOM-PIVOTED. Its pivot sits at the bottom
++	--     face of the visual cylinder. For vertical placement we drop the pivot
++	--     half a block below the target so the model extends UP to be centered.
++	--     For HORIZONTAL placement the rotation re-orients which way "up" points
++	--     in world space, so the half-block offset must align with the rotated
++	--     extend direction (┬▒X or ┬▒Z) instead of ΓÇôY.
++	--
++	--   * CandyCaneFull (BasePart Union) is CENTER-PIVOTED. Its CFrame sits at
++	--     the visual center of the cube, so no offset is needed at allΓÇöjust
++	--     place the CFrame directly at the target position.
++	local rotation = CFrame.new()
++	if logAxis == "X" then
++		rotation = CFrame.Angles(0, 0, math.rad(90))
++	elseif logAxis == "Z" then
++		rotation = CFrame.Angles(math.rad(90), 0, 0)
++	end
++	
++	if block:IsA("BasePart") then
++		-- Center-pivoted: CFrame = position centers the block on `position`.
++		block.CFrame = CFrame.new(position) * rotation
++	elseif block:IsA("Model") then
++		-- Compute pivot position such that the model's visual bounding-box
++		-- center ends up at world `position` after rotation. The local-space
++		-- offset between pivot and visual center is constant for the template,
++		-- so we cache it once and rotate it into world space here for each
++		-- placement. This auto-adapts to whatever pivot the model was authored
++		-- with ΓÇö no hardcoded BLOCK_SIZE/2 assumptions, no magic floating fudge.
++		local localCenterOffset = getCandyLogCenterOffset()
++		local worldCenterOffset = rotation:VectorToWorldSpace(localCenterOffset)
++		block:PivotTo(CFrame.new(position - worldCenterOffset) * rotation)
++	end
++	
++	-- Attributes that the save/load + spatial-index systems expect.
++	block:SetAttribute("BlockType", variantId)
++	block:SetAttribute("BlockPosX", position.X)
++	block:SetAttribute("BlockPosY", position.Y)
++	block:SetAttribute("BlockPosZ", position.Z)
++	block:SetAttribute("PlacedBy", placedBy)
++	block:SetAttribute("GrownFromSapling", true)
++	block:SetAttribute("IsTreeBlock", true)
++	if logAxis and templateName == "CandyCaneLog" then
++		block:SetAttribute("LogAxis", logAxis)
++	end
++	
++	block.Parent = blocksFolder
++	return block
++end
++
++-- Grow a candy cane from the sapling's position. Returns true on success.
++-- The structure (Option B from chat plan): a J-shape made of N+4 blocks.
++--   * Vertical pole: N CandyCaneLog blocks (N = random 3-8), all CandyCaneLog
++--     (including the base, which sits on the ground so its swirl is hidden).
++--   * Top corner (pole-top + 1 in Y): CandyCaneFull ΓÇö the bend where the pole
++--     meets the curl. Full because the chain changes axis here.
++--   * Horizontal middle: CandyCaneLog, oriented on the curl axis, placed 1
++--     block in the curl direction. Log because both its ends are covered
++--     (top corner on one side, right corner on the other).
++--   * Right corner: CandyCaneFull, placed 1 block further in the curl direction
++--     (= 2 blocks from the top corner). Covers the horizontal log's far end
++--     AND the stub's top ΓÇö without this, the log's swirl shows through and
++--     the cane looks janky.
++--   * Stub: CandyCaneFull, 1 block DOWN from the right corner. The tip of the
++--     J: its bottom face is exposed (nothing below), so Full for stripes
++--     on all faces.
++-- Plan view of the curl (looking down at the top two layers, curl going +X):
++--   Y=N:   F L F      <- top corner, horizontal log, right corner
++--   Y=N-1: P . F      <- pole top, gap, stub
++local function growCandyCane(sapling, treeBasePos, blocksFolder)
++	local placedBy = sapling:GetAttribute("PlacedBy")
++	
++	-- The CandyCaneLog model's pivot is ~0.1 studs below its visual bottom face,
++	-- so the cane sat half a block too low. Net offset: -1.6 + 1.5 = -0.1 keeps
++	-- the pole base flush on grass.
++	treeBasePos = treeBasePos - Vector3.new(0, 0.1, 0)
++	
++	-- Roll randomness
++	local height = math.random(3, 8)
++	-- Color: prefer the flavor that was already chosen when the sapling was
++	-- planted (stored on the sapling so it visually matched the grow-color).
++	-- Fall back to a fresh random roll if the attribute is missing.
++	local flavor = getCandyFlavor(sapling:GetAttribute("CandyCaneFlavor"))
++		 or CANDY_PALETTE[math.random(1, #CANDY_PALETTE)]
++	local color = flavor.color
++	local variantSuffix = "_" .. flavor.name
++	-- Curl direction: random +X, -X, +Z, or -Z. The chosen axis is the curl axis;
++	-- the horizontal-log gets LogAxis = that axis.
++	local directions = {
++		{ axis = "X", offset = Vector3.new(BLOCK_SIZE, 0, 0) },
++		{ axis = "X", offset = Vector3.new(-BLOCK_SIZE, 0, 0) },
++		{ axis = "Z", offset = Vector3.new(0, 0, BLOCK_SIZE) },
++		{ axis = "Z", offset = Vector3.new(0, 0, -BLOCK_SIZE) },
++	}
++	local dir = directions[math.random(1, #directions)]
++	
++	print(string.format("[SaplingHandler] Growing candy cane: %s, height=%d, curlAxis=%s, curlDir=(%.0f,%.0f,%.0f)",
++		flavor.name, height, dir.axis, dir.offset.X, dir.offset.Y, dir.offset.Z))
++	
++	local placedAny = false
++	
++	-- 1. Pole ΓÇö N vertical CandyCaneLog blocks
++	for i = 0, height - 1 do
++		local pos = treeBasePos + Vector3.new(0, i * BLOCK_SIZE, 0)
++		local blk = placeCandyBlock(
++			"CandyCaneLog",
++			"CandyCaneLog" .. variantSuffix,
++			color, pos, "Y", blocksFolder, placedBy)
++		if blk then placedAny = true end
++	end
++	
++	-- 2. Top corner ΓÇö CandyCaneFull at pole-top + 1 in Y
++	local topCornerPos = treeBasePos + Vector3.new(0, height * BLOCK_SIZE, 0)
++	placeCandyBlock(
++		"CandyCaneFull",
++		"CandyCaneFull" .. variantSuffix,
++		color, topCornerPos, nil, blocksFolder, placedBy)
++	
++	-- 3. Horizontal middle ΓÇö CandyCaneLog, oriented on curl axis, 1 block in
++	--    the curl direction from the top corner. Both ends covered (by top
++	--    corner and right corner) so the log's swirl stays hidden.
++	local curlMidPos = topCornerPos + dir.offset
++	placeCandyBlock(
++		"CandyCaneLog",
++		"CandyCaneLog" .. variantSuffix,
++		color, curlMidPos, dir.axis, blocksFolder, placedBy)
++	
++	-- 4. Right corner ΓÇö CandyCaneFull, 1 block further in the curl direction
++	--    from the horizontal log. Covers the log's far end and sits above
++	--    the stub.
++	local rightCornerPos = curlMidPos + dir.offset
++	placeCandyBlock(
++		"CandyCaneFull",
++		"CandyCaneFull" .. variantSuffix,
++		color, rightCornerPos, nil, blocksFolder, placedBy)
++	
++	-- 5. Stub ΓÇö CandyCaneFull, 1 block down from the right corner. This is
++	--    the tip of the J: bottom face exposed, so Full for stripes-everywhere.
++	local stubPos = rightCornerPos - Vector3.new(0, BLOCK_SIZE, 0)
++	placeCandyBlock(
++		"CandyCaneFull",
++		"CandyCaneFull" .. variantSuffix,
++		color, stubPos, nil, blocksFolder, placedBy)
++	
++	print("[SaplingHandler] Candy cane grown successfully")
++	return placedAny
++end
++
+ -- Grow a sapling into a tree
+ local function growSapling(sapling, data)
+ 	print("[SaplingHandler] ========== GROW SAPLING CALLED ==========")
+-	
++
+ 	if not TreeGenerator then
+ 		warn("[SaplingHandler] Cannot grow sapling - TreeGenerator not loaded!")
+ 		warn("[SaplingHandler] Check that ServerScriptService.Modules.TreeGenerator exists")
+ 		return false
+ 	end
+ 	print("[SaplingHandler] TreeGenerator is loaded Γ£ô")
+-	
++
+ 	local blocksFolder = getBlocksFolder(sapling)
+ 	if not blocksFolder then
+ 		warn("[SaplingHandler] Cannot find blocks folder for sapling")

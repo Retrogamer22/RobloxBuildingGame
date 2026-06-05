@@ -45,6 +45,19 @@ end
 function VinePlacement.IsVine(blockId)
 	if not blockId then return false end
 	return blockId == "Vine" or blockId == "VineTrimmed" or blockId == "VineTrimmedEnd"
+		or blockId == "VineHalf"
+end
+
+-- Returns true ONLY for the half-height vine variant (used when the host face only
+-- has material in its bottom half, e.g. a bottom slab or the open front of a stair).
+function VinePlacement.IsVineHalf(blockId)
+	if not blockId then return false end
+	return blockId == "VineHalf"
+end
+
+function VinePlacement.IsVineHalfInstance(block)
+	if not block then return false end
+	return block:GetAttribute("IsVineHalf") == true
 end
 
 -- Returns true ONLY if the vine is trimmed (won't spread, blocks further growth).
@@ -193,6 +206,87 @@ function VinePlacement.GetVineCFrame(gridPosition, face, flipped)
 	end
 	
 	return CFrame.new(finalPosition) * yRotation
+end
+
+-- Distance the half-vine is dropped from the cell center so its 1.5-stud-tall
+-- geometry sits flush in the BOTTOM half of the cell. The VineHalf model's pivot
+-- is at its own center, so a -0.75 world-Y shift bottom-aligns it.
+local VINE_HALF_DROP = BLOCK_SIZE / 4 -- 0.75
+
+-- Same as GetVineCFrame, but lowered so the half-height vine fills the bottom half
+-- of the cell (matching a bottom slab / open stair front host).
+function VinePlacement.GetVineHalfCFrame(gridPosition, face, flipped)
+	local base = VinePlacement.GetVineCFrame(gridPosition, face, flipped)
+	return base + Vector3.new(0, -VINE_HALF_DROP, 0)
+end
+
+-- ============================================
+-- HALF-HOST DETECTION
+-- ============================================
+
+-- Convention-free geometry probe: is the host's TOP half empty just behind the vine
+-- face? Raycasts the host's actual geometry, so it works for stairs (open front),
+-- slabs, and any partial block without relying on orientation attributes. The probe
+-- is shallow so a stair's set-back top step (at the BACK) doesn't count as "solid"
+-- behind the FRONT face.
+local function hostTopHalfEmpty(hostBlock, face, vineGridPosition)
+	if not vineGridPosition then return false end
+	local faceOut = VinePlacement.GetFaceOffset(face) -- host outward normal on this face
+	if faceOut.Magnitude < 0.5 then return false end
+
+	local hostCenter = vineGridPosition - faceOut * BLOCK_SIZE
+	-- Start just outside the face, centered in the TOP half; cast a short distance in.
+	local rayStart = hostCenter + faceOut * (BLOCK_SIZE / 2 + 0.1) + Vector3.new(0, BLOCK_SIZE / 4, 0)
+	local rayDir = -faceOut * 0.85
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { hostBlock }
+	params.IgnoreWater = true
+
+	return workspace:Raycast(rayStart, rayDir, params) == nil
+end
+
+-- Returns true if the host face the vine attaches to only has material in its BOTTOM
+-- half, so the vine has nothing in the top half to "grab" onto (bottom slab, open
+-- stair front, etc.). Top slabs / upside-down stairs are top-half-only and correctly
+-- do NOT match (their top half is solid, so the probe hits).
+function VinePlacement.HostIsBottomHalfOnly(hostBlock, face, vineGridPosition)
+	if not hostBlock or not face then return false end
+
+	-- Fast path: a bottom slab is always bottom-half-only.
+	if hostBlock:GetAttribute("SlabOrientation") == "bottom" then
+		return true
+	end
+
+	-- General case: probe the host's real geometry (needs the vine's grid position).
+	return hostTopHalfEmpty(hostBlock, face, vineGridPosition)
+end
+
+-- Find the solid host block a vine at `vineGridPosition` is attached to on `face`.
+-- The host sits one cell behind the vine (opposite the outward face direction).
+function VinePlacement.GetHostBlock(vineGridPosition, face, blocksFolder)
+	if not blocksFolder then return nil end
+	local hostPos = vineGridPosition - VinePlacement.GetFaceOffset(face) * BLOCK_SIZE
+
+	local index = getSpatialIndex(blocksFolder)
+	local candidates = index and index:GetBlocksAt(hostPos) or blocksFolder:GetChildren()
+	for _, block in ipairs(candidates) do
+		if block:GetAttribute("IsVine") then continue end
+		if block:GetAttribute("IsDecoration") then continue end
+		return block
+	end
+	return nil
+end
+
+-- Resolve which vine variant belongs at a position given its host's shape.
+-- Returns ("VineHalf" | "Vine"), hostBlock. Only meaningful for non-trimmed vines.
+function VinePlacement.ResolveVineType(vineGridPosition, face, blocksFolder)
+	local host = VinePlacement.GetHostBlock(vineGridPosition, face, blocksFolder)
+	if host and VinePlacement.HostIsBottomHalfOnly(host, face, vineGridPosition) then
+		return "VineHalf", host
+	end
+	return "Vine", host
 end
 
 -- ============================================

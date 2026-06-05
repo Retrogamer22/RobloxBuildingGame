@@ -177,7 +177,7 @@ local YIELD_EVERY = 500 -- yield after processing this many blocks
 
 local function buildSpatialLookup(blocksFolder)
 	local occupiedPositions = {} -- key -> true (solid/blocking blocks only)
-	local grassPositions = {}   -- key -> true (grass block at position)
+	local grassPositions = {}   -- key -> grass BlockType string at position
 	local count = 0
 	
 	for _, block in ipairs(blocksFolder:GetChildren()) do
@@ -192,7 +192,11 @@ local function buildSpatialLookup(blocksFolder)
 			
 			local blockType = block:GetAttribute("BlockType")
 			if blockType and CONFIG.GRASS_BLOCKS[blockType] then
-				grassPositions[key] = true
+				-- Store the grass TYPE (not just presence) so spreading grass can
+				-- inherit its neighbour's variant (e.g. SnowyGrassBlock) instead of
+				-- always defaulting to the plot's CurrentBiome. Critical on the chunk
+				-- world, where CurrentBiome is "Default" but cells are per-cell biomes.
+				grassPositions[key] = blockType
 			end
 		end
 		
@@ -228,6 +232,38 @@ local function hasAdjacentGrassFast(gx, gy, gz, grassPositions)
 	end
 	
 	return false
+end
+
+-- Find the grass TYPE a dirt block should inherit when grass spreads onto it,
+-- based on its neighbours. Spreading grass should look like the grass it spread
+-- FROM, not the plot's nominal biome -- this is what keeps a snowy region snowy
+-- on the chunk world (where CurrentBiome is the meaningless "Default"). A snowy
+-- neighbour wins over a plain one so snow biomes don't get punched full of green
+-- holes at their dirt edges. Returns the chosen BlockType string, or nil if no
+-- grass neighbour exists. Full blocks only (slabs keep their own slab path).
+local SNOWY_GRASS_VARIANTS = {
+	["SnowyGrassBlock"] = true,
+	["SnowGrassBlock"] = true,
+}
+local function getAdjacentGrassType(gx, gy, gz, grassPositions)
+	local firstFound = nil
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			for dz = -1, 1 do
+				if not (dx == 0 and dy == 0 and dz == 0) then
+					local t = grassPositions[getGridKey(gx + dx, gy + dy, gz + dz)]
+					if type(t) == "string" then
+						-- Snowy neighbour takes priority -- return immediately.
+						if SNOWY_GRASS_VARIANTS[t] then
+							return t
+						end
+						firstFound = firstFound or t
+					end
+				end
+			end
+		end
+	end
+	return firstFound
 end
 
 -- Get the appropriate grass block type for the biome
@@ -486,12 +522,15 @@ local function convertGrassToDirt(grassBlock, blocksFolder)
 		dirtBlock:SetAttribute("PlacedBy", placedBy)
 	end
 	
-	if isTerrainBlock then
+	-- FIX: A block with no PlacedBy is natural terrain. Always flag decayed dirt as terrain
+	-- so its lineage isn't lost (which previously orphaned grass that later regrew on it).
+	local treatAsTerrain = isTerrainBlock or not placedBy
+	if treatAsTerrain then
 		dirtBlock:SetAttribute("IsTerrainBlock", true)
 		dirtBlock:SetAttribute("TerrainDepth", 1) -- Now underground
 	end
 	
-	if isLazyLoaded then
+	if isLazyLoaded or treatAsTerrain then
 		dirtBlock:SetAttribute("IsLazyLoaded", true)
 	end
 	
@@ -505,8 +544,51 @@ local function convertGrassToDirt(grassBlock, blocksFolder)
 	return true
 end
 
+-- Clone a SnowLayer block and rest it on top of `grassBlock`, registered in the
+-- grid cell ABOVE (BlockPosY = posY + BLOCK_SIZE) so the snow<->grass invariant
+-- holds exactly as if a player had placed it. Mirrors the terrain generator's
+-- snowy-surface treatment so spread-grown snowy grass looks identical to
+-- generated snowy grass. No-op if the SnowLayer template is missing or a block
+-- already occupies the cell above.
+local function placeSnowLayerAbove(blocksFolder, posX, posY, posZ)
+	local template = getBlockTemplate("SnowLayer")
+	if not template then return end
+
+	local snow = template:Clone()
+	snow.Name = "SnowLayer_" .. math.random(100000, 999999)
+
+	local cellTopY = posY + BLOCK_SIZE / 2 -- top face of the grass block
+	if snow:IsA("BasePart") then
+		snow.CFrame = CFrame.new(posX, cellTopY + snow.Size.Y / 2, posZ)
+		snow.Anchored = true
+		snow.CanCollide = false
+		snow.CanTouch = false
+		snow.CastShadow = false
+	elseif snow:IsA("Model") then
+		snow:PivotTo(CFrame.new(posX, cellTopY, posZ))
+		for _, part in ipairs(snow:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Anchored = true
+				part.CanCollide = false
+			end
+		end
+	end
+
+	snow:SetAttribute("BlockType", "SnowLayer")
+	snow:SetAttribute("IsTerrainBlock", true)
+	snow:SetAttribute("TerrainDepth", 0)
+	-- Register one cell ABOVE the grass so SnowyGrassManager / lookups see snow at gy+1.
+	snow:SetAttribute("BlockPosX", posX)
+	snow:SetAttribute("BlockPosY", posY + BLOCK_SIZE)
+	snow:SetAttribute("BlockPosZ", posZ)
+	snow.Parent = blocksFolder
+end
+
 -- Convert a dirt block to grass
-local function convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName)
+-- overrideGrassType: optional BlockType the new grass should be, taking priority
+-- over the plot biome. Used so grass spreading on the chunk world inherits its
+-- neighbour's variant (keeps snowy regions snowy). Ignored for slabs.
+local function convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName, overrideGrassType)
 	local blockType = dirtBlock:GetAttribute("BlockType")
 	if not blockType or not CONFIG.DIRT_BLOCKS[blockType] then
 		return false
@@ -564,8 +646,14 @@ local function convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName
 			return false
 		end
 	else
-		-- For full dirt blocks, convert to the biome's grass block
-		grassType = getGrassTypeForBiome(biomeName)
+		-- For full dirt blocks, convert to the biome's grass block -- UNLESS an
+		-- override was supplied (spread inherits its neighbour's grass variant, so
+		-- snowy regions stay snowy even though the plot's CurrentBiome is "Default").
+		if overrideGrassType and CONFIG.GRASS_BLOCKS[overrideGrassType] and not isGrassSlab(overrideGrassType) then
+			grassType = overrideGrassType
+		else
+			grassType = getGrassTypeForBiome(biomeName)
+		end
 		template = getBlockTemplate(grassType)
 		if not template then
 			warn("[GrassSpread] Could not find grass template: " .. grassType)
@@ -667,12 +755,21 @@ local function convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName
 		grassBlock:SetAttribute("PlacedBy", placedBy)
 	end
 	
-	if isTerrainBlock then
+	-- FIX: A block with no PlacedBy is, by definition, natural terrain. Always flag it as
+	-- terrain so that breaking it routes through OnTerrainBlockBroken (marks the position
+	-- dug). Previously this was inherited only if the source dirt still had IsTerrainBlock,
+	-- so a grass block whose lineage lost the flag during decay/spread became an orphan:
+	-- not saved, not mark-dug, and thus regenerated on every load.
+	local treatAsTerrain = isTerrainBlock or not placedBy
+	if treatAsTerrain then
 		grassBlock:SetAttribute("IsTerrainBlock", true)
 		grassBlock:SetAttribute("TerrainDepth", 0) -- Grass is always surface
 	end
 	
-	if isLazyLoaded then
+	-- Grown grass is a state change from the originally generated surface, so it must be
+	-- saved to persist. Lazy-load it if it was already lazy OR if it's terrain (so the
+	-- grown state round-trips and the block is mark-dug correctly when broken).
+	if isLazyLoaded or treatAsTerrain then
 		grassBlock:SetAttribute("IsLazyLoaded", true)
 	end
 	
@@ -682,6 +779,14 @@ local function convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName
 	-- Parent the new block and destroy the old one
 	grassBlock.Parent = blocksFolder
 	dirtBlock:Destroy()
+	
+	-- If the spread produced a SNOWY grass variant, cap it with a SnowLayer so it
+	-- matches generated snowy terrain (and the snow<->grass invariant holds). Grass
+	-- only spreads onto EXPOSED dirt (nothing above), so the cell above is clear --
+	-- we won't bury a player's build.
+	if SNOWY_GRASS_VARIANTS[grassType] then
+		placeSnowLayerAbove(blocksFolder, posX, posY, posZ)
+	end
 	
 	return true
 end
@@ -775,7 +880,11 @@ local function processTick()
 		for _, dirtBlock in ipairs(eligibleDirtBlocks) do
 			if totalChanges >= maxChanges then break end
 			if math.random() < CONFIG.GRASS_SPREAD_CHANCE then
-				if convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName) then
+				-- Spread inherits the neighbouring grass variant (snowy wins) so the
+				-- chunk world's snowy regions don't fill with plain-green holes.
+				local dgx, dgy, dgz = getBlockGridPos(dirtBlock)
+				local inheritType = dgx and getAdjacentGrassType(dgx, dgy, dgz, grassPositions) or nil
+				if convertDirtToGrass(dirtBlock, blocksFolder, biomeName, seasonName, inheritType) then
 					blocksConverted = blocksConverted + 1
 					totalChanges = totalChanges + 1
 				end

@@ -431,6 +431,7 @@ local function processFall(block: Instance, blocksFolder: Folder, useInstant: bo
 end
 
 local function processQueue()
+	if BulkOperationFlags and BulkOperationFlags.IsShuttingDown() then return end
 	if #fallQueue == 0 then return end
 	
 	local useInstant = #fallQueue > INSTANT_FALL_THRESHOLD
@@ -619,10 +620,12 @@ local function monitorBuildArea(buildArea: Instance)
 	end
 	
 	blocksFolder.ChildAdded:Connect(function(block)
+		if BulkOperationFlags.IsShuttingDown() then return end
 		onBlockAdded(block, blocksFolder)
 	end)
 	
 	blocksFolder.ChildRemoved:Connect(function(block)
+		if BulkOperationFlags.IsShuttingDown() then return end
 		onBlockRemoved(block, blocksFolder)
 	end)
 end

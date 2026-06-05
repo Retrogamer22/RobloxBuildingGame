@@ -399,6 +399,7 @@ end
 -- ============================================
 
 RunService.Heartbeat:Connect(function()
+	if BulkOperationFlags and BulkOperationFlags.IsShuttingDown() then return end
 	if not IsRunning then return end
 	
 	local now = tick()

@@ -532,6 +532,7 @@ local function monitorBuildArea(buildArea)
 		end
 		
 		local addedConn = folder.ChildAdded:Connect(function(block)
+			if BulkOperationFlags.IsShuttingDown() then return end
 			task.wait() -- Let the block fully set up
 			if BulkOperationFlags.IsBulkOperation(buildArea) then
 				DeferredBuildAreas[buildArea] = true
@@ -542,6 +543,7 @@ local function monitorBuildArea(buildArea)
 		table.insert(connections, addedConn)
 		
 		local removedConn = folder.ChildRemoved:Connect(function()
+			if BulkOperationFlags.IsShuttingDown() then return end
 			if not BulkOperationFlags.IsBulkOperation(buildArea) then
 				scheduleRecalc(buildArea)
 			else

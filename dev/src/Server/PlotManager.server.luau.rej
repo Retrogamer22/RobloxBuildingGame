@@ -1,0 +1,31 @@
+diff a/dev/src/Server/PlotManager.server.luau b/dev/src/Server/PlotManager.server.luau	(rejected hunks)
+@@ -142,17 +140,14 @@ local function assignPlot(player, plotNumber)
+ 			local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
+ 			local defaultTerrainStyle = "Flat"
+ 			
+-			print("[PlotManager] Generating terrain on-demand for plot " .. plotNumber)
+ 			TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
+ 			
+ 			buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
+ 			buildArea:SetAttribute("CurrentBiome", defaultBiome)
+ 			PlotTerrainReady[plotNumber] = true
+-			print("[PlotManager] Plot " .. plotNumber .. " terrain ready for " .. player.Name)
+ 		end
+ 	end
+ 	
+-	print(player.Name .. " assigned to plot " .. plotNumber)
+ 	PlotAssigned:FireClient(player, plotNumber, buildArea)
+ 	
+ 	-- Register plot for grass spreading
+@@ -534,11 +518,9 @@ local function initializeAllPlots()
+ 				blocksFolder.Parent = buildArea
+ 			end
+ 			
+-			print("[PlotManager] Plot " .. i .. " prepared (no terrain yet)")
+ 		end
+ 	end
+ 	
+-	print("[PlotManager] All plots prepared! Terrain will generate on-demand when players join.")
+ end
+ 
+ -- Shared state: clients can check this on join to know if loading screen is needed

@@ -93,6 +93,8 @@ local function raycastForInteractable()
 		return block, "crafting_table"
 	elseif BlockPresets.IsFurnace(blockType) then
 		return block, "furnace"
+	elseif BlockPresets.IsPaintMixer and BlockPresets.IsPaintMixer(blockType) then
+		return block, "paint_mixer"
 	elseif BlockPresets.IsBed and BlockPresets.IsBed(blockType) then
 		return block, "bed"
 	end
@@ -116,6 +118,10 @@ local function closeAllBlockUIs()
 	end
 	if _G.FurnaceUI and _G.FurnaceUI.IsOpen() then
 		_G.FurnaceUI.Close()
+		wasClosed = true
+	end
+	if _G.PaintMixerUI and _G.PaintMixerUI.IsOpen() then
+		_G.PaintMixerUI.Close()
 		wasClosed = true
 	end
 	if wasClosed then
@@ -167,8 +173,9 @@ function BlockInteractionController.IsAnyBlockUIOpen()
 	local chestOpen = _G.ChestUI and _G.ChestUI.IsOpen() or false
 	local craftingOpen = _G.CraftingTableUI and _G.CraftingTableUI.IsOpen() or false
 	local furnaceOpen = _G.FurnaceUI and _G.FurnaceUI.IsOpen() or false
+	local mixerOpen = _G.PaintMixerUI and _G.PaintMixerUI.IsOpen() or false
 	local justClosed = (tick() - lastBlockUICloseTime) < CLOSE_GUARD_TIME
-	return chestOpen or craftingOpen or furnaceOpen or justClosed
+	return chestOpen or craftingOpen or furnaceOpen or mixerOpen or justClosed
 end
 
 -- Called by individual block UIs when they close (via E key, overlay click, etc.)
@@ -222,6 +229,12 @@ function BlockInteractionController.TryInteract()
 		end
 		return true
 
+	elseif interactionType == "paint_mixer" then
+		if _G.PaintMixerUI then
+			_G.PaintMixerUI.Open(block)
+		end
+		return true
+
 	elseif interactionType == "bed" then
 		if _G.BedController then
 			_G.BedController.LayDown(block)
@@ -237,6 +250,6 @@ end
 -- ============================================
 _G.BlockInteractionController = BlockInteractionController
 
-print("[BlockInteractionController] Initialized (chest, crafting table, furnace, bed interaction)")
+print("[BlockInteractionController] Initialized (chest, crafting table, furnace, paint mixer, bed interaction)")
 
 return BlockInteractionController

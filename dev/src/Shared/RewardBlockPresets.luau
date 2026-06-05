@@ -52,7 +52,9 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local RewardBlockPresets = {}
 
--- Valid inventory tabs (must match Categories list in BlockPresets.luau)
+-- Valid inventory tabs (must match Categories list in BlockPresets.luau).
+-- THEMED-PACK tabs (Tab field in Manifest) are added dynamically and live
+-- alongside these — they don't need to be listed here.
 local VALID_CATEGORIES = {
 	Nature = true,
 	Building = true,
@@ -97,6 +99,68 @@ local function coerceColor(value)
 	return nil
 end
 
+-- Resolve a manifest PaletteSubset spec into a list of { color3, colorName, displayName, index }.
+-- Three accepted forms:
+--   "all"                              -> every palette color (in ColorPalette.ColorOrder)
+--   { "Red", "Blue", ... }             -> just those colors (names from ColorPalette)
+--   { { Color="Red", Name="..." }, .. } -> custom display name per color
+-- `index` is each variant's position in the canonical palette order, used for
+-- in-tab sorting so colors group together visually instead of alphabetically.
+local function resolvePaletteSubset(spec, ColorPalette, setName, blockName, colorOverrides)
+	local entries = {}
+	local orderedNames = ColorPalette.ColorOrder
+	local nameToIndex = {}
+	for i, n in ipairs(orderedNames) do nameToIndex[n] = i end
+	-- colorOverrides (optional): { [colorName] = Color3 } from the manifest. When a
+	-- color is listed here, use that exact Color3 instead of ColorPalette's version.
+	-- Lets a set use punchier colors than the shared palette (e.g. candy canes).
+	colorOverrides = colorOverrides or {}
+	local function colorFor(name)
+		return colorOverrides[name] or ColorPalette.Colors[name] or ColorPalette.getColor(name)
+	end
+	
+	-- Form 1: "all"
+	if spec == "all" then
+		for i, n in ipairs(orderedNames) do
+			table.insert(entries, { colorName = n, color3 = colorFor(n), displayName = nil, index = i })
+		end
+		return entries
+	end
+	
+	if type(spec) ~= "table" then
+		warn(string.format("[RewardBlockPresets] %s.%s: PaletteSubset must be 'all' or a table - skipping variants", setName, blockName))
+		return {}
+	end
+	
+	for _, item in ipairs(spec) do
+		local colorName, displayName
+		if type(item) == "string" then
+			-- Form 2: list of names
+			colorName = item
+		elseif type(item) == "table" and type(item.Color) == "string" then
+			-- Form 3: { Color, Name } table
+			colorName = item.Color
+			displayName = item.Name
+		else
+			warn(string.format("[RewardBlockPresets] %s.%s: PaletteSubset entry has unexpected shape - skipping", setName, blockName))
+			continue
+		end
+		local color3 = colorFor(colorName)
+		if not color3 then
+			warn(string.format("[RewardBlockPresets] %s.%s: PaletteSubset references unknown color '%s' - skipping",
+				setName, blockName, tostring(colorName)))
+			continue
+		end
+		table.insert(entries, {
+			colorName = colorName,
+			color3 = color3,
+			displayName = displayName,
+			index = nameToIndex[colorName] or 999,
+		})
+	end
+	return entries
+end
+
 -- Shallow-merge defaults into a config table without overwriting per-block keys
 local function applyDefaults(blockCfg, defaults)
 	if not defaults then return blockCfg end
@@ -106,12 +170,24 @@ local function applyDefaults(blockCfg, defaults)
 	return merged
 end
 
--- Build a single preset table from a set name, block name, and merged config
-local function buildPreset(setName, blockName, cfg)
-	-- Validate category
-	local category = cfg.Category
-	if not category or not VALID_CATEGORIES[category] then
-		warn(string.format("[RewardBlockPresets] %s.%s: invalid or missing Category '%s' (valid: Nature/Building/Decoration/Colors/Lights/Frames/Wiring/Items) - skipping",
+-- Build a single preset table from a set name, block name, and merged config.
+-- manifestTab: the set-level Tab field (themed-pack tab name), if any. Used as
+-- the fallback Category when no per-block Category is set.
+local function buildPreset(setName, blockName, cfg, manifestTab)
+	-- Resolve category: per-block Category wins; otherwise fall back to the
+	-- set-level Tab field; otherwise we have no destination and must skip.
+	local category = cfg.Category or manifestTab
+	local isThemedPackBlock = (cfg.Category == nil and manifestTab ~= nil)
+	if not category then
+		warn(string.format("[RewardBlockPresets] %s.%s: no Category and no set-level Tab - skipping",
+			setName, blockName))
+		return nil
+	end
+	-- Built-in categories must be in the allow-list. Themed-pack categories
+	-- (where Category == manifestTab) bypass this check since they're declared
+	-- by the manifest itself.
+	if not isThemedPackBlock and not VALID_CATEGORIES[category] then
+		warn(string.format("[RewardBlockPresets] %s.%s: invalid Category '%s' (valid: Nature/Building/Decoration/Colors/Lights/Frames/Wiring/Items) - skipping",
 			setName, blockName, tostring(category)))
 		return nil
 	end
@@ -132,8 +208,21 @@ local function buildPreset(setName, blockName, cfg)
 		-- Tagging for the unlock-gating system
 		IsRewardBlock = true,
 		BelongsToSet = setName,
+		-- True when this block lives in a themed-pack tab (set-level Tab field).
+		-- Used by the inventory to gate tab visibility per-player.
+		IsThemedPackBlock = isThemedPackBlock or nil,
 		-- Behavior config (drives ColorCycleController, placement quirks, etc.)
 		Behavior = cfg.Behavior,
+		-- Decoration support (saplings, flowers, etc. living in reward sets).
+		-- BlockHandler's decoration placement path uses BlockModelFolder to look
+		-- up the template, instead of the hardcoded Decorations folder.
+		IsDecoration = cfg.IsDecoration or nil,
+		DecorationName = cfg.DecorationName or nil,
+		-- Sapling support: IsSaplingItem flags the preset as a sapling for the
+		-- inventory UI; TreeType identifies what tree it grows into (consumed by
+		-- SaplingHandler via its SAPLING_TO_TREE map).
+		IsSaplingItem = cfg.IsSaplingItem or nil,
+		TreeType = cfg.TreeType or nil,
 	}
 	
 	-- Back-compat shim: if the manifest declares ColorCycle behavior, also set
@@ -150,6 +239,17 @@ local function buildPreset(setName, blockName, cfg)
 		Category = true, DisplayName = true, Material = true, MaterialVariant = true,
 		Color = true, DefaultColor = true, Shape = true, SortPriority = true, ApplyColor = true,
 		Behavior = true,
+		-- Set-level fields that shouldn't pass through to per-block presets:
+		Tab = true, TabIcon = true,
+		-- Variant-expansion fields (handled by the caller, not the per-preset row):
+		PaletteSubset = true, NamePattern = true, ColorOverrides = true,
+		-- Decoration / sapling fields (handled inline above; don't pass through
+		-- as random extra preset keys):
+		IsDecoration = true, DecorationName = true,
+		IsSaplingItem = true, TreeType = true,
+		-- StripeColorMode + BaseBlock DO pass through; the block-creation pipeline
+		-- reads StripeColorMode to know how to tint, and BaseBlock identifies the
+		-- unlock group for variant presets.
 	}
 	for k, v in pairs(cfg) do
 		if not KNOWN_FIELDS[k] and preset[k] == nil then
@@ -164,14 +264,17 @@ end
 -- PUBLIC API
 -- ============================================
 
--- Walk RewardSets and return an array of preset tables for every block
+-- Walk RewardSets and return an array of preset tables for every block.
+-- Also returns themed-pack tab info as a second return value:
+--   { { Name = "Candy", IconBlockName = "CandyBricks", SetName = "CandyBlocks" }, ... }
 function RewardBlockPresets.Generate()
 	local results = {}
+	local themedTabs = {}     -- list of { Name, IconBlockName, SetName }
+	local seenThemedTabs = {} -- dedupe by tab name in case two sets share one
 	
 	local setsFolder = ReplicatedStorage:FindFirstChild("RewardSets")
 	if not setsFolder then
-		-- Not an error - folder doesn't exist yet
-		return results
+		return results, themedTabs
 	end
 	
 	local modelsFolder = ReplicatedStorage:FindFirstChild("RewardModels")
@@ -205,6 +308,17 @@ function RewardBlockPresets.Generate()
 		end
 		
 		local defaults = manifest.Defaults
+		local manifestTab = manifest.Tab  -- set-level themed-pack tab name (or nil)
+		
+		-- Record themed-pack tab if this set declares one
+		if manifestTab and not seenThemedTabs[manifestTab] then
+			seenThemedTabs[manifestTab] = true
+			table.insert(themedTabs, {
+				Name = manifestTab,
+				IconBlockName = manifest.TabIcon,  -- may be nil; consumer should fall back
+				SetName = setName,
+			})
+		end
 		
 		-- Generate one preset per block listed in the manifest
 		for blockName, blockCfg in pairs(manifest.Blocks) do
@@ -218,9 +332,56 @@ function RewardBlockPresets.Generate()
 			end
 			
 			local merged = applyDefaults(blockCfg, defaults)
-			local preset = buildPreset(setName, blockName, merged)
-			if preset then
-				table.insert(results, preset)
+			
+			-- PaletteSubset: expand into N variant presets, one per color, the way
+			-- Concrete works. The original (uncolored) preset is suppressed; only
+			-- the variants appear in the inventory.
+			if merged.PaletteSubset then
+				local ColorPalette = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("ColorPalette"))
+				local entries = resolvePaletteSubset(merged.PaletteSubset, ColorPalette, setName, blockName, merged.ColorOverrides)
+				local namePattern = merged.NamePattern or "{color} {base}"
+				local baseDisplayName = merged.DisplayName or autoSpace(blockName)
+				local basePriority = merged.SortPriority or 500
+				
+				for _, entry in ipairs(entries) do
+					-- Build a per-variant config: variant Id, name, color, and a
+					-- SortPriority that interleaves variants alongside the base sort
+					-- order (base*100 + paletteIndex) so all colors of a block group
+					-- together AND respect the palette's display order.
+					local variantCfg = {}
+					for k, v in pairs(merged) do variantCfg[k] = v end
+					variantCfg.PaletteSubset = nil
+					variantCfg.NamePattern = nil
+					variantCfg.DefaultColor = entry.color3
+					variantCfg.SortPriority = basePriority * 100 + entry.index
+					variantCfg.BaseBlock = blockName  -- unlock check looks at base, not variant
+					-- Per-color display name: custom > pattern > derived
+					if entry.displayName then
+						variantCfg.DisplayName = entry.displayName
+					else
+						local humanColor = (entry.colorName:gsub("(%l)(%u)", "%1 %2"))
+						local name = namePattern:gsub("{color}", humanColor):gsub("{base}", baseDisplayName)
+						variantCfg.DisplayName = name
+					end
+					
+					local variantId = blockName .. "_" .. entry.colorName
+					local preset = buildPreset(setName, variantId, variantCfg, manifestTab)
+					if preset then
+						-- Override BlockModelName: variants share the SAME template, only
+						-- the preset Id and color differ. buildPreset defaulted this to
+						-- variantId (which doesn't exist on disk) — fix that.
+						preset.BlockModelName = blockName
+						preset.IsVariant = true
+						preset.VariantColorName = entry.colorName
+						table.insert(results, preset)
+					end
+				end
+			else
+				-- Single preset, no expansion
+				local preset = buildPreset(setName, blockName, merged, manifestTab)
+				if preset then
+					table.insert(results, preset)
+				end
 			end
 		end
 		
@@ -233,7 +394,7 @@ function RewardBlockPresets.Generate()
 		end
 	end
 	
-	return results
+	return results, themedTabs
 end
 
 return RewardBlockPresets

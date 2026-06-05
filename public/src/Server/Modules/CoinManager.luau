@@ -35,6 +35,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local CoinConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("CoinConfig"))
+local ModConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("ModConfig"))
 local LootConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("DailyRewardLootConfig"))
 local RewardSetPicker = require(ReplicatedStorage:WaitForChild("RewardSetPicker"))
 
@@ -63,6 +64,55 @@ local function playerHasPlus(userId: number): boolean
 	if not pm then return false end
 	local ok, result = pcall(pm.HasPlus, userId)
 	return ok and result == true
+end
+
+-- ============================================
+-- ANALYTICS (coin faucet / sink logging)
+-- ============================================
+-- Lazy handle to AnalyticsEvents (sibling module). Required on first use so
+-- module load order never matters; cached after first success. Fully optional —
+-- if the module is missing or HTTP is disabled, coin logging silently no-ops.
+local _AnalyticsEvents = nil
+local _analyticsTried = false
+local function getAnalyticsEvents()
+	if _AnalyticsEvents then return _AnalyticsEvents end
+	if _analyticsTried then return nil end
+	_analyticsTried = true
+	local sibling = script.Parent:FindFirstChild("AnalyticsEvents")
+	if not sibling then return nil end
+	local ok, mod = pcall(require, sibling)
+	if ok then
+		_AnalyticsEvents = mod
+		return _AnalyticsEvents
+	end
+	warn("[CoinManager] Failed to require AnalyticsEvents:", mod)
+	return nil
+end
+
+-- Collapse a detailed coin `reason` into a coarse source bucket so the analytics
+-- dashboard groups cleanly (e.g. "daily_reward_w2_d5" -> "daily_reward").
+local function coarseCoinSource(reason: string?): string
+	if type(reason) ~= "string" or reason == "" then return "unknown" end
+	if reason:find("^daily_reward") then return "daily_reward" end
+	if reason:find("^achievement") then return "achievement" end
+	if reason:find("^community") then return "community" end
+	if reason:find("^vote_from") then return "likes" end
+	return reason
+end
+
+-- Fire a coin faucet/sink event (fire-and-forget). Resolves a username because
+-- the Worker requires a non-empty one even though we key analytics on userId.
+local function logCoinFlow(userId: number, direction: string, amount: number, reason: string?)
+	local ae = getAnalyticsEvents()
+	if not ae then return end
+	local player = Players:GetPlayerByUserId(userId)
+	local username = player and player.Name or ("User" .. tostring(userId))
+	ae.Post("coin_" .. direction, {
+		userId = userId,
+		username = username,
+		amount = amount,
+		source = coarseCoinSource(reason),
+	})
 end
 
 local CoinManager = {}
@@ -120,7 +170,11 @@ local function createDefaultData()
 		dailyCoinStreak = 0,
 		unlockedRewardSets = {},
 		unlockedBlocks = {},
-		
+
+		-- Coin-purchased mods (id -> true). Buying a mod also grants its blocks
+		-- into unlockedBlocks, so the inventory un-gating reuses the reward path.
+		ownedMods = {},
+
 		-- Achievement progress
 		achievements = {},
 		
@@ -271,6 +325,9 @@ function CoinManager.AddCoins(userId: number, amount: number, reason: string?): 
 	for _, callback in ipairs(OnCoinsChangedCallbacks) do
 		task.spawn(callback, userId, data.coins, amount, reason or "unknown")
 	end
+
+	-- Analytics: coin faucet (earn)
+	logCoinFlow(userId, "earn", amount, reason)
 	
 	return true
 end
@@ -295,6 +352,9 @@ function CoinManager.SpendCoins(userId: number, amount: number, reason: string?)
 	for _, callback in ipairs(OnCoinsChangedCallbacks) do
 		task.spawn(callback, userId, data.coins, -amount, reason or "purchase")
 	end
+
+	-- Analytics: coin sink (spend)
+	logCoinFlow(userId, "spend", amount, reason)
 	
 	return true
 end
@@ -303,6 +363,134 @@ end
 function CoinManager.CanAfford(userId: number, amount: number): boolean
 	if not PlayerData[userId] then return false end
 	return PlayerData[userId].coins >= amount
+end
+
+-- ============================================
+-- MODS (coin-purchased content bundles)
+-- See ModConfig for definitions. A mod is bought once; buying it marks the mod
+-- owned and grants every block Id in mod.grants into unlockedBlocks (reusing the
+-- exact reward-block unlock path, including Unlocked_<BlockId> attributes and the
+-- NotifyNewBlocks badge push).
+-- ============================================
+
+-- Does the player own this mod?
+function CoinManager.OwnsMod(userId: number, modId: string): boolean
+	local data = PlayerData[userId]
+	if not data or not data.ownedMods then return false end
+	return data.ownedMods[modId] == true
+end
+
+-- Return a shallow copy of the player's owned-mods set { [modId] = true }.
+function CoinManager.GetOwnedMods(userId: number): { [string]: boolean }
+	local data = PlayerData[userId]
+	if not data or not data.ownedMods then return {} end
+	local out = {}
+	for modId, owned in pairs(data.ownedMods) do
+		if owned then out[modId] = true end
+	end
+	return out
+end
+
+-- Grant a mod to a player WITHOUT charging coins (used by PurchaseMod after a
+-- successful spend, and available for admin gifts). Marks the mod owned, unlocks
+-- its grant blocks, applies runtime attributes + NEW badges, and persists.
+-- Returns (ok, message, grantedBlockIds, alreadyOwned).
+function CoinManager.GrantMod(userId: number, modId: string): (boolean, string, {string}?, boolean?)
+	local data = PlayerData[userId]
+	if not data then
+		return false, "player data not loaded", nil, nil
+	end
+	local mod = ModConfig.GetById(modId)
+	if not mod then
+		return false, "unknown mod: " .. tostring(modId), nil, nil
+	end
+
+	data.ownedMods = data.ownedMods or {}
+	data.unlockedBlocks = data.unlockedBlocks or {}
+
+	local alreadyOwned = data.ownedMods[modId] == true
+	data.ownedMods[modId] = true
+
+	-- Grant each block the mod unlocks (skip ones already owned)
+	local grantedBlockIds = {}
+	for _, blockId in ipairs(mod.grants or {}) do
+		if not data.unlockedBlocks[blockId] then
+			data.unlockedBlocks[blockId] = true
+			table.insert(grantedBlockIds, blockId)
+		end
+	end
+
+	-- Apply runtime attributes + push NEW badges if the player is online
+	local player = Players:GetPlayerByUserId(userId)
+	if player then
+		for _, blockId in ipairs(grantedBlockIds) do
+			player:SetAttribute("Unlocked_" .. blockId, true)
+		end
+		if #grantedBlockIds > 0 then
+			local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+			local notify = remotes and remotes:FindFirstChild("NotifyNewBlocks")
+			if notify then
+				notify:Fire(player, grantedBlockIds)
+			end
+		end
+	end
+
+	DataDirty[userId] = true
+	-- Persist immediately so the grant survives a crash before the next save
+	CoinManager.SavePlayerData(userId)
+
+	local message = string.format("'%s' granted to userId=%d (+%d blocks, alreadyOwned=%s)",
+		mod.name or modId, userId, #grantedBlockIds, tostring(alreadyOwned))
+	print("[CoinManager] mod grant: " .. message)
+	return true, message, grantedBlockIds, alreadyOwned
+end
+
+-- Attempt to buy a mod with coins. Validates availability + ownership, applies
+-- the Roblox Plus coin discount, spends, then grants. Returns (ok, message, newBalance).
+function CoinManager.PurchaseMod(userId: number, modId: string): (boolean, string, number)
+	local data = PlayerData[userId]
+	if not data then
+		return false, "Data not loaded", 0
+	end
+	local mod = ModConfig.GetById(modId)
+	if not mod then
+		return false, "Unknown mod", data.coins
+	end
+	if mod.available ~= true then
+		return false, "Not available yet", data.coins
+	end
+
+	data.ownedMods = data.ownedMods or {}
+	if data.ownedMods[modId] then
+		return false, "Already owned", data.coins
+	end
+
+	-- Apply the Plus coin discount (rounds down, same as the rest of the economy).
+	local basePrice = tonumber(mod.coinPrice) or 0
+	local finalPrice = basePrice
+	local pm = getPlusManager()
+	if pm then
+		local ok, discounted = pcall(pm.GetDiscountedPrice, userId, basePrice)
+		if ok and type(discounted) == "number" then
+			finalPrice = discounted
+		end
+	end
+
+	if finalPrice > 0 and data.coins < finalPrice then
+		return false, "Not enough coins", data.coins
+	end
+
+	if finalPrice > 0 then
+		local spent = CoinManager.SpendCoins(userId, finalPrice, "mod_" .. modId)
+		if not spent then
+			return false, "Purchase failed", data.coins
+		end
+	end
+
+	CoinManager.GrantMod(userId, modId)
+	print(string.format("[CoinManager] mod purchase: userId=%d bought '%s' for %d coins (base %d)",
+		userId, mod.name or modId, finalPrice, basePrice))
+	return true, "Purchased!", data.coins
 end
 
 -- ============================================
@@ -348,6 +536,89 @@ function CoinManager.ApplyUnlockAttributesToPlayer(player: Player)
 	if count > 0 then
 		print(string.format("[CoinManager] Applied %d unlock attribute(s) to %s", count, player.Name))
 	end
+end
+
+-- ============================================
+-- ADMIN GIFTS / GRANTS
+-- ============================================
+-- Grant an entire RewardSet (and all of its blocks) to a player. Designed for
+-- the owner gift commands in BetaAdminCommands. The recipient must be on this
+-- server so we can apply Unlocked_<BlockId> attributes and refresh their
+-- inventory immediately; granting to a player whose data is held by another
+-- server would race with that server's writes.
+--
+-- Returns: (ok, message, grantedBlockIds, alreadyOwnedSet)
+--   ok               : true on success (set is now marked owned)
+--   message          : human-readable summary for logs / UI
+--   grantedBlockIds  : list of NEW block IDs added this call (may be empty)
+--   alreadyOwnedSet  : true if the set was already marked owned before this call
+function CoinManager.GrantRewardSet(userId: number, setName: string): (boolean, string, {string}?, boolean?)
+	if type(userId) ~= "number" or type(setName) ~= "string" or setName == "" then
+		return false, "invalid args", nil, nil
+	end
+	
+	local data = PlayerData[userId]
+	if not data then
+		return false, "player data not loaded (recipient must be on this server)", nil, nil
+	end
+	
+	-- Resolve set from ReplicatedStorage.RewardSets (case-insensitive match on folder name)
+	local target = nil
+	for _, info in ipairs(RewardSetPicker.GetAllSets()) do
+		if string.lower(info.name) == string.lower(setName) then
+			target = info
+			break
+		end
+	end
+	if not target then
+		return false, "unknown reward set: " .. setName, nil, nil
+	end
+	
+	data.unlockedRewardSets = data.unlockedRewardSets or {}
+	data.unlockedBlocks = data.unlockedBlocks or {}
+	
+	local alreadyOwnedSet = data.unlockedRewardSets[target.name] == true
+	data.unlockedRewardSets[target.name] = true
+	
+	-- Grant each block in the set (skip ones already owned)
+	local grantedBlockIds = {}
+	for _, blockId in ipairs(target.grants) do
+		if not data.unlockedBlocks[blockId] then
+			data.unlockedBlocks[blockId] = true
+			table.insert(grantedBlockIds, blockId)
+		end
+	end
+	
+	-- Apply runtime attributes + push NEW badges if player is online
+	local player = Players:GetPlayerByUserId(userId)
+	if player then
+		for _, blockId in ipairs(grantedBlockIds) do
+			player:SetAttribute("Unlocked_" .. blockId, true)
+		end
+		if #grantedBlockIds > 0 then
+			local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+			local notify = remotes and remotes:FindFirstChild("NotifyNewBlocks")
+			if notify then
+				notify:Fire(player, grantedBlockIds)
+			end
+		end
+	end
+	
+	-- Persist immediately so the grant survives a crash before the next normal save
+	CoinManager.SavePlayerData(userId)
+	
+	local message
+	if alreadyOwnedSet and #grantedBlockIds == 0 then
+		message = string.format("'%s' already fully owned by userId=%d", target.name, userId)
+	elseif alreadyOwnedSet then
+		message = string.format("'%s' re-granted to userId=%d (+%d new blocks)", target.name, userId, #grantedBlockIds)
+	else
+		message = string.format("'%s' (%s) granted to userId=%d (+%d blocks)",
+			target.name, target.rarity or "Common", userId, #grantedBlockIds)
+	end
+	
+	print("[CoinManager] gift: " .. message)
+	return true, message, grantedBlockIds, alreadyOwnedSet
 end
 
 -- ============================================

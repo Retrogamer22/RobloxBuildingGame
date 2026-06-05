@@ -41,7 +41,9 @@ local NatureBlocks = {
 	["Sandstone"] = true,
 	["Gravel"] = true,
 	["PathBlock"] = true,
-	["Leaves"] = true,
+	["OakLeaves"] = true,
+	["BirchLeaves"] = true,
+	["SpruceLeaves"] = true,
 	["OakLog"] = true,
 	["SpruceLog"] = true,
 	["BirchLog"] = true,
@@ -50,6 +52,7 @@ local NatureBlocks = {
 	["HayBale"] = true,
 	["SnowBlock"] = true,
 	["SnowLayer"] = true,
+	["SoulSand"] = true,
 }
 
 -- Wiring blocks (pistons, buttons, plates, lamps, logic gates)
@@ -70,6 +73,10 @@ local SkipAutoPreset = {
 	["Vine"] = true,
 	["VineTrimmed"] = true,
 	["VineTrimmedEnd"] = true,
+	["VineHalf"] = true,
+	-- SugarCaneTrimmed is registered as an explicit hidden decoration preset below
+	-- (only obtainable via Shears), so skip the auto-decoration pass for it.
+	["SugarCaneTrimmed"] = true,
 	["ColumnTorch"] = true,
 	-- Column pieces (manually registered as single "Column" preset)
 	["ColumnSingle"] = true,
@@ -133,7 +140,9 @@ local SkipVariants = {
 	["OakLogHollow"] = true,
 	["SpruceLogHollow"] = true,
 	["BirchLogHollow"] = true,
-	["Leaves"] = true,
+	["OakLeaves"] = true,
+	["BirchLeaves"] = true,
+	["SpruceLeaves"] = true,
 	["GrassBlock"] = true,
 	["SnowyGrassBlock"] = true,
 	["PathBlock"] = true,
@@ -147,6 +156,7 @@ local SkipVariants = {
 	["HayBale"] = true,
 	["SnowBlock"] = true,
 	["SnowLayer"] = true,
+	["SoulSand"] = true, -- nether-style sand: no stair/slab variants
 	-- Wiring/Redstone blocks
 	["Piston"] = true,
 	["StickyPiston"] = true,
@@ -237,6 +247,11 @@ local BedBlocks = {}
 -- Blocks that are chests (wood-colored chest models) - populated dynamically
 local ChestBlocks = {}
 
+-- Paint Mod: paint cans (single PaintCan model tinted per color) - populated dynamically
+local PaintCanBlocks = {}
+-- Paint Mod: primer cans (subset of PaintCanBlocks that cover instead of recolor)
+local PrimerPaintCanBlocks = {}
+
 -- Blocks that are crafting tables (wood-colored with leather tint) - populated dynamically
 local CraftingTableBlocks = {}
 
@@ -326,6 +341,8 @@ local DecorationPlacementRestrictions = {
 	["DarkOakSapling"] = { "Dirt", "GrassBlock" },
 	["EbonySapling"] = { "Dirt", "GrassBlock" },
 	["RedwoodSapling"] = { "Dirt", "GrassBlock" },
+	-- Candy reward sapling (Step 5) ΓÇö same restriction.
+	["CandyCaneSapling"] = { "Dirt", "GrassBlock" },
 }
 
 -- Color palette for customization
@@ -806,10 +823,19 @@ local function generatePresets()
 	-- ========================================
 	-- TOOLS -> Items category
 	-- ========================================
+	-- Buckets handled manually below (water/lava system) — skip them here so
+	-- we don't get duplicate presets that miss the IsWaterBucket / IsLavaBucket
+	-- / IsEmptyBucket flags and HideFromInventory gating.
+	local SkipToolPreset = {
+		["WaterBucket"] = true,
+		["EmptyBucket"] = true,
+		["LavaBucket"] = true,
+	}
 	local toolsFolder = ReplicatedStorage:FindFirstChild("Tools")
 	if toolsFolder then
 		for _, tool in ipairs(toolsFolder:GetChildren()) do
 			local toolName = tool.Name
+			if SkipToolPreset[toolName] then continue end
 			local displayName = formatName(toolName)
 			local color, material = extractBlockProperties(tool)
 			
@@ -835,7 +861,10 @@ local function generatePresets()
 	end
 	
 	-- ========================================
-	-- WATER BUCKETS -> Items category
+	-- WATER & LAVA BUCKETS -> Items category
+	-- Models live in ReplicatedStorage.Tools. The Tools auto-loop above skips
+	-- these IDs so the manual presets below (which carry the IsWaterBucket /
+	-- IsLavaBucket / IsEmptyBucket flags) are the canonical entries.
 	-- ========================================
 	
 	-- Water Bucket: places a water source block
@@ -846,14 +875,15 @@ local function generatePresets()
 		Shape = "Block",
 		Material = Enum.Material.Metal,
 		DefaultColor = Color3.fromRGB(60, 120, 220),
-		UseBlockModel = false,
+		UseBlockModel = true,
+		BlockModelName = "WaterBucket",
+		BlockModelFolder = "Tools",
 		IsTool = true,
 		IsWaterBucket = true,
 		SortPriority = 50,
-		HideFromInventory = true, -- Hidden until water system is fully polished
 	})
 	
-	-- Empty Bucket: picks up a water source block
+	-- Empty Bucket: picks up a water OR lava source block (handler decides)
 	table.insert(presets, {
 		Id = "EmptyBucket",
 		Name = "Empty Bucket",
@@ -861,11 +891,194 @@ local function generatePresets()
 		Shape = "Block",
 		Material = Enum.Material.Metal,
 		DefaultColor = Color3.fromRGB(180, 180, 180),
-		UseBlockModel = false,
+		UseBlockModel = true,
+		BlockModelName = "EmptyBucket",
+		BlockModelFolder = "Tools",
 		IsTool = true,
 		IsEmptyBucket = true,
 		SortPriority = 51,
-		HideFromInventory = true, -- Hidden until water system is fully polished
+	})
+	
+	-- Lava Bucket: places a lava source block
+	table.insert(presets, {
+		Id = "LavaBucket",
+		Name = "Lava Bucket",
+		Category = "Items",
+		Shape = "Block",
+		Material = Enum.Material.Metal,
+		DefaultColor = Color3.fromRGB(255, 110, 30),
+		UseBlockModel = true,
+		BlockModelName = "LavaBucket",
+		BlockModelFolder = "Tools",
+		IsTool = true,
+		IsLavaBucket = true,
+		SortPriority = 52,
+	})
+	
+	-- ========================================
+	-- PAINT MOD: Paint Cans -> Paint category
+	-- ========================================
+	-- One can per ColorPalette color, all sharing the single PaintCan model
+	-- (Mods/PaintMod/PaintCan). The can body keeps its modeled look; only the PaintColor
+	-- union is tinted, handled by PaintCanVisual on place/load. UseBlockModel=true with NO
+	-- ApplyColor so the generic whole-model tint is skipped.
+	for _, entry in ipairs(ColorPalette.getColorsOrdered()) do
+		local canId = entry.name .. "PaintCan"
+		PaintCanBlocks[canId] = true
+		-- "LightBlue" -> "Light Blue Paint Can"
+		local canDisplay = entry.name:gsub("(%l)(%u)", "%1 %2") .. " Paint Can"
+		table.insert(presets, {
+			Id = canId,
+			Name = canDisplay,
+			Category = "Paint",
+			Shape = "Block",
+			Material = Enum.Material.SmoothPlastic,
+			DefaultColor = entry.color,
+			UseBlockModel = true,
+			BlockModelFolder = "Mods/PaintMod",
+			BlockModelName = "PaintCanModel", -- placed/ground can (Can/Paint/Wrapper); PaintCan is the held/inventory model
+			IsPaintCan = true,
+		})
+	end
+	
+	-- Primer Paint Cans: one per color, using the PrimerPaintCanModel. Same as regular cans but
+	-- flagged PaintIsPrimer so the brush covers (fades in the concrete texture) instead of just
+	-- recoloring. Hidden from the catalog -- players obtain primer cans from the Paint Mixer, not
+	-- the tab -- but registered so placement/save/load and the mixer output treat them as cans.
+	for _, entry in ipairs(ColorPalette.getColorsOrdered()) do
+		local canId = entry.name .. "PrimerPaintCan"
+		PaintCanBlocks[canId] = true
+		PrimerPaintCanBlocks[canId] = true
+		local canDisplay = entry.name:gsub("(%l)(%u)", "%1 %2") .. " Primer Can"
+		table.insert(presets, {
+			Id = canId,
+			Name = canDisplay,
+			Category = "Paint",
+			Shape = "Block",
+			Material = Enum.Material.SmoothPlastic,
+			DefaultColor = entry.color,
+			UseBlockModel = true,
+			BlockModelFolder = "Mods/PaintMod",
+			BlockModelName = "PrimerPaintCanModel",
+			IsPaintCan = true,
+			IsPrimerCan = true,
+			HideFromInventory = true, -- obtained via the mixer, not the catalog
+		})
+	end
+	
+	-- Mixer carrier cans: the Paint Mixer produces ANY color, so it can't map to a per-color
+	-- preset. Instead it grants one of these four generic carriers and overrides the inventory
+	-- slot's Color to the mixed shade. Primer flag + paint mode are encoded by WHICH carrier
+	-- (so the color rides the slot, primer/mode ride the preset -- no inventory-shape change).
+	-- Placement stamps PaintIsPrimer + PaintMode + CustomColorR/G/B from these so the brush and
+	-- save/load behave exactly like a hand-placed can. Hidden from the catalog.
+	for _, carrier in ipairs({
+		{ Id = "MixedPaintCan",            Name = "Paint Can",        Model = "PaintCanModel",       Primer = false, Mode = "blend" },
+		{ Id = "MixedPaintCanMatch",       Name = "Paint Can",        Model = "PaintCanModel",       Primer = false, Mode = "match" },
+		{ Id = "MixedPrimerPaintCan",      Name = "Primer Can",       Model = "PrimerPaintCanModel", Primer = true,  Mode = "blend" },
+		{ Id = "MixedPrimerPaintCanMatch", Name = "Primer Can",       Model = "PrimerPaintCanModel", Primer = true,  Mode = "match" },
+	}) do
+		PaintCanBlocks[carrier.Id] = true
+		if carrier.Primer then PrimerPaintCanBlocks[carrier.Id] = true end
+		table.insert(presets, {
+			Id = carrier.Id,
+			Name = carrier.Name,
+			Category = "Paint",
+			Shape = "Block",
+			Material = Enum.Material.SmoothPlastic,
+			DefaultColor = Color3.fromRGB(200, 200, 200), -- fallback; the slot Color override sets the real shade
+			UseBlockModel = true,
+			BlockModelFolder = "Mods/PaintMod",
+			BlockModelName = carrier.Model,
+			IsPaintCan = true,
+			IsPrimerCan = carrier.Primer or nil,
+			IsMixedCan = true,         -- placement stamps CustomColorR/G/B for these
+			PaintMode = carrier.Mode,  -- placement stamps PaintMode (brush reads it off the can)
+			HideFromInventory = true,  -- granted by the mixer, never shown in the catalog
+		})
+	end
+	
+	-- Empty Paint Can: the "blank" can (mixer input + plain placeable can). Lives in the Paint
+	-- tab next to the colored cans. Registered as a paint can so placement/save/load treat it
+	-- like the others; IsEmptyCan makes it render with no paint swatch.
+	PaintCanBlocks["EmptyPaintCan"] = true
+	table.insert(presets, {
+		Id = "EmptyPaintCan",
+		Name = "Empty Paint Can",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(200, 200, 200),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintCanModel",
+		IsPaintCan = true,
+		IsEmptyCan = true,
+	})
+	
+	-- Paint Brush: held tool that loads color from a placed can and paints anything.
+	-- NOT IsTool: keep it a preset item so GetSelectedBlock returns it (the brush engine
+	-- checks IsPaintbrush) and the hotbar renders it via the model path. placeBlock suppresses
+	-- placement on IsPaintbrush, so it never drops a block.
+	table.insert(presets, {
+		Id = "PaintBrush",
+		Name = "Paint Brush",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(205, 205, 205),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintBrush",
+		IsPaintbrush = true,
+	})
+	
+	-- Sponge: held tool that steps painted blocks backwards (flat -> painted -> default).
+	-- Same NOT-IsTool treatment as the brush so GetSelectedBlock returns it and the hotbar
+	-- renders the model; placeBlock suppresses placement on IsSponge so it never drops a block.
+	table.insert(presets, {
+		Id = "Sponge",
+		Name = "Sponge",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(230, 220, 120),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "Sponge",
+		IsSponge = true,
+	})
+	
+	-- Paint Swatch: empty held item. Right-click a block to capture its visible color; load it
+	-- into the mixer to pre-fill the color sliders. The swatch's six face-textures get tinted to
+	-- the captured color (PaintCanVisual.ApplySwatch). Not consumed by the mixer. NOT IsTool so
+	-- GetSelectedBlock returns it; placeBlock suppresses placement on IsSwatch.
+	table.insert(presets, {
+		Id = "PaintSwatch",
+		Name = "Paint Swatch",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(185, 185, 185),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintSwatch",
+		IsSwatch = true,
+	})
+	
+	-- Paint Mixer: placeable block; interacting with the placed mixer opens the color picker
+	-- (wired up with the mixer system).
+	table.insert(presets, {
+		Id = "PaintMixer",
+		Name = "Paint Mixer",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(150, 150, 150),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintMixer",
+		IsPaintMixer = true,
 	})
 	
 	-- ========================================
@@ -1590,8 +1803,87 @@ local function generatePresets()
 				HideFromInventory = true, -- Only obtainable via Shears
 			})
 		end
+
+		-- VineHalf: hidden preset (auto-selected when a vine is placed on a host whose
+		-- face is only filled in its bottom half, e.g. a bottom slab or open stair front).
+		-- Never placeable directly; the placement/spread/load paths swap a "Vine" for this
+		-- variant via VineHalfReconciler. IsVine = true so it saves/loads & climbs like a
+		-- normal vine; it still spreads (NOT IsVineTrimmed).
+		local vineHalfModel = decorationsFolder:FindFirstChild("VineHalf")
+		if vineHalfModel then
+			local c, m = extractBlockProperties(vineHalfModel)
+			table.insert(presets, {
+				Id = "VineHalf",
+				Name = "Vine (Half)",
+				Category = "Decoration",
+				Shape = "Block",
+				Material = m,
+				DefaultColor = c,
+				UseBlockModel = true,
+				BlockModelName = "VineHalf",
+				BlockModelFolder = "Decorations",
+				IsVine = true,
+				IsVineHalf = true,
+				ApplyColor = false,
+				HideFromInventory = true, -- Auto-selected, never placed directly
+			})
+		end
+
+		-- SugarCaneTrimmed: hidden decoration preset (created by Shears, not placeable
+		-- directly). IsDecoration so it saves/loads through the decoration path; the
+		-- SugarCaneHandler growth system skips it (and counts it toward column height).
+		local sugarCaneTrimmedModel = decorationsFolder:FindFirstChild("SugarCaneTrimmed")
+		if sugarCaneTrimmedModel then
+			local c, m = extractBlockProperties(sugarCaneTrimmedModel)
+			table.insert(presets, {
+				Id = "SugarCaneTrimmed",
+				Name = "Sugar Cane (Trimmed)",
+				Category = "Decoration",
+				Shape = "Decoration",
+				Material = m,
+				DefaultColor = c,
+				UseBlockModel = false, -- decorations load from the Decorations folder
+				IsDecoration = true,
+				DecorationName = "SugarCaneTrimmed",
+				HideFromInventory = true, -- Only obtainable via Shears
+			})
+		end
 	end
 	
+	-- ========================================
+	-- SHEARED BRANCHES (Shears strip the leaves) -> Nature category
+	-- ========================================
+	-- Each per-type leaf block (OakLeaves/BirchLeaves/SpruceLeaves) doubles as a
+	-- "branches" block: Shears remove the "Leaves" parts in place, leaving the
+	-- "Branches" parts, and relabel it "<Wood>Branches". There is no separate
+	-- template -- the preset reuses the leaf model and the load path strips the
+	-- "Leaves" parts wherever BranchesOnly is set (see BlockPresets.StripLeaves).
+	-- Hidden from the catalog (only obtainable via Shears). ApplyColor stays false so
+	-- the branches keep their own greyscale-texture tint instead of a leaf colour.
+	if blocksFolder then
+		for _, leafModel in ipairs(blocksFolder:GetChildren()) do
+			local leafName = leafModel.Name
+			if string.match(leafName, "Leaves$") then
+				local branchName = (leafName:gsub("Leaves$", "Branches"))
+				local bColor, bMaterial, bMaterialVariant = extractBlockProperties(leafModel)
+				table.insert(presets, {
+					Id = branchName,
+					Name = formatName(branchName),
+					Category = "Nature",
+					Shape = "Block",
+					Material = bMaterial,
+					MaterialVariant = bMaterialVariant,
+					DefaultColor = bColor,
+					UseBlockModel = true,
+					BlockModelName = leafName, -- reuse the leaf template
+					BranchesOnly = true,       -- load path strips the "Leaves" parts
+					ApplyColor = false,        -- keep the branches' own tint
+					HideFromInventory = true,  -- only obtainable via Shears
+				})
+			end
+		end
+	end
+
 	-- ========================================
 	-- COLUMNS -> Building category
 	-- ========================================
@@ -2042,15 +2334,27 @@ end
 -- Generate presets at module load
 local Presets = generatePresets()
 
--- Append auto-generated reward block presets (from ReplicatedStorage.RewardSets)
+-- Append auto-generated reward block presets (from ReplicatedStorage.RewardSets).
+-- Generate() returns (presets, themedTabs); the latter is a list of themed-pack
+-- tabs declared by manifests (e.g. Candy), which the inventory renders as right-
+-- side tabs gated by player unlocks.
+local ThemedPackTabs = {}
 local rewardPresetsOk, RewardBlockPresets = pcall(require, ReplicatedStorage:WaitForChild("RewardBlockPresets"))
 if rewardPresetsOk and RewardBlockPresets then
-	local rewardPresets = RewardBlockPresets.Generate()
+	local rewardPresets, themedTabs = RewardBlockPresets.Generate()
 	for _, preset in ipairs(rewardPresets) do
 		table.insert(Presets, preset)
 	end
+	if themedTabs then
+		ThemedPackTabs = themedTabs
+	end
 	if #rewardPresets > 0 then
 		print(string.format("[BlockPresets] Added %d reward-block preset(s) from RewardSets folder", #rewardPresets))
+	end
+	if #ThemedPackTabs > 0 then
+		local names = {}
+		for _, t in ipairs(ThemedPackTabs) do table.insert(names, t.Name) end
+		print(string.format("[BlockPresets] Themed-pack tabs: %s", table.concat(names, ", ")))
 	end
 else
 	warn("[BlockPresets] Could not load RewardBlockPresets module")
@@ -2067,6 +2371,7 @@ local Categories = {
 	{ Name = "Frames", IconBlock = "FrameBlock", IconFolder = "FrameBlocks" },
 	{ Name = "Wiring", IconBlock = "Piston", IconFolder = "Blocks" },
 	{ Name = "Items", IconBlock = "WireTool", IconFolder = "Tools" },
+	{ Name = "Paint", IconBlock = "PaintMixer", IconFolder = "Mods/PaintMod" }, -- Paint Mod tab icon = the mixer
 }
 
 -- Lookup functions
@@ -2155,6 +2460,13 @@ local function GetAllCategories()
 	return Categories
 end
 
+-- Themed-pack tabs (right-side tabs declared by reward-set Manifest.Tab fields).
+-- Returns a list of { Name = "Candy", IconBlockName = "CandyBricks", SetName = "CandyBlocks" }.
+-- The inventory uses this to render dynamic right-side tabs gated by player unlocks.
+local function GetThemedPackTabs()
+	return ThemedPackTabs
+end
+
 local function GetAllColors()
 	return Colors
 end
@@ -2178,11 +2490,26 @@ local function IsGlass(id)
 end
 
 local function IsSapling(id)
-	return SaplingBlocks[id] ~= nil
+	if SaplingBlocks[id] ~= nil then return true end
+	-- Reward-set saplings are tagged via the manifest (IsSaplingItem=true). Consult
+	-- the preset list so SaplingHandler.RegisterSapling fires for them at placement.
+	for _, preset in ipairs(Presets) do
+		if preset.Id == id and preset.IsSaplingItem then
+			return true
+		end
+	end
+	return false
 end
 
 local function GetSaplingTreeType(id)
-	return SaplingBlocks[id]
+	if SaplingBlocks[id] then return SaplingBlocks[id] end
+	-- Reward-set saplings carry TreeType on the preset itself.
+	for _, preset in ipairs(Presets) do
+		if preset.Id == id and preset.TreeType then
+			return preset.TreeType
+		end
+	end
+	return nil
 end
 
 local function IsLadder(id)
@@ -2242,6 +2569,23 @@ end
 
 local function IsChest(id)
 	return ChestBlocks[id] == true
+end
+
+local function IsPaintCan(id)
+	return PaintCanBlocks[id] == true
+end
+
+local function IsPrimerCan(id)
+	return PrimerPaintCanBlocks[id] == true
+end
+
+local function IsSwatch(id)
+	local preset = GetPreset(id)
+	return preset and preset.IsSwatch == true
+end
+
+local function IsPaintMixer(id)
+	return id == "PaintMixer"
 end
 
 local function IsBed(id)
@@ -2305,6 +2649,15 @@ local function IsWater(id)
 	return id == "Water" or id == "WaterSource" or id == "WaterFlowing"
 end
 
+local function IsLavaBucket(id)
+	local preset = GetPreset(id)
+	return preset and preset.IsLavaBucket == true
+end
+
+local function IsLava(id)
+	return id == "Lava" or id == "LavaSource" or id == "LavaFlowing"
+end
+
 -- Get placement restrictions for a decoration
 -- Returns nil if no restrictions (can be placed anywhere)
 -- Returns a table of allowed block types if restricted
@@ -2316,20 +2669,44 @@ end
 -- Returns true if placement is allowed, false otherwise
 local function CanPlaceDecorationOn(decorationId, blockTypeBelow)
 	local restrictions = DecorationPlacementRestrictions[decorationId]
-	
+
 	-- No restrictions means it can be placed on anything
 	if not restrictions then
 		return true
 	end
-	
+
 	-- Check if blockTypeBelow matches any of the allowed types
 	for _, allowedType in ipairs(restrictions) do
 		if blockTypeBelow == allowedType then
 			return true
 		end
 	end
-	
+
 	return false
+end
+
+-- Strip the foliage off a leaf block / leaf-filled frame and reveal its branches.
+-- A leaf block carries two stacked instances named "Branches" and "Leaves" (Texture/Decal
+-- overlays on the block, or dedicated leaf BaseParts). The "Branches" overlay ships
+-- invisible (Transparency 1) so only the leaves show until sheared. Shears -- and the
+-- BranchesOnly load path -- call this to REMOVE every "Leaves" instance AND make the
+-- "Branches" instances visible (Transparency 0). Returns how many leaf instances removed.
+local function StripLeaves(instance)
+	if not instance then return 0 end
+	local removed = 0
+	for _, d in ipairs(instance:GetDescendants()) do
+		if d.Name == "Leaves" and (d:IsA("Texture") or d:IsA("Decal") or d:IsA("BasePart")) then
+			d:Destroy()
+			removed += 1
+		elseif d.Name == "Branches" and (d:IsA("Texture") or d:IsA("Decal") or d:IsA("BasePart")) then
+			-- Branches ship hidden; reveal them now that the leaves are gone.
+			d.Transparency = 0
+			if d:IsA("Texture") or d:IsA("Decal") then
+				d:SetAttribute("BaseTransparency", 0)
+			end
+		end
+	end
+	return removed
 end
 
 return {
@@ -2377,4 +2754,12 @@ return {
 	GetPlacementRestrictions = GetPlacementRestrictions,
 	CanPlaceDecorationOn = CanPlaceDecorationOn,
 	IsRainbow = IsRainbow,
+	GetThemedPackTabs = GetThemedPackTabs,
+	IsLava = IsLava,
+	IsLavaBucket = IsLavaBucket,
+	IsPaintCan = IsPaintCan,
+	IsPaintMixer = IsPaintMixer,
+	IsPrimerCan = IsPrimerCan,
+	IsSwatch = IsSwatch,
+	StripLeaves = StripLeaves,
 }

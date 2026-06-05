@@ -600,4 +600,32 @@ function BiomeConfig.GetBiomeNames()
 	return names
 end
 
+-- Tint a leaf block to `leafColor` WITHOUT recolouring its bark. A leaf block shows
+-- its colour on the part(s) plus a face Texture/Decal overlay; the "Branches" texture
+-- (and any dedicated "Branches" part) keeps its own authored bark tint so that shearing
+-- the leaves reveals correctly-coloured branches. Used on placement (BlockHandler),
+-- on load (SaveManager / MegaPlotSaveManager) and by TreeGenerator.
+function BiomeConfig.TintLeaves(block, leafColor)
+	if not block or not leafColor then return end
+	local function tintPart(part)
+		-- A dedicated "Branches" BasePart (if a model has one) keeps its bark colour.
+		if part.Name ~= "Branches" then
+			part.Color = leafColor
+		end
+		for _, d in ipairs(part:GetChildren()) do
+			-- Tint the leaf face overlay(s) only; leave the "Branches" texture's tint alone.
+			if (d:IsA("Texture") or d:IsA("Decal")) and d.Name ~= "Branches" then
+				d.Color3 = leafColor
+			end
+		end
+	end
+	if block:IsA("BasePart") then
+		tintPart(block)
+	else
+		for _, p in ipairs(block:GetDescendants()) do
+			if p:IsA("BasePart") then tintPart(p) end
+		end
+	end
+end
+
 return BiomeConfig

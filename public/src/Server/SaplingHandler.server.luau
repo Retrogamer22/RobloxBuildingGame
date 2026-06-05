@@ -13,6 +13,10 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local RunService = game:GetService("RunService")
 
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
+local BulkOperationFlags = nil
+pcall(function()
+	BulkOperationFlags = require(ReplicatedStorage:WaitForChild("BulkOperationFlags", 5))
+end)
 
 -- Wait for TreeGenerator module
 local TreeGenerator = nil
@@ -1040,6 +1044,7 @@ local lastCheckTime = tick()
 local lastDebugTime = tick()
 
 RunService.Heartbeat:Connect(function()
+	if BulkOperationFlags and BulkOperationFlags.IsShuttingDown() then return end
 	local currentTime = tick()
 
 	-- Only check every GROWTH_CHECK_INTERVAL seconds

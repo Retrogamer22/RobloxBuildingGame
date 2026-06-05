@@ -12,6 +12,8 @@ local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
 
 local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
+local GlassPlacement = require(ReplicatedStorage:WaitForChild("GlassPlacement", 10))
+local PaintCanVisual = require(ReplicatedStorage:WaitForChild("PaintCanVisual", 10)) -- Paint Mod
 local UITheme = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("UITheme"))
 local BetaConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BetaConfig"))
 local BlockTemplates = ReplicatedStorage:WaitForChild("BlockTemplates", 10)
@@ -429,9 +431,23 @@ local function findTemplate(templateName)
 	return BlockTemplates:FindFirstChild(templateName)
 end
 
-local function setupViewportModel(viewport, templateName, color, material, materialVariant, useBlockModel, blockModelName, isDecoration, decorationName, blockModelFolder, applyColor, leatherTint, isRainbow, stripeColorMode)
+local function setupViewportModel(viewport, templateName, color, material, materialVariant, useBlockModel, blockModelName, isDecoration, decorationName, blockModelFolder, applyColor, leatherTint, isRainbow, stripeColorMode, isEmptyCan, brushLoadedColor, swatchLoadedColor)
 	local worldModel = viewport:FindFirstChild("World")
 	if not worldModel then return nil end
+
+	-- Paint Mod: the inventory/hotbar icon uses the held models -- PaintCan (filled, colored)
+	-- and PaintBrush (empty by default) -- not the ground PaintCanModel. Capture intent, then
+	-- swap the can to its held model for rendering only (placement still uses PaintCanModel).
+	local isPaintCanItem = (blockModelName == "PaintCanModel" or blockModelName == "PaintCan"
+		or blockModelName == "PrimerPaintCanModel" or blockModelName == "PrimerPaintCan")
+	local isPaintBrushItem = (blockModelName == "PaintBrush")
+	local isPaintSwatchItem = (blockModelName == "PaintSwatch")
+	local isPaintSpongeItem = (blockModelName == "Sponge")
+	if blockModelName == "PaintCanModel" then
+		blockModelName = "PaintCan"
+	elseif blockModelName == "PrimerPaintCanModel" then
+		blockModelName = "PrimerPaintCan"
+	end
 	
 	for _, child in ipairs(worldModel:GetChildren()) do
 		child:Destroy()
@@ -612,7 +628,9 @@ local function setupViewportModel(viewport, templateName, color, material, mater
 					local isFrameDoor = blockModelName and blockModelName == "FrameDoor"
 					local isSignStandingFrame = blockModelName and blockModelName == "SignStandingFrame"
 					local isColumn = blockModelName and blockModelName == "ColumnSingle"
-					if isTool then
+					-- Paint Mod: cans/brush render straight-on like tools (not angled like blocks)
+					local isPaintFlatItem = isPaintCanItem or isPaintBrushItem or isPaintSwatchItem or isPaintSpongeItem
+					if isTool or isPaintFlatItem then
 					-- Tools: keep authored orientation (just face camera). Tools should be
 					-- authored at the angle they should display (head upper-left, etc.).
 					-- Adding tilt here would over-rotate already-diagonal tool models.
@@ -768,7 +786,30 @@ local function setupViewportModel(viewport, templateName, color, material, mater
 		end
 	end
 	
+	-- Colored glass icons: the pane is an invisible Part showing tinted face textures,
+	-- so the generic Part-coloring above leaves the swatch grey. Apply the same
+	-- colored-glass styling used in-world (tinted textures + 70% transparency +
+	-- SmoothPlastic) so the icon actually shows the glass color.
+	if color and applyColor and (blockModelName == "GlassPane" or blockModelName == "GlassBlock") then
+		GlassPlacement.StyleColoredGlass(model, color)
+	end
+
 	model.Parent = worldModel
+
+	-- Paint Mod: tint the can icon to its color; render the brush empty (or its loaded color)
+	if isPaintCanItem then
+		PaintCanVisual.ApplyCan(model, color, isEmptyCan == true)
+	elseif isPaintBrushItem then
+		-- Paint is per-brush: render from the slot's own loaded color (passed in), NOT the
+		-- global player attribute -- so a fresh/empty brush shows blank even if another brush
+		-- was loaded. nil = empty brush.
+		PaintCanVisual.ApplyBrush(model, brushLoadedColor, brushLoadedColor ~= nil)
+	elseif isPaintSwatchItem then
+		-- Per-swatch: render from the slot's own captured color (passed in), NOT the global
+		-- attribute -- so an empty swatch shows blank even if another swatch is colored.
+		-- nil = empty (neutral grey, handled inside ApplySwatch).
+		PaintCanVisual.ApplySwatch(model, swatchLoadedColor)
+	end
 
 	-- Apply tool rotation AFTER parenting — UnionOperations in ViewportFrames don't refresh
 	-- their rendered orientation if rotated before being parented to the WorldModel.
@@ -783,7 +824,8 @@ local function setupViewportModel(viewport, templateName, color, material, mater
 		local isDoorModel = blockModelName and (string.find(blockModelName, "Door") ~= nil)
 		local isLadderModel = blockModelName and blockModelName == "Ladder"
 		local isToolModel = blockModelFolder == "Tools"
-		if isToolModel then
+		local isPaintFlatItem = isPaintCanItem or isPaintBrushItem or isPaintSwatchItem or isPaintSpongeItem
+		if isToolModel or isPaintFlatItem then
 			-- Tools: look straight at the flat face (matches hotbar tool rendering)
 			camera.CFrame = CFrame.new(Vector3.new(0, 0, 5), Vector3.new(0, 0, 0))
 		elseif isCandySapling then
@@ -872,7 +914,11 @@ local function setupCategoryIconViewport(viewport, iconBlock, iconFolder)
 		child:Destroy()
 	end
 	
-	local folder = ReplicatedStorage:FindFirstChild(iconFolder)
+	-- iconFolder may be a nested path like "Mods/PaintMod"; walk each segment from ReplicatedStorage.
+	local folder = ReplicatedStorage
+	for _, seg in ipairs(string.split(iconFolder, "/")) do
+		folder = folder and folder:FindFirstChild(seg)
+	end
 	if not folder then return nil end
 	
 	local template = folder:FindFirstChild(iconBlock)
@@ -979,11 +1025,44 @@ local function updateSelection()
 	end
 end
 
+-- Paint Mod: per-brush paint sync -------------------------------------------
+-- Paint is per-brush: each brush slot stores its own loaded color (data.BrushLoaded +
+-- data.Color/BrushIsPrimer/BrushMode). Selecting a brush tells the server to make THAT brush's
+-- paint active; selecting an empty brush clears it. This is what stops a fresh brush from
+-- inheriting the last color, and lets empty brushes stack while loaded ones stay separate.
+local _setBrushRemote = nil
+local function getSetBrushRemote()
+	if _setBrushRemote then return _setBrushRemote end
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	_setBrushRemote = remotes and remotes:FindFirstChild("SetBrushState")
+	return _setBrushRemote
+end
+
+local function syncSelectedBrushToServer()
+	if IsToolSlotSelected then return end
+	local data = Hotbar[CurrentSlot]
+	if not (data and data.PresetId == "PaintBrush") then return end
+	local remote = getSetBrushRemote()
+	if not remote then return end
+	if data.BrushLoaded and data.Color then
+		remote:FireServer({
+			r = math.round(data.Color.R * 255),
+			g = math.round(data.Color.G * 255),
+			b = math.round(data.Color.B * 255),
+			isPrimer = data.BrushIsPrimer and true or false,
+			mode = data.BrushMode or "blend",
+		})
+	else
+		remote:FireServer(nil) -- empty brush -> server clears active paint
+	end
+end
+
 local function selectSlot(slotNumber)
 	IsToolSlotSelected = false
 	CurrentSlot = slotNumber
 	CurrentRotation = 0
 	updateSelection()
+	syncSelectedBrushToServer()
 end
 
 local function selectToolSlot(slotNumber)
@@ -1064,7 +1143,10 @@ local function updateHotbarSlotViewport(slotNumber)
 				preset.ApplyColor,
 				preset.LeatherTint,
 				preset.IsRainbow,
-				preset.StripeColorMode
+				preset.StripeColorMode,
+				preset.IsEmptyCan, -- isEmptyCan: empty cans render the empty model, not the painted one
+				(data.BrushLoaded and data.Color or nil), -- brushLoadedColor: per-slot brush paint
+				(data.SwatchLoaded and data.Color or nil) -- swatchLoadedColor: per-slot swatch color
 			)
 			end
 		end
@@ -1199,9 +1281,13 @@ local function addPresetToHotbar(presetId)
 			end
 		end
 	else
-		-- Check if already in hotbar with room to stack
+		-- Check if already in hotbar with room to stack. A loaded brush/swatch is its own item
+		-- and never receives a merge -- only EMPTY ones stack -- so skip slots already colored.
+		-- (This is also why a new empty brush/swatch starts a fresh stack when you only have
+		-- colored ones: every colored slot is skipped, so it lands in a new slot.)
 		for i = 1, HOTBAR_SLOTS do
-			if Hotbar[i] and Hotbar[i].PresetId == presetId then
+			if Hotbar[i] and Hotbar[i].PresetId == presetId
+				and not Hotbar[i].BrushLoaded and not Hotbar[i].SwatchLoaded then
 				local count = Hotbar[i].Count or 1
 				if count < MAX_STACK then
 					-- Increment existing stack
@@ -1253,6 +1339,67 @@ local function addPresetToHotbar(presetId)
 end
 
 -- ============================================
+-- SPLIT A LOADED PAINT ITEM OFF A STACK (Minecraft-style)
+-- Used when loading a brush from a can or capturing a color with a swatch while a STACK of
+-- empties is selected: peel one off into a new slot and apply the loaded fields to it, leaving
+-- the rest of the stack untouched. A single (Count 1) item is just loaded in place.
+-- loadedFields = extra fields for the loaded item, e.g. { BrushLoaded=true, Color=c, ... }.
+-- ============================================
+local function splitLoadedPaintItem(loadedFields)
+	if IsToolSlotSelected then return end
+	local src = Hotbar[CurrentSlot]
+	if not src then return end
+	local count = src.Count or 1
+
+	-- Single item: load it in place.
+	if count <= 1 then
+		for k, v in pairs(loadedFields) do src[k] = v end
+		src.Count = 1
+		updateHotbarSlotViewport(CurrentSlot)
+		return CurrentSlot
+	end
+
+	-- Stack: peel one off into a new slot. If the hotbar is full, fall back to loading the
+	-- whole stack in place (rare edge -- nowhere to put the split item).
+	local target = findFirstEmptySlot()
+	if not target then
+		for k, v in pairs(loadedFields) do src[k] = v end
+		updateHotbarSlotViewport(CurrentSlot)
+		return CurrentSlot
+	end
+
+	src.Count = count - 1
+	updateHotbarSlotViewport(CurrentSlot)
+
+	local newItem = { PresetId = src.PresetId, Count = 1 }
+	for k, v in pairs(loadedFields) do newItem[k] = v end
+	Hotbar[target] = newItem
+	updateHotbarSlotViewport(target)
+	selectSlot(target) -- equip the freshly loaded item (also syncs brush paint to the server)
+	return target
+end
+
+-- ============================================
+-- GRANT ITEM (stations like the Paint Mixer hand a finished item to the player)
+-- Places into the first empty hotbar slot. Returns true on success, false if the
+-- hotbar is full (caller decides what to do then). Color may be a Color3 override.
+-- ============================================
+local function grantItem(presetId, color, count)
+	local preset = BlockPresets.GetPreset(presetId)
+	if not preset then return false end
+	local slot = findFirstEmptySlot()
+	if not slot then return false end
+	Hotbar[slot] = {
+		PresetId = presetId,
+		Color = color or preset.DefaultColor,
+		Count = count or 1,
+	}
+	updateHotbarSlotViewport(slot)
+	if slot == CurrentSlot and not IsToolSlotSelected then updateSelection() end
+	return true
+end
+
+-- ============================================
 -- DRAG-AND-DROP (Minecraft-style pick up / place)
 -- ============================================
 
@@ -1295,7 +1442,8 @@ local function createHeldItemUI(presetId, count)
 			preset.ApplyColor,
 			preset.LeatherTint,
 			preset.IsRainbow,
-			preset.StripeColorMode
+			preset.StripeColorMode,
+			preset.IsEmptyCan
 		)
 	end
 	
@@ -1511,6 +1659,14 @@ local function getSelectedBlock()
 				IsTool = true,
 				IsEmptyBucket = true,
 			}
+		elseif data.ToolName == "PaintBrush" then
+			-- Paint Mod: brush may linger as a stale tool-slot entry from when it was IsTool.
+			-- Expose IsPaintbrush so the brush engine + gate treat it correctly (not a wiring tool).
+			return {
+				Id = "PaintBrush",
+				Name = "Paint Brush",
+				IsPaintbrush = true,
+			}
 		end
 		return nil -- Regular tools don't place blocks
 	end
@@ -1545,6 +1701,7 @@ local function getSelectedBlock()
 		IsFence = preset.IsFence,
 		IsDoor = preset.IsDoor,
 		IsFrameBlock = preset.IsFrameBlock,
+		IsPaintbrush = preset.IsPaintbrush, -- Paint Mod: routes right-click to the brush engine
 	}
 end
 
@@ -1982,7 +2139,8 @@ local function createPresetButton(preset, parent)
 			preset.ApplyColor,
 			preset.LeatherTint,
 			preset.IsRainbow,
-			preset.StripeColorMode
+			preset.StripeColorMode,
+			preset.IsEmptyCan
 		)
 	end
 	
@@ -2599,7 +2757,7 @@ local function refreshPresetDisplay()
 	-- Check if a right tab is selected (Tools, Frames, etc.)
 	if SelectedRightTab == "Tools" then
 		-- Show items from Tools folder
-		local hiddenTools = { ["WaterBucket"] = true, ["EmptyBucket"] = true }
+		local hiddenTools = { ["WaterBucket"] = true, ["EmptyBucket"] = true, ["PaintBrush"] = true, ["PaintCan"] = true }
 		if ToolsFolder then
 			for _, tool in ipairs(ToolsFolder:GetChildren()) do
 				if not hiddenTools[tool.Name] and (not hasSearch or tool.Name:lower():find(searchLower, 1, true)) then
@@ -3965,6 +4123,7 @@ _G.InventoryController = {
 	PickUpItem = pickUpItem,
 	DropItemOnSlot = dropItemOnSlot,
 	CancelHeldItem = cancelHeldItem,
+	GrantItem = grantItem,
 	IsHolding = function() return HeldItem ~= nil end,
 	GetHeldItem = function() return HeldItem end,
 	DiscardHeld = function()
@@ -4213,4 +4372,49 @@ task.spawn(function()
 		end)
 		print("[BB-NEW] Listening for mid-session new block pushes")
 	end
+end)
+
+-- Paint Mod: per-brush loaded state. Paint is per-brush, so each brush's color lives on its
+-- own slot and the icon renders from that (NOT the global attribute). We record a color onto a
+-- brush ONLY when the player actually loads it from a can -- the server fires BrushLoadedFromCan
+-- for that, and never for routine select-syncs. (Stamping on the raw attribute change was racy:
+-- a select echo could land after CurrentSlot moved and recolor the wrong brush, which is what
+-- made brushes swap colors when scrolling between them.)
+task.spawn(function()
+	local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+	local BrushLoadedFromCan = remotes and remotes:WaitForChild("BrushLoadedFromCan", 10)
+	if not BrushLoadedFromCan then return end
+	BrushLoadedFromCan.OnClientEvent:Connect(function(payload)
+		if type(payload) ~= "table" then return end
+		if IsToolSlotSelected then return end
+		local data = Hotbar[CurrentSlot]
+		if not (data and data.PresetId == "PaintBrush") then return end
+		-- Peel one brush off the (empty) stack and color it; leave the rest empty.
+		splitLoadedPaintItem({
+			BrushLoaded = true,
+			Color = Color3.fromRGB(payload.r or 255, payload.g or 255, payload.b or 255),
+			BrushIsPrimer = payload.isPrimer and true or false,
+			BrushMode = payload.mode or "blend",
+		})
+	end)
+end)
+
+-- Paint Mod: per-swatch captured color. Mirrors the brush -- each swatch's color lives on its
+-- own slot (rendered via swatchLoadedColor). When the player captures a color, the server fires
+-- SwatchCapturedFromBlock; we split one swatch off the held stack and color it, leaving the rest
+-- empty. (The global Swatch* attributes are still set server-side for the Paint Mixer to read.)
+task.spawn(function()
+	local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+	local SwatchCapturedFromBlock = remotes and remotes:WaitForChild("SwatchCapturedFromBlock", 10)
+	if not SwatchCapturedFromBlock then return end
+	SwatchCapturedFromBlock.OnClientEvent:Connect(function(payload)
+		if type(payload) ~= "table" then return end
+		if IsToolSlotSelected then return end
+		local data = Hotbar[CurrentSlot]
+		if not (data and data.PresetId == "PaintSwatch") then return end
+		splitLoadedPaintItem({
+			SwatchLoaded = true,
+			Color = Color3.fromRGB(payload.r or 255, payload.g or 255, payload.b or 255),
+		})
+	end)
 end)

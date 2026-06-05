@@ -19,11 +19,54 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local MarketplaceService = game:GetService("MarketplaceService")
 
+-- Onboarding milestone fire (one-shot per player per session; the analytics
+-- Worker dedupes across sessions via its UNIQUE index). Optional: no-ops if the
+-- AnalyticsEvents module is missing or HTTP is disabled.
+local _MilestoneAE, _milestoneTried = nil, false
+local _milestoneFired = {}
+local function fireMilestone(player, name)
+	if not player or not player.Parent then return end
+	local seen = _milestoneFired[player.UserId]
+	if not seen then seen = {}; _milestoneFired[player.UserId] = seen end
+	if seen[name] then return end
+	seen[name] = true
+	if not _MilestoneAE and not _milestoneTried then
+		_milestoneTried = true
+		local mods = ServerScriptService:FindFirstChild("Modules")
+		local sib = mods and mods:FindFirstChild("AnalyticsEvents")
+		if sib then local ok, m = pcall(require, sib); if ok then _MilestoneAE = m end end
+	end
+	if _MilestoneAE then
+		_MilestoneAE.Post("milestone", { userId = player.UserId, username = player.Name, milestone = name })
+	end
+end
+Players.PlayerRemoving:Connect(function(plr) _milestoneFired[plr.UserId] = nil end)
+
+-- Snapshot how many save slots this player currently has filled (saves-per-player
+-- distribution). Reuses the AnalyticsEvents handle resolved above.
+local function postPlotSlots(player, slotCount)
+	if not player then return end
+	if not _MilestoneAE and not _milestoneTried then
+		_milestoneTried = true
+		local mods = ServerScriptService:FindFirstChild("Modules")
+		local sib = mods and mods:FindFirstChild("AnalyticsEvents")
+		if sib then local ok, m = pcall(require, sib); if ok then _MilestoneAE = m end end
+	end
+	if _MilestoneAE then
+		_MilestoneAE.Post("plot_slots", { userId = player.UserId, username = player.Name, slotCount = slotCount })
+	end
+end
+
 -- Coin system for coin-based slot purchases
 local Modules = ServerScriptService:WaitForChild("Modules", 10)
 local CoinManager = require(Modules:WaitForChild("CoinManager", 10))
 local CoinConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("CoinConfig"))
 local BetaConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BetaConfig"))
+
+-- Free-build sandbox (second place) shares this source AND the universe DataStore,
+-- so plot persistence must be a complete no-op there or we'd read/write the player's
+-- real plot save. Computed once; game.PlaceId is constant for the server's lifetime.
+local IS_FREE_BUILD = BetaConfig.IsFreeBuildPlace()
 
 -- Unique instance ID for debugging duplicate script detection
 local INSTANCE_ID = math.random(100000, 999999)
@@ -43,6 +86,7 @@ local SLOT_PURCHASE_PRODUCT_ID = 3526105434  -- Developer Product for extra slot
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
 local PlotSerializer = require(ReplicatedStorage:WaitForChild("PlotSerializer", 10))
 local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
+local PaintCanVisual = require(ReplicatedStorage:WaitForChild("PaintCanVisual", 10)) -- Paint Mod
 local SlabPlacement = require(ReplicatedStorage:WaitForChild("SlabPlacement", 10))
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local FencePlacement = require(ReplicatedStorage:WaitForChild("FencePlacement", 10))
@@ -738,6 +782,13 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 	local BlocksSourceFolder = templateCtx and templateCtx.BlocksSourceFolder or getBlocksFolder()
 	local DecorationsSourceFolder = templateCtx and templateCtx.DecorationsSourceFolder or getDecorationsFolder()
 	
+	-- LEGACY-SAVE ALIAS: the single "Leaves" block was split into per-type leaf
+	-- blocks (OakLeaves/BirchLeaves/SpruceLeaves). Old saves still store "Leaves";
+	-- map them to OakLeaves so they resolve to a real preset/template and load.
+	if blockData.blockType == "Leaves" then
+		blockData.blockType = "OakLeaves"
+	end
+	
 	local preset = BlockPresets.GetPreset(blockData.blockType)
 	if not preset then
 		-- FilledFence has no inventory preset - use a minimal fallback
@@ -1126,7 +1177,10 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 			local centerPos = topOfBlock + Vector3.new(0, block.Size.Y / 2, 0)
 			cframe = CFrame.new(centerPos) * rotation45
 		elseif block:IsA("Model") then
-			cframe = CFrame.new(topOfBlock) * rotation45
+			-- SugarCaneTrimmed renders half a block high relative to its pivot; lower it
+			-- to line up with regular sugar cane (matches the ToolHandler trim).
+			local yFix = (blockData.blockType == "SugarCaneTrimmed") and -BLOCK_SIZE / 2 or 0
+			cframe = CFrame.new(topOfBlock + Vector3.new(0, yFix, 0)) * rotation45
 		end
 	elseif isStair then
 		local stairRotation = blockData.attributes.Rotation or 0
@@ -1510,8 +1564,33 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		end
 	end
 	
+	-- Texture-mode coloring (candy canes, etc.): the stripe pattern lives in
+	-- grayscale Texture/Decal children, so tinting them to the variant color
+	-- produces the colored block. Mirrors BlockHandler.createBlockFromTemplate's
+	-- Texture branch. Runs independently of shouldApplyColor below, because these
+	-- presets carry no Material (which would gate that path off) and must NOT tint
+	-- the white Bark part. Without this, loaded candy canes revert to the template's
+	-- authored stripe color (red) regardless of the saved variant.
+	if preset.StripeColorMode == "Texture" and preset.ApplyColor ~= false and preset.DefaultColor then
+		local tint = preset.DefaultColor
+		for _, desc in ipairs(block:GetDescendants()) do
+			if desc:IsA("Texture") or desc:IsA("Decal") then
+				desc.Color3 = tint
+			elseif desc:IsA("BasePart") and desc.Name == "Core" then
+				desc.Color = tint
+			end
+		end
+		if block:IsA("BasePart") then
+			for _, child in ipairs(block:GetChildren()) do
+				if child:IsA("Texture") or child:IsA("Decal") then
+					child.Color3 = tint
+				end
+			end
+		end
+	end
+
 	-- Apply color/material
-	local shouldApplyColor = (not usedBlockModel or isLadder or isFence or preset.ApplyColor) and preset.DefaultColor and preset.Material and not isDecoration and not isBed
+	local shouldApplyColor = (not usedBlockModel or isLadder or isFence or preset.ApplyColor) and preset.DefaultColor and preset.Material and not isDecoration and not isBed and preset.StripeColorMode ~= "Texture"
 	
 	if shouldApplyColor then
 		local color = preset.DefaultColor
@@ -1597,6 +1676,50 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		end
 	end
 	
+	-- Glass: never restore with the refractive Glass material.
+	if GlassPlacement.IsAnyGlass(blockData.blockType) then
+		GlassPlacement.NormalizeGlassMaterial(block)
+	end
+
+	-- Colored glass: recolor face textures + 70% transparency to match how it was
+	-- placed. Uses the saved custom color when present, else the preset tint.
+	if GlassPlacement.IsColoredGlass(blockData.blockType) and preset.DefaultColor then
+		local gColor = preset.DefaultColor
+		local cr, cg, cb = blockData.attributes.CustomColorR, blockData.attributes.CustomColorG, blockData.attributes.CustomColorB
+		if cr and cg and cb then gColor = Color3.fromRGB(cr, cg, cb) end
+		GlassPlacement.StyleColoredGlass(block, gColor)
+	end
+
+	-- Paint Mod: brush-painted blocks carry a blended color (CustomColorR/G/B), a coat count
+	-- (PaintCoats) and a primer-coat count (PaintPrimerCoats). shouldApplyColor above only covers
+	-- template/ApplyColor blocks, so restore the paint here for ANY block type. We snapshot the
+	-- default look first (so the sponge can fully revert post-reload), then ApplyCoats re-tints
+	-- the block and rebuilds the concrete cover textures from the primer-coat count. All paint
+	-- attributes round-trip via the generic attribute loop below, so this survives save/load.
+	if blockData.attributes.IsPainted then
+		local pr = blockData.attributes.CustomColorR
+		local pg = blockData.attributes.CustomColorG
+		local pb = blockData.attributes.CustomColorB
+		if pr and pg and pb then
+			local paintColor = Color3.fromRGB(pr, pg, pb)
+			local primerCoats = blockData.attributes.PaintPrimerCoats or 0
+			PaintCanVisual.CaptureOriginal(block)
+			PaintCanVisual.ApplyCoats(block, paintColor, primerCoats)
+		end
+	end
+	
+	-- Paint Mod: a placed paint can keeps its modeled body and shows its color on the
+	-- PaintColor union. Preset cans derive color from the preset; custom (mixer) cans carry
+	-- cr/cg/cb; empty cans set IsEmptyCan. Material-agnostic via PaintCanVisual.
+	if BlockPresets.IsPaintCan and BlockPresets.IsPaintCan(blockData.blockType) then
+		local canColor = preset and preset.DefaultColor
+		local ccr = blockData.attributes.CustomColorR
+		local ccg = blockData.attributes.CustomColorG
+		local ccb = blockData.attributes.CustomColorB
+		if ccr and ccg and ccb then canColor = Color3.fromRGB(ccr, ccg, ccb) end
+		PaintCanVisual.ApplyCan(block, canColor, blockData.attributes.IsEmptyCan == true)
+	end
+	
 	-- Apply attributes
 	block:SetAttribute("BlockType", blockData.blockType)
 	block:SetAttribute("PlacedBy", placedByUserId)
@@ -1628,6 +1751,9 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 	-- Restore frame block fill: if this frame was filled, we already loaded the solid
 	-- template above (see FrameFillBlockId check), so just apply the saved appearance
 	local frameFillId = blockData.attributes.FrameFillBlockId
+	-- LEGACY-SAVE ALIAS: pre-split saves stored the single "Leaves" fill id; map it to
+	-- OakLeaves so it resolves to a real preset/model (mirrors the blockType alias above).
+	if frameFillId == "Leaves" then frameFillId = "OakLeaves" end
 	if frameFillId and (isFrameBlock or blockData.blockType == "FilledFence") then
 		local fillPreset = BlockPresets.GetPreset(frameFillId)
 		if fillPreset then
@@ -1680,6 +1806,121 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 					part.Color = fillColor
 					part.Material = fillMaterial
 					part.MaterialVariant = fillMaterialVariant ~= "" and fillMaterialVariant or ""
+				end
+			end
+
+			-- Texture-mode fill (candy canes, etc.): the stripe pattern lives in
+			-- Texture/Decal objects on the source model, not a MaterialVariant, so the
+			-- plain color/material application above leaves a flat block. Copy the
+			-- source's stripe textures onto the filled block and tint them to the fill
+			-- color; keep the part white so the stripe background matches a real cane.
+			if fillPreset.StripeColorMode == "Texture" then
+				local srcFolder = ReplicatedStorage
+				for _, n in ipairs(string.split(fillPreset.BlockModelFolder or "", "/")) do
+					srcFolder = srcFolder and srcFolder:FindFirstChild(n)
+				end
+				local srcModel = srcFolder and srcFolder:FindFirstChild(fillPreset.BlockModelName or frameFillId)
+				if srcModel then
+					local stripes = {}
+					local srcMaterial, srcMatVariant
+					local scanRoot = srcModel:IsA("BasePart") and srcModel:GetChildren() or srcModel:GetDescendants()
+					for _, c in ipairs(scanRoot) do
+						if c:IsA("Texture") or c:IsA("Decal") then table.insert(stripes, c) end
+					end
+					-- Filled candy frames always use the PixelCandyCaneAlt material variant.
+					-- Look it up in MaterialService so we set the matching BaseMaterial — a
+					-- MaterialVariant only renders when part.Material == its BaseMaterial.
+					-- Fall back to the source block's authored material if the variant is missing.
+					local altMV = game:GetService("MaterialService"):FindFirstChild("PixelCandyCaneAlt", true)
+					if altMV and altMV:IsA("MaterialVariant") then
+						srcMaterial = altMV.BaseMaterial
+						srcMatVariant = "PixelCandyCaneAlt"
+					elseif srcModel:IsA("BasePart") then
+						srcMaterial = srcModel.Material
+						srcMatVariant = srcModel.MaterialVariant
+					else
+						local body = srcModel.PrimaryPart or srcModel:FindFirstChild("Bark") or srcModel:FindFirstChildWhichIsA("BasePart")
+						if body then
+							srcMaterial = body.Material
+							srcMatVariant = body.MaterialVariant
+						end
+					end
+					local function applyStripes(part)
+						part.Color = Color3.new(1, 1, 1)
+						if srcMaterial then
+							part.Material = srcMaterial
+							part.MaterialVariant = srcMatVariant or ""
+						end
+						for _, tex in ipairs(stripes) do
+							local copy = tex:Clone()
+							copy.Color3 = fillColor
+							copy.Parent = part
+						end
+					end
+					if block:IsA("BasePart") then
+						applyStripes(block)
+					else
+						for _, part in ipairs(block:GetDescendants()) do
+							if part:IsA("BasePart") then applyStripes(part) end
+						end
+					end
+				end
+			end
+			-- Leaf-mode fill (mirror of BlockHandler): leaf blocks show their colour on the
+			-- Part with a face Texture on top. Recompute the randomized biome/season leaf
+			-- colour from the fill id (same as a placed leaf block on load), then copy the
+			-- leaf Part's transparency/material + face textures. Recomputing means old saves
+			-- (stored flat, pre-texture) auto-upgrade to the textured + randomized look.
+			if string.find(frameFillId, "Leaves") and BiomeConfig then
+				local leafType = (string.find(frameFillId, "Birch") and "Birch")
+					or (string.find(frameFillId, "Spruce") and "Spruce") or "Oak"
+				local fbiome = blockData.attributes.Biome
+				local fseason = blockData.attributes.Season or "Summer"
+				local leafColor
+				if fbiome then
+					leafColor = BiomeConfig.GetRandomizedTintedLeafColor(leafType, fbiome, fseason)
+				else
+					local leafConfig = BiomeConfig.LeafTypes[leafType] or BiomeConfig.LeafTypes.Oak
+					leafColor = BiomeConfig.GetRandomizedLeafColor(leafConfig.Color)
+				end
+				leafColor = leafColor or fillColor
+				local blocksFolder = ReplicatedStorage:FindFirstChild("Blocks")
+				local leafModel = blocksFolder and blocksFolder:FindFirstChild(frameFillId)
+				local leafPart = leafModel and (leafModel:IsA("BasePart") and leafModel or leafModel:FindFirstChildWhichIsA("BasePart"))
+				if leafPart then
+					local faces = {}
+					for _, c in ipairs(leafPart:GetChildren()) do
+						if c:IsA("Texture") or c:IsA("Decal") or c:IsA("SurfaceAppearance") then
+							table.insert(faces, c)
+						end
+					end
+					local function applyLeaf(part)
+						part.Transparency = leafPart.Transparency
+						part.Material = leafPart.Material
+						part.MaterialVariant = leafPart.MaterialVariant or ""
+						part.Color = leafColor
+						for _, ex in ipairs(part:GetChildren()) do
+							if ex:IsA("Texture") or ex:IsA("Decal") or ex:IsA("SurfaceAppearance") then
+								ex:Destroy()
+							end
+						end
+						for _, f in ipairs(faces) do
+							local c = f:Clone()
+							-- Leaves show their colour on the texture (see visibleBlockColor), not
+							-- the part, so tint each copied face or every fill is the same shade.
+							if c:IsA("Texture") or c:IsA("Decal") then
+								c.Color3 = leafColor
+							end
+							c.Parent = part
+						end
+					end
+					if block:IsA("BasePart") then
+						applyLeaf(block)
+					else
+						for _, part in ipairs(block:GetDescendants()) do
+							if part:IsA("BasePart") then applyLeaf(part) end
+						end
+					end
 				end
 			end
 		end
@@ -1928,7 +2169,7 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 		block:SetAttribute("NeedsBiomeColor", savedBiome == nil)
 	end
 	
-	if blockData.blockType == "Leaves" and BiomeConfig then
+	if blockData.blockType and blockData.blockType:find("Leaves") ~= nil and BiomeConfig then
 		local treeType = blockData.attributes.TreeType or "Oak"
 		local leafColor
 		if savedBiome then
@@ -1944,6 +2185,14 @@ local function createBlockFromSave(blockData, blocksFolder, placedByUserId, orig
 			elseif cachedBaseParts then
 				for _, part in ipairs(cachedBaseParts) do
 					part.Color = leafColor
+				end
+			end
+			-- Leaves show their colour on the face Texture/Decal, not the part .Color
+			-- (see TreeGenerator.CreateLeaves / visibleBlockColor), so tint those too or
+			-- saved trees reload to a flat, uniform shade.
+			for _, d in ipairs(block:GetDescendants()) do
+				if d:IsA("Decal") then  -- Texture is a subclass of Decal
+					d.Color3 = leafColor
 				end
 			end
 		end
@@ -2563,7 +2812,7 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 						if not decosByParentPos[key] then decosByParentPos[key] = {} end
 						table.insert(decosByParentPos[key], item)
 					end
-				elseif isTreeBlock or isCactus or isFallenLog or (blockType == "Leaves") then
+				elseif isTreeBlock or isCactus or isFallenLog or (blockType and blockType:find("Leaves") ~= nil) then
 					local bx = item:GetAttribute("BlockPosX")
 					local by = item:GetAttribute("BlockPosY")
 					local bz = item:GetAttribute("BlockPosZ")
@@ -2831,6 +3080,15 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 					local currentConnectionType = glass:GetAttribute("GlassConnectionType") or "isolated"
 					
 					if newPlacementInfo.connectionType ~= currentConnectionType then
+						-- Sample the old pane color so colored glass keeps its tint through
+						-- the connection-type swap (the cloned template is uncolored).
+						local sampledColor
+						if glass:IsA("BasePart") then
+							sampledColor = glass.Color
+						elseif glass:IsA("Model") then
+							local fp = glass:FindFirstChildWhichIsA("BasePart", true)
+							if fp then sampledColor = fp.Color end
+						end
 						glass:Destroy()
 						local newGlass = createGlassBlock(
 							newPlacementInfo.templateName, glassType, glassPos,
@@ -2838,7 +3096,13 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 							newPlacementInfo.connectionType, newPlacementInfo.primaryDir,
 							newPlacementInfo.secondaryDir, glassOrientation
 						)
-						if newGlass then passUpdated = passUpdated + 1 end
+						if newGlass then
+							passUpdated = passUpdated + 1
+							GlassPlacement.NormalizeGlassMaterial(newGlass)
+							if GlassPlacement.IsColoredGlass(glassType) and sampledColor then
+								GlassPlacement.StyleColoredGlass(newGlass, sampledColor)
+							end
+						end
 					end
 				end
 				
@@ -2848,6 +3112,11 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
 		end
 	end
 	
+	-- Connected-glass texture culling for the freshly loaded plot (hide textures on
+	-- faces where glass meets glass). Runs after the connection-type reconciliation
+	-- above so every pane is in its final form.
+	GlassPlacement.CullAllGlass(blocksFolder)
+
 	-- Apply biome colors to decorations
 	local currentBiome = buildArea:GetAttribute("CurrentBiome")
 	local currentSeason = buildArea:GetAttribute("CurrentSeason") or "Summer"
@@ -3156,6 +3425,13 @@ local function connectEventHandlers()
 		local success, blockCount, lifetimeBlocks = savePlotToSlot(player, buildArea, slotNumber)
 		if success then
 			SaveLoadResult:FireClient(player, "save", true, "Saved " .. blockCount .. " blocks to Slot " .. slotNumber .. "!")
+			fireMilestone(player, "first_save")
+			do
+				local slotMeta = getPlayerMeta(player.UserId)
+				local slotCount = 0
+				if slotMeta and slotMeta.slots then for _ in pairs(slotMeta.slots) do slotCount = slotCount + 1 end end
+				postPlotSlots(player, slotCount)
+			end
 			
 			if BetaPlayerManager then
 				BetaPlayerManager.CheckAndRegisterIfQualified(player, lifetimeBlocks)
@@ -3350,6 +3626,7 @@ local function connectEventHandlers()
 	-- IMPORTANT: Do NOT clear PlayerActiveSlot here! PlotManager's PlayerRemoving
 	-- calls SavePlotSync which needs the active slot. Cleanup happens AFTER save.
 	Players.PlayerRemoving:Connect(function(player)
+		if IS_FREE_BUILD then return end  -- free-build: no plot persistence
 		-- Wait briefly for PlotManager's SavePlotSync to complete first
 		-- PlotManager's handler calls SavePlotSync synchronously, which sets SavedOnLeave
 		local waitStart = tick()
@@ -3444,6 +3721,12 @@ AutoLoadPlot.Name = "AutoLoadPlot"
 AutoLoadPlot.Parent = ReplicatedStorage
 
 AutoLoadPlot.OnInvoke = function(player, buildArea, plotNumber)
+	if IS_FREE_BUILD then
+		-- Free-build sandbox: never load plot saves. Return success/0 (same shape as
+		-- the "no save data / fresh plot" path) so PlotManager treats this as a clean
+		-- empty plot, not a load failure that would disable saving for the session.
+		return true, 0
+	end
 	if not player or not buildArea or not plotNumber then
 		return false, "Invalid parameters"
 	end
@@ -3509,6 +3792,12 @@ SavePlotSync.Name = "SavePlotSync"
 SavePlotSync.Parent = ReplicatedStorage
 
 SavePlotSync.OnInvoke = function(player)
+	if IS_FREE_BUILD then
+		-- Free-build sandbox: never write plot saves. Flag cleanup done so the
+		-- emergency PlayerRemoving handler below won't wait or save either.
+		if player then SavedOnLeave[player.UserId] = true end
+		return true, 0
+	end
 	if not player then
 		return false, "No player"
 	end
@@ -3570,6 +3859,7 @@ end)
 -- ============================================
 
 game:BindToClose(function()
+	if IS_FREE_BUILD then return end  -- free-build: no plot persistence
 	
 	local saveThreads = {}
 	local skippedCount = 0
@@ -3603,7 +3893,11 @@ game:BindToClose(function()
 	end
 	
 	local startTime = tick()
-	local timeout = 25
+	-- Studio's shutdown deadline (~30s) + a yielding BindToClose = a long stop-freeze
+	-- and "past shutdown deadline" log spam. Cap the wait low in Studio (saves still run;
+	-- a single test plot finishes well under this), keep the full window on live servers
+	-- so a real shutdown never truncates a save.
+	local timeout = game:GetService("RunService"):IsStudio() and 6 or 25
 	
 	while #saveThreads > 0 and (tick() - startTime) < timeout do
 		for i = #saveThreads, 1, -1 do
@@ -3624,6 +3918,7 @@ end)
 -- whose plot was successfully loaded this session. Mirrors MegaPlot's autoSaveLoop
 -- in spirit. Protects against work loss on server crashes between leave events.
 task.spawn(function()
+	if IS_FREE_BUILD then return end  -- free-build: no periodic plot autosave
 	while true do
 		task.wait(AUTO_SAVE_INTERVAL)
 		

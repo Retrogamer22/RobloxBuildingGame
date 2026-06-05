@@ -21,9 +21,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local PlotSerializer = {}
 
--- Glass debug levels: 0=off, 1=summary, 2=verbose
-local DEBUG_GLASS_LEVEL = 1
-
 -- Current save format version (increment when format changes)
 PlotSerializer.VERSION = 2  -- Updated for multi-depth dug tracking
 
@@ -48,6 +45,8 @@ local ExtraKeyShort = {
 	["HostBlockX"] = "hx",
 	["HostBlockY"] = "hy",
 	["HostBlockZ"] = "hz",
+	["FireFace"] = "ffc",  -- which face of the host is burning (Top/Bottom/PosX/NegX/PosZ/NegZ)
+	["FireVariant"] = "fv", -- "Blue" for SoulSand soul-fire; nil/absent = normal
 	["FenceConnectionType"] = "fc",
 	["BlockedDirections"] = "bd",  -- User-blocked fence connection directions
 	["GlassConnectionType"] = "gc",
@@ -139,6 +138,12 @@ local AttributeBlacklist = {
 	["PathBaseX"] = true,        -- Used for grid calculation during save only
 	["PathBaseY"] = true,        -- Used for grid calculation during save only
 	["PathBaseZ"] = true,        -- Used for grid calculation during save only
+	-- ChestSecondary absolute coords are NOT saved; we save origin-relative csx/csy/csz
+	-- instead (see chest block below). Saving absolutes caused double chests to teleport
+	-- out of the plot when reloaded at a different origin.
+	["ChestSecondaryX"] = true,
+	["ChestSecondaryY"] = true,
+	["ChestSecondaryZ"] = true,
 	["CharLevel"] = true,        -- Transient fire-charring progress
 	["CharOrigR"] = true,        -- Transient fire-charring colour snapshot
 	["CharOrigG"] = true,        -- Transient fire-charring colour snapshot
@@ -232,16 +237,6 @@ local function deserializeExtraData(extraData)
 			-- Check if it's a short code, otherwise use key as-is (full name)
 			local fullKey = ShortToExtraKey[key] or key
 			attributes[fullKey] = value
-			
-			-- Debug: print slab orientation when deserializing
-			if fullKey == "SlabOrientation" then
-				print(string.format("[PlotSerializer] Deserialized SlabOrientation: %s", tostring(value)))
-			end
-			
-			-- Debug: print door attributes when deserializing
-			if fullKey == "DoorDirection" or fullKey == "DoorDepth" or fullKey == "DoorHingeSide" then
-				print(string.format("[PlotSerializer] Deserialized %s: %s (type=%s) from key=%s", fullKey, tostring(value), type(value), key))
-			end
 		end
 	end
 	
@@ -373,44 +368,6 @@ local function serializeBlock(block, blockPos, BLOCK_SIZE, terrainOrigin)
 		end
 	end
 	
-	-- Debug logging for lazy-loaded blocks
-	if block:GetAttribute("IsLazyLoaded") then
-		print(string.format("[SaveDebug] %s LazyLoaded -> Grid(%d,%d,%d) from %s",
-			blockType, gridX, gridY, gridZ, positionSource))
-	end
-	
-	-- Debug logging for doors (use string matching to catch all doors)
-	local isDoorBlock = string.find(string.lower(blockType), "door") ~= nil
-	if isDoorBlock then
-		print(string.format("[SaveDebug] Door %s -> Grid(%d,%d,%d) from %s",
-			blockType, gridX, gridY, gridZ, positionSource))
-		-- Log all door attributes being saved
-		print(string.format("[SaveDebug] Door attributes on block: DoorDirection=%s, DoorDepth=%s, DoorHingeSide=%s, Rotation=%s, IsDoor=%s",
-			tostring(block:GetAttribute("DoorDirection")),
-			tostring(block:GetAttribute("DoorDepth")),
-			tostring(block:GetAttribute("DoorHingeSide")),
-			tostring(block:GetAttribute("Rotation")),
-			tostring(block:GetAttribute("IsDoor"))))
-	end
-	
-	-- Debug logging for wallpaper frames
-	if block:GetAttribute("IsWallpaperFrame") then
-		local hostX = block:GetAttribute("HostBlockX")
-		local hostY = block:GetAttribute("HostBlockY")
-		local hostZ = block:GetAttribute("HostBlockZ")
-		local bpX = block:GetAttribute("BlockPosX")
-		local bpY = block:GetAttribute("BlockPosY")
-		local bpZ = block:GetAttribute("BlockPosZ")
-		local face = block:GetAttribute("WallpaperFace") or "?"
-		local fillId = block:GetAttribute("FrameFillBlockId")
-		print(string.format("[WP-SAVE] %s face=%s filled=%s -> Grid(%d,%d,%d) from %s",
-			blockType, face, tostring(fillId), gridX, gridY, gridZ, positionSource))
-		print(string.format("[WP-SAVE]   BlockPos=(%s,%s,%s) HostBlock=(%s,%s,%s) visualPos=(%.2f,%.2f,%.2f)",
-			tostring(bpX), tostring(bpY), tostring(bpZ),
-			tostring(hostX), tostring(hostY), tostring(hostZ),
-			blockPos.X, blockPos.Y, blockPos.Z))
-	end
-	
 	-- Register type and get ID
 	local typeId = registerType(blockType)
 	
@@ -419,15 +376,6 @@ local function serializeBlock(block, blockPos, BLOCK_SIZE, terrainOrigin)
 	
 	-- Get extra data (attributes)
 	local extra = serializeExtraData(block)
-	
-	-- Debug: log door extra data after serialization
-	if isDoorBlock and extra then
-		local extraStr = ""
-		for k, v in pairs(extra) do
-			extraStr = extraStr .. string.format("%s=%s, ", k, tostring(v))
-		end
-		print(string.format("[SaveDebug] Door serialized extra data: {%s}", extraStr))
-	end
 	
 	-- Mark decorations
 	if block:GetAttribute("IsDecoration") then
@@ -446,12 +394,6 @@ local function serializeBlock(block, blockPos, BLOCK_SIZE, terrainOrigin)
 							 block:GetAttribute("IsLadder") or
 							 block:GetAttribute("IsGlass")
 	
-	-- Debug: print slab orientation when saving
-	if string.find(blockType, "Slab") then
-		local slabOrientation = block:GetAttribute("SlabOrientation")
-		print(string.format("[PlotSerializer] Saving slab %s with orientation: %s", blockType, tostring(slabOrientation)))
-	end
-	
 	if isTemplateBlock then
 		local color = extractBlockColor(block)
 		if color then
@@ -459,27 +401,24 @@ local function serializeBlock(block, blockPos, BLOCK_SIZE, terrainOrigin)
 			extra["cr"] = math.round(color.R * 255)
 			extra["cg"] = math.round(color.G * 255)
 			extra["cb"] = math.round(color.B * 255)
-			
-			-- Debug: log ladder color being saved
-			if string.find(blockType, "Ladder") then
-				print(string.format("[Ladder SAVE] %s color: R=%d G=%d B=%d", 
-					blockType, extra["cr"], extra["cg"], extra["cb"]))
-			end
-		else
-			-- Debug: log if color extraction failed
-			if string.find(blockType, "Ladder") then
-				print(string.format("[Ladder SAVE] %s - WARNING: extractBlockColor returned nil!", blockType))
-			end
 		end
 	end
 	
-	-- Debug: log chest save data
+	-- Chest: save the secondary cell as ORIGIN-RELATIVE grid coords (csx/csy/csz).
+	-- The absolute ChestSecondaryX/Y/Z attributes are blacklisted (not saved) because
+	-- absolute coords don't survive a reload at a different plot origin -- that bug threw
+	-- double chests out of the plot. Relative coords travel correctly like the primary.
 	if block:GetAttribute("IsChest") then
 		local isDouble = block:GetAttribute("IsDoubleChest")
 		local secX = block:GetAttribute("ChestSecondaryX")
-		print(string.format("[Chest] SAVE type=%s grid=(%d,%d,%d) isDouble=%s hasSecondary=%s extraKeys=%s",
-			blockType, gridX, gridY, gridZ, tostring(isDouble), tostring(secX ~= nil),
-			extra and table.concat((function() local keys = {} for k in pairs(extra) do table.insert(keys, k) end return keys end)(), ",") or "nil"))
+		local secY = block:GetAttribute("ChestSecondaryY")
+		local secZ = block:GetAttribute("ChestSecondaryZ")
+		if isDouble and secX and secY and secZ then
+			extra = extra or {}
+			extra["csx"] = math.round((secX - originX) / BLOCK_SIZE)
+			extra["csy"] = math.round((secY - originY) / BLOCK_SIZE)
+			extra["csz"] = math.round((secZ - originZ) / BLOCK_SIZE)
+		end
 	end
 	
 	if extra then
@@ -668,9 +607,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 	local sizeX = buildArea:GetAttribute("BasePlateSizeX")
 	local sizeZ = buildArea:GetAttribute("BasePlateSizeZ")
 	
-	print(string.format("[PlotSerializer] DEBUG SAVE: terrainSurfaceY=%.4f, posX=%.4f, posZ=%.4f, sizeX=%.4f, sizeZ=%.4f, BLOCK_SIZE=%d",
-		terrainSurfaceY or -999, posX or -999, posZ or -999, sizeX or -999, sizeZ or -999, BLOCK_SIZE))
-	
 	-- Calculate terrain origin for relative grid positions
 	local terrainOrigin = nil
 	if posX and posZ and sizeX and sizeZ then
@@ -679,8 +615,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 			y = terrainSurfaceY or 0,
 			z = posZ - sizeZ / 2 + BLOCK_SIZE / 2,
 		}
-		print(string.format("[PlotSerializer] Using terrain origin: (%.4f, %.4f, %.4f)", 
-			terrainOrigin.x, terrainOrigin.y, terrainOrigin.z))
 	end
 	
 	local blocks = {}
@@ -751,12 +685,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 					relGridY = math.round((blockPos.Y - terrainOrigin.y) / BLOCK_SIZE)
 					relGridZ = math.round((blockPos.Z - terrainOrigin.z) / BLOCK_SIZE)
 					missingBlockPosCount = missingBlockPosCount + 1
-					
-					-- Log first few missing BlockPos blocks for debugging
-					if missingBlockPosCount <= 3 then
-						print(string.format("[PlotSerializer] WARNING: Terrain block missing BlockPosX/Y/Z! actualPos=(%.2f,%.2f,%.2f) -> relGrid=(%d,%d,%d)",
-							blockPos.X, blockPos.Y, blockPos.Z, relGridX, relGridY, relGridZ))
-					end
 				else
 					-- No terrain origin, use absolute coords (fallback)
 					relGridX = math.round(blockPos.X / BLOCK_SIZE)
@@ -767,23 +695,10 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 				local key = relGridX .. "," .. relGridY .. "," .. relGridZ
 				existingTerrainPositions[key] = true
 				terrainBlockCount = terrainBlockCount + 1
-				
-				-- Log sample terrain positions (first 3 blocks)
-				if terrainBlockCount <= 3 then
-					print(string.format("[PlotSerializer] Sample terrain: relKey=%s storedPos=(%.2f,%.2f,%.2f) usedStored=%s",
-						key, storedX or blockPos.X, storedY or blockPos.Y, storedZ or blockPos.Z, tostring(usedStoredPos)))
-				end
 			end
 			
 			local serialized = serializeBlock(block, blockPos, BLOCK_SIZE, terrainOrigin)
 			if serialized then
-				-- Summary logging at level 1+
-				if isGlass and DEBUG_GLASS_LEVEL >= 1 then
-					local connType = block:GetAttribute("GlassConnectionType") or "unknown"
-					print(string.format("[Glass SAVE] type=%s pivotPos=(%.2f,%.2f,%.2f) -> grid=(%d,%d,%d)",
-						connType, blockPos.X, blockPos.Y, blockPos.Z,
-						(serialized :: {any})[1], (serialized :: {any})[2], (serialized :: {any})[3]))
-				end
 				table.insert(blocks, serialized)
 				totalBlocks = totalBlocks + 1
 			else
@@ -798,8 +713,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 			task.wait()
 		end
 	end
-	
-	print(string.format("[PlotSerializer] Found %d terrain blocks (%d missing BlockPos attrs)", terrainBlockCount, missingBlockPosCount))
 	
 	-- Calculate expected surface blocks for validation
 	local expectedSurfaceBlocks = 0
@@ -840,9 +753,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 		local gridSizeX = buildArea:GetAttribute("TerrainGridSizeX") or math.floor(sizeX / BLOCK_SIZE)
 		local gridSizeZ = buildArea:GetAttribute("TerrainGridSizeZ") or math.floor(sizeZ / BLOCK_SIZE)
 		
-		print(string.format("[PlotSerializer] Checking for dug positions: gridSize=%dx%d, flat=%s", 
-			gridSizeX, gridSizeZ, tostring(isFlatTerrain)))
-		
 		-- For Natural terrain, we need the height map to know expected surface Y at each position
 		local heightMap = nil
 		if not isFlatTerrain then
@@ -861,7 +771,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 						heightMap[gx][gz] = tonumber(heights[index]) or 0
 					end
 				end
-				print(string.format("[PlotSerializer] Loaded height map for Natural terrain (%dx%d)", storedGridSizeX, storedGridSizeZ))
 			end
 		end
 		
@@ -893,12 +802,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 				if not existingTerrainPositions[surfaceKey] then
 					-- Surface is dug - record as RELATIVE grid coords
 					table.insert(dugPositions, {gx, relGridY, gz})
-					
-					-- Log first few dug positions for debugging
-					if #dugPositions <= 5 then
-						print(string.format("[PlotSerializer] Dug detected: relKey=%s NOT FOUND (expectedSurfaceY=%.2f)", 
-							surfaceKey, expectedSurfaceY))
-					end
 				end
 			end
 			
@@ -939,9 +842,6 @@ function PlotSerializer.SerializePlot(buildArea, BLOCK_SIZE, options)
 	
 	-- Calculate expected surface blocks
 	local expectedSurfaceBlocks = (math.floor(sizeX / BLOCK_SIZE)) * (math.floor(sizeZ / BLOCK_SIZE))
-	
-	print(string.format("[PlotSerializer] Serialized %d blocks, %d dug positions (skipped %d terrain, found %d terrain blocks)", 
-		totalBlocks, #dugPositions, skippedTerrain, terrainBlockCount))
 	
 	-- STRIP PATTERN DETECTION: Check if an entire row or column is falsely marked as dug
 	-- This catches the edge strip bug at save time to prevent corrupting save data
@@ -1061,8 +961,6 @@ function PlotSerializer.DeserializePlot(saveData)
 			gridZ = pos[3],
 		})
 	end
-	
-	print(string.format("[PlotSerializer] Deserialized %d blocks, %d dug positions", #blocks, #dugPositions))
 	
 	return {
 		biome = saveData.biome or "Plains",

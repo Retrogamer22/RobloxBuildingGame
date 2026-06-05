@@ -15,6 +15,12 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("GridConfig", 10))
+-- Free-build (second) place gate. On that place there are no bounded plots --
+-- the player builds anywhere in the continuous chunk world -- so the ghost
+-- preview and client permission checks skip the footprint test and anchor the
+-- build grid to the player's own center plate. Mirrors the server gate in
+-- BlockHandler (canPlayerBuildAtPosition). Single source of truth: BetaConfig.
+local BetaConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("BetaConfig", 10))
 local NetherConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("NetherConfig", 10))
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local LogPlacement = require(ReplicatedStorage:WaitForChild("LogPlacement", 10))
@@ -46,9 +52,11 @@ local BuildRejected = Remotes:WaitForChild("BuildRejected", 5)
 local GetMySharedAccessList = Remotes:WaitForChild("GetMySharedAccessList", 5)
 local SharedAccessChanged = Remotes:WaitForChild("SharedAccessChanged", 5)
 
--- Water bucket remotes
+-- Water/lava bucket remotes
 local PlaceWater = Remotes:WaitForChild("PlaceWater", 5)
 local PickupWater = Remotes:WaitForChild("PickupWater", 5)
+local PlaceLava = Remotes:WaitForChild("PlaceLava", 5)
+local PickupLava = Remotes:WaitForChild("PickupLava", 5)
 
 -- Frame block remotes
 local FillFrameBlock = Remotes:WaitForChild("FillFrameBlock", 5)
@@ -59,7 +67,12 @@ local Camera = workspace.CurrentCamera
 
 local BLOCK_SIZE = GridConfig.BLOCK_SIZE
 local REACH_DISTANCE = 50
-local BREAK_TIME = 0.3
+local BREAK_TIME = 0.1 -- crack/break duration: short so breaking feels near-instant and only flashes a few crack stages (raise this for survival-style slower mining)
+-- Creative-style breaking: each block breaks instantly, then a short cooldown
+-- gates the next break while the button is held (Minecraft creative uses 5 ticks,
+-- about 0.25s, so you don't accidentally chew through blocks). Tunable.
+local CREATIVE_BREAK_COOLDOWN = 0.25
+local BreakCooldownTimer = 0
 local PLACE_RATE = 0.15 -- Time between continuous placements when holding
 
 -- Ghost preview settings
@@ -303,6 +316,14 @@ end
 
 -- Get basePlate data for ANY plot at a given position (for shared building)
 local function getBasePlateAtPosition(position)
+	-- FREE-BUILD PLACE: one continuous world anchored on the player's center
+	-- plate. Every chunk shares that plate's grid origin, so we always snap off
+	-- it regardless of where `position` is -- no footprint lookup, no per-chunk
+	-- plate. (Server mirrors this in canPlayerBuildAtPosition.)
+	if BetaConfig.IsFreeBuildPlace() then
+		return getBasePlate()
+	end
+
 	-- In MegaPlot mode, always use MegaPlotBuildArea for grid alignment
 	if _G.PlotClient and _G.PlotClient.IsMegaPlotMode and _G.PlotClient.IsMegaPlotMode() then
 		local megaPlotRoom = workspace:FindFirstChild("MegaPlotRoom")
@@ -452,8 +473,8 @@ local function isWiringToolSelected()
 	if _G.InventoryController and _G.InventoryController.GetSelectedBlock then
 		local selected = _G.InventoryController.GetSelectedBlock()
 		if not selected then return false end
-		-- Water buckets are tools but need full input (not wiring tools)
-		if selected.IsWaterBucket or selected.IsEmptyBucket then return false end
+		-- Water/lava buckets are tools but need full input (not wiring tools)
+		if selected.IsWaterBucket or selected.IsEmptyBucket or selected.IsLavaBucket then return false end
 		return selected.IsWiringTool or selected.IsTool
 	end
 	return false
@@ -498,7 +519,14 @@ end
 -- Check if the local player can interact (break/place) at a world position
 local function canInteractAtPosition(position)
 	if not position then return false end
-	
+
+	-- FREE-BUILD PLACE: no bounded plots -- the player may build/break anywhere
+	-- in the chunk world. Allow as long as we have our own plot assigned (the
+	-- center chunk). Server still authoritatively re-checks in BlockHandler.
+	if BetaConfig.IsFreeBuildPlace() then
+		return getBasePlate() ~= nil
+	end
+
 	-- Private server: everyone can build on all plots
 	local isPrivate = false
 	pcall(function() isPrivate = game.PrivateServerId ~= "" end)
@@ -849,16 +877,20 @@ local function raycastForBlock()
 	-- without waiting for server round-trips to spawn real blocks.
 	raycastParams.FilterDescendantsInstances = filterList
 	
-	-- Check if we're holding a bucket (EmptyBucket targets water for pickup, WaterBucket targets water to convert flowing→source)
+	-- Check if we're holding a bucket. EmptyBucket can pick up water OR lava.
+	-- WaterBucket / LavaBucket each only stop on their own fluid (to convert
+	-- flowing -> source). Otherwise they pass through fluid to place behind it.
 	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
 	local isEmptyBucket = blockData and blockData.IsEmptyBucket
 	local isWaterBucket = blockData and blockData.IsWaterBucket
-	local isBucketTool = isEmptyBucket or isWaterBucket
+	local isLavaBucket = blockData and blockData.IsLavaBucket
+	local isBucketTool = isEmptyBucket or isWaterBucket or isLavaBucket
 	
-	-- Raycast loop: if we hit water and aren't holding a bucket,
-	-- add the water block to the filter and re-cast through it.
-	-- EmptyBucket: stops at SOURCE water only (passes through flowing)
-	-- WaterBucket: stops at ANY water (to convert flowing->source) or passes through to place on blocks below
+	-- Raycast loop: pass through fluids that this bucket can't interact with
+	-- so the player can target a solid block on the other side.
+	-- EmptyBucket: stops at SOURCE water OR lava (passes through flowing)
+	-- WaterBucket: stops at ANY water (convert flowing->source); passes through lava
+	-- LavaBucket:  stops at ANY lava  (convert flowing->source); passes through water
 	local MAX_PASSES = 20 -- Safety limit
 	for _ = 1, MAX_PASSES do
 		local result = workspace:Raycast(origin, direction * REACH_DISTANCE, raycastParams)
@@ -866,38 +898,54 @@ local function raycastForBlock()
 			return result
 		end
 		
-		-- Check if we hit a water block
+		-- Identify the hit as water / lava / other (and unwrap the parent if
+		-- the part is a child of a fluid block).
 		local hitBlock = result.Instance
-		if not hitBlock:GetAttribute("IsWater") then
-			-- Check parent (water might be a child part)
-			if hitBlock.Parent and hitBlock.Parent:GetAttribute("IsWater") then
+		local isWaterHit = hitBlock:GetAttribute("IsWater") == true
+		local isLavaHit = hitBlock:GetAttribute("IsLava") == true
+		if not (isWaterHit or isLavaHit) and hitBlock.Parent then
+			if hitBlock.Parent:GetAttribute("IsWater") then
 				hitBlock = hitBlock.Parent
-			else
-				-- Not water, return the result
-				return result
+				isWaterHit = true
+			elseif hitBlock.Parent:GetAttribute("IsLava") then
+				hitBlock = hitBlock.Parent
+				isLavaHit = true
 			end
 		end
 		
-		-- Hit water block
-		local waterLevel = hitBlock:GetAttribute("WaterLevel") or 0
+		if not (isWaterHit or isLavaHit) then
+			return result -- Solid block, normal hit
+		end
 		
 		if isEmptyBucket then
-			-- EmptyBucket: only stop at source blocks (level 0), pass through flowing
-			if waterLevel == 0 then
+			-- EmptyBucket: only stop at source blocks (level 0) of either fluid,
+			-- pass through flowing to reach a source / solid block behind it.
+			local level
+			if isWaterHit then
+				level = hitBlock:GetAttribute("WaterLevel") or 0
+			else
+				level = hitBlock:GetAttribute("LavaLevel") or 0
+			end
+			if level == 0 then
 				return result
 			end
-			-- Flowing water: skip through to reach source behind/below it
 			table.insert(filterList, hitBlock)
 			raycastParams.FilterDescendantsInstances = filterList
 			continue
 		end
 		
-		if isWaterBucket then
-			-- WaterBucket: stop at ANY water (to convert flowing->source or reject placing on source)
+		if isWaterBucket and isWaterHit then
+			-- WaterBucket on water: stop here (convert flowing->source or reject).
 			return result
 		end
 		
-		-- Not a bucket: skip through water by adding to filter
+		if isLavaBucket and isLavaHit then
+			-- LavaBucket on lava: stop here.
+			return result
+		end
+		
+		-- Any other case (no bucket, or bucket facing the wrong fluid): skip
+		-- through this fluid block and re-cast.
 		table.insert(filterList, hitBlock)
 		raycastParams.FilterDescendantsInstances = filterList
 	end
@@ -1111,11 +1159,44 @@ end
 -- BREAKING SYSTEM
 -- ============================================
 
+-- ============================================
+-- BLOCK-BREAK CRACK OVERLAY (Minecraft destroy stages)
+-- ============================================
+-- Frames 0->9 play over the break duration on all six sides of the target. An
+-- invisible "wrapper" cube sized to the block's bounding box carries six Texture
+-- objects (one per face), so it works for plain part blocks AND multi-part models
+-- (grass blocks, chests, etc.) -- the crack sits on the outside of the whole
+-- thing. Textures tile at BLOCK_SIZE so the crack keeps the right scale on big
+-- models instead of stretching one image across the face.
+local CRACK_FRAMES = {
+	"rbxassetid://107738750300099",
+	"rbxassetid://118668832805089",
+	"rbxassetid://95687397890983",
+	"rbxassetid://91449639798909",
+	"rbxassetid://83977270074687",
+	"rbxassetid://139403604344255",
+	"rbxassetid://71625339065497",
+	"rbxassetid://113324576672842",
+	"rbxassetid://71448850706605",
+	"rbxassetid://83842727577705",
+}
+local CRACK_FACES = { Enum.NormalId.Front, Enum.NormalId.Back, Enum.NormalId.Left, Enum.NormalId.Right, Enum.NormalId.Top, Enum.NormalId.Bottom }
+
+local crackOverlayFolder = nil
+local function getCrackOverlayFolder()
+	if crackOverlayFolder and crackOverlayFolder.Parent then return crackOverlayFolder end
+	crackOverlayFolder = Instance.new("Folder")
+	crackOverlayFolder.Name = "BlockBreakCrackOverlay"
+	crackOverlayFolder.Parent = workspace.Terrain
+	return crackOverlayFolder
+end
+
+-- { part = wrapperPart, textures = {Texture...}, frame = 1 }
 local CrackOverlays = {}
 
 local function clearCrackOverlays()
-	for _, overlay in pairs(CrackOverlays) do
-		if overlay and overlay.Parent then overlay:Destroy() end
+	if CrackOverlays.part and CrackOverlays.part.Parent then
+		CrackOverlays.part:Destroy()
 	end
 	CrackOverlays = {}
 end
@@ -1123,34 +1204,71 @@ end
 local function createCrackOverlaysForBlock(block)
 	clearCrackOverlays()
 	if not block or not block.Parent then return end
-	
-	local targetPart = block
-	if block:IsA("Model") then
-		targetPart = block.PrimaryPart or block:FindFirstChildWhichIsA("BasePart")
+
+	local cf, size = getBlockBoundingBox(block)
+	if not cf or not size then return end
+
+	-- Crack tint = the block's own colour, much darker, so each crack reads as a
+	-- dark shade of that block instead of a generic grey overlay.
+	local baseColor = Color3.fromRGB(160, 160, 160)
+	if block:IsA("BasePart") then
+		baseColor = block.Color
+	else
+		local best, bestVol
+		for _, d in ipairs(block:GetDescendants()) do
+			if d:IsA("BasePart") then
+				local v = d.Size.X * d.Size.Y * d.Size.Z
+				if not bestVol or v > bestVol then bestVol, best = v, d end
+			end
+		end
+		if best then baseColor = best.Color end
 	end
-	if not targetPart then return end
-	
-	local faces = {Enum.NormalId.Front, Enum.NormalId.Back, Enum.NormalId.Left, Enum.NormalId.Right, Enum.NormalId.Top, Enum.NormalId.Bottom}
-	
-	for _, face in ipairs(faces) do
-		local surfaceGui = Instance.new("SurfaceGui")
-		surfaceGui.Name = "CrackOverlay_" .. face.Name
-		surfaceGui.Face = face
-		surfaceGui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-		surfaceGui.PixelsPerStud = 32
-		surfaceGui.LightInfluence = 0
-		surfaceGui.Adornee = targetPart
-		surfaceGui.Parent = PlayerGui
-		
-		local overlay = Instance.new("Frame")
-		overlay.Name = "Overlay"
-		overlay.Size = UDim2.new(1, 0, 1, 0)
-		overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-		overlay.BackgroundTransparency = 1
-		overlay.BorderSizePixel = 0
-		overlay.Parent = surfaceGui
-		
-		CrackOverlays[face.Name] = surfaceGui
+	local CRACK_DARKEN = 0.35 -- how much darker than the block the crack is (lower = darker)
+	local crackColor = Color3.new(baseColor.R * CRACK_DARKEN, baseColor.G * CRACK_DARKEN, baseColor.B * CRACK_DARKEN)
+
+	-- Invisible wrapper sized to the block; the Texture objects on its six faces
+	-- are what render the crack. CanQuery=false so it never blocks the break ray.
+	local wrapper = Instance.new("Part")
+	wrapper.Name = "CrackWrapper"
+	wrapper.Anchored = true
+	wrapper.CanCollide = false
+	wrapper.CanQuery = false
+	wrapper.CanTouch = false
+	wrapper.CastShadow = false
+	wrapper.Transparency = 1
+	wrapper.Size = size + Vector3.new(0.02, 0.02, 0.02) -- hug the surface; tiny offset avoids z-fighting
+	wrapper.CFrame = cf
+	wrapper.Parent = getCrackOverlayFolder()
+
+	local textures = {}
+	for _, face in ipairs(CRACK_FACES) do
+		local tex = Instance.new("Texture")
+		tex.Face = face
+		tex.Texture = CRACK_FRAMES[1]
+		-- Tile at the block grid size so the crack keeps a consistent scale on
+		-- large models rather than stretching one image across the whole face.
+		tex.StudsPerTileU = BLOCK_SIZE
+		tex.StudsPerTileV = BLOCK_SIZE
+		-- Tint each crack to a much darker shade of the block's own colour so it
+		-- blends as cracks in that block instead of a generic grey overlay.
+		tex.Color3 = crackColor
+		tex.Transparency = 0.2
+		tex.Parent = wrapper
+		table.insert(textures, tex)
+	end
+
+	CrackOverlays = { part = wrapper, textures = textures, frame = 1 }
+end
+
+-- Advance the crack texture to match break progress (0..1).
+local function updateCrackOverlayFrame(progress)
+	if not CrackOverlays.textures then return end
+	local idx = math.clamp(math.floor(progress * #CRACK_FRAMES) + 1, 1, #CRACK_FRAMES)
+	if idx == CrackOverlays.frame then return end
+	CrackOverlays.frame = idx
+	local asset = CRACK_FRAMES[idx]
+	for _, tex in ipairs(CrackOverlays.textures) do
+		tex.Texture = asset
 	end
 end
 
@@ -1189,6 +1307,9 @@ local function startBreaking(target)
 		return -- do NOT enter breaking state
 	end
 	
+	-- Creative-style: a quick crack animation plays over BREAK_TIME, then the block
+	-- pops. Once started the break commits (it finishes even if the button is
+	-- released), so a single click reliably breaks one block; holding chains them.
 	BreakingState.isBreaking = true
 	BreakingState.target = target
 	BreakingState.progress = 0
@@ -1200,6 +1321,7 @@ local function stopBreaking()
 	BreakingState.isBreaking = false
 	BreakingState.target = nil
 	BreakingState.progress = 0
+	BreakCooldownTimer = 0
 	if BreakProgressUI then BreakProgressUI.Visible = false end
 	clearCrackOverlays()
 end
@@ -1254,14 +1376,9 @@ local function updateBreaking(deltaTime)
 	
 	BreakingState.progress = BreakingState.progress + (deltaTime / BreakingState.timeRequired)
 	
-	if BreakProgressUI then BreakProgressUI.Visible = true end
-	if ProgressFill then ProgressFill.Size = UDim2.new(BreakingState.progress, 0, 1, 0) end
-	
-	local targetTransparency = 1 - (BreakingState.progress * 0.7)
-	for _, overlay in pairs(CrackOverlays) do
-		local frame = overlay:FindFirstChild("Overlay")
-		if frame then frame.BackgroundTransparency = targetTransparency end
-	end
+	-- No survival progress bar; the crack texture is the feedback now.
+	if BreakProgressUI then BreakProgressUI.Visible = false end
+	updateCrackOverlayFrame(BreakingState.progress)
 	
 	if BreakingState.progress >= 1 then
 		local targetBlock = BreakingState.target
@@ -1320,6 +1437,7 @@ local function updateBreaking(deltaTime)
 		end
 		
 		stopBreaking()
+		BreakCooldownTimer = CREATIVE_BREAK_COOLDOWN
 		if _G.OnBlockBroken then _G.OnBlockBroken() end
 	end
 end
@@ -1961,19 +2079,30 @@ local function TrySignInteraction()
 	return true
 end
 
-local function TryWaterBucketAction()
+local function TryBucketAction()
 	local blockData = _G.InventoryController and _G.InventoryController.GetSelectedBlock()
 	if not blockData then return false end
 	
+	-- Helper: swap the bucket the player just used in their hotbar. Wrapped
+	-- so the dependency on _G.InventoryController.SwapToolInHotbar is in one
+	-- place. No-op if InventoryController isn't ready yet.
+	local function swapBucket(fromName, toName)
+		if _G.InventoryController and _G.InventoryController.SwapToolInHotbar then
+			_G.InventoryController.SwapToolInHotbar(fromName, toName)
+		end
+	end
+	
+	-- =========================================================
+	-- WATER BUCKET: place water source, or convert flowing water -> source
+	-- =========================================================
 	if blockData.IsWaterBucket then
 		local target, _ = getBlockTarget()
 		if not target then return false end
 		
-		-- Check if we're targeting a water block (for flowing->source conversion)
+		-- Targeting water: try to convert flowing -> source
 		if target:GetAttribute("IsWater") then
 			local waterLevel = target:GetAttribute("WaterLevel") or 0
 			if waterLevel > 0 then
-				-- Flowing water: convert to source block
 				local blockPos
 				local bpx = target:GetAttribute("BlockPosX")
 				local bpy = target:GetAttribute("BlockPosY")
@@ -1988,35 +2117,97 @@ local function TryWaterBucketAction()
 				
 				if PlaceWater then
 					PlaceWater:FireServer({ Position = blockPos, ConvertFlowing = true })
+					swapBucket("WaterBucket", "EmptyBucket")
 					if _G.OnBlockPlaced then _G.OnBlockPlaced() end
 				end
 				return true
 			else
-				-- Source water: can't place another source on top of a source
-				return true -- Consume the click but do nothing
+				-- Source water already: consume click, do nothing.
+				return true
 			end
 		end
 		
-		-- Not targeting water: place water source at adjacent position (like placing a block)
+		-- Not targeting water: place a source at the adjacent grid cell.
 		local gridPos = getPlacementPosition(blockData)
 		if not gridPos then return false end
-		
 		if not canInteractAtPosition(gridPos) then return false end
 		
 		if PlaceWater then
 			PlaceWater:FireServer({ Position = gridPos })
+			swapBucket("WaterBucket", "EmptyBucket")
 			if _G.OnBlockPlaced then _G.OnBlockPlaced() end
 		end
 		return true
 		
-	elseif blockData.IsEmptyBucket then
-		-- Pick up water source at targeted block
+	-- =========================================================
+	-- LAVA BUCKET: same shape as WaterBucket but targets lava.
+	-- Mirrors the water branch above; any change here probably needs to
+	-- happen in the water branch too.
+	-- =========================================================
+	elseif blockData.IsLavaBucket then
 		local target, _ = getBlockTarget()
 		if not target then return false end
 		
-		-- Must be targeting a water source block
-		if not target:GetAttribute("IsWater") then return false end
-		if target:GetAttribute("WaterLevel") ~= 0 then return false end -- Only pick up sources
+		-- Targeting lava: try to convert flowing -> source
+		if target:GetAttribute("IsLava") then
+			local lavaLevel = target:GetAttribute("LavaLevel") or 0
+			if lavaLevel > 0 then
+				local blockPos
+				local bpx = target:GetAttribute("BlockPosX")
+				local bpy = target:GetAttribute("BlockPosY")
+				local bpz = target:GetAttribute("BlockPosZ")
+				if bpx and bpy and bpz then
+					blockPos = Vector3.new(bpx, bpy, bpz)
+				elseif target:IsA("BasePart") then
+					blockPos = target.Position
+				end
+				if not blockPos then return false end
+				if not canInteractAtPosition(blockPos) then return false end
+				
+				if PlaceLava then
+					PlaceLava:FireServer({ Position = blockPos, ConvertFlowing = true })
+					swapBucket("LavaBucket", "EmptyBucket")
+					if _G.OnBlockPlaced then _G.OnBlockPlaced() end
+				end
+				return true
+			else
+				return true -- Source lava: consume click, do nothing
+			end
+		end
+		
+		-- Not targeting lava: place a source at the adjacent grid cell.
+		local gridPos = getPlacementPosition(blockData)
+		if not gridPos then return false end
+		if not canInteractAtPosition(gridPos) then return false end
+		
+		if PlaceLava then
+			PlaceLava:FireServer({ Position = gridPos })
+			swapBucket("LavaBucket", "EmptyBucket")
+			if _G.OnBlockPlaced then _G.OnBlockPlaced() end
+		end
+		return true
+		
+	-- =========================================================
+	-- EMPTY BUCKET: pick up a water OR lava source. Whichever fluid the
+	-- raycast landed on, fire the matching pickup remote. The server will
+	-- decide what (if anything) to give back to the player's inventory.
+	-- =========================================================
+	elseif blockData.IsEmptyBucket then
+		local target, _ = getBlockTarget()
+		if not target then return false end
+		
+		local isWaterTarget = target:GetAttribute("IsWater") == true
+		local isLavaTarget = target:GetAttribute("IsLava") == true
+		if not (isWaterTarget or isLavaTarget) then return false end
+		
+		-- Only source blocks (level 0) are pickupable.
+		local level
+		if isWaterTarget then
+			level = target:GetAttribute("WaterLevel") or 0
+		else
+			level = target:GetAttribute("LavaLevel") or 0
+		end
+		if level ~= 0 then return false end
 		
 		local blockPos
 		if target:IsA("BasePart") then
@@ -2026,17 +2217,23 @@ local function TryWaterBucketAction()
 			blockPos = p and p.Position
 		end
 		if not blockPos then return false end
-		
 		if not canInteractAtPosition(blockPos) then return false end
 		
-		if PickupWater then
+		if isWaterTarget and PickupWater then
 			PickupWater:FireServer({ Position = blockPos })
+			swapBucket("EmptyBucket", "WaterBucket")
+		elseif isLavaTarget and PickupLava then
+			PickupLava:FireServer({ Position = blockPos })
+			swapBucket("EmptyBucket", "LavaBucket")
 		end
 		return true
 	end
 	
 	return false
 end
+
+-- Back-compat alias: older code paths may still call TryWaterBucketAction.
+local TryWaterBucketAction = TryBucketAction
 
 -- ============================================
 -- INPUT HANDLING
@@ -2084,7 +2281,8 @@ end)
 UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
 		MouseDown = false
-		stopBreaking()
+		-- Don't cancel an in-progress break on release; let it finish so a quick
+		-- single click still breaks the block (the crack commits once started).
 	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
 		RightMouseDown = false
 	end
@@ -2301,10 +2499,15 @@ RunService.RenderStepped:Connect(function(deltaTime)
 		end
 	end
 	
-	-- Update breaking
-	if MouseDown and BreakingState.isBreaking then
+	-- Update breaking (creative-style: a quick crack flash, then the block pops).
+	-- A break commits once started (finishes even if released), and a short cooldown
+	-- gates the NEXT break while holding so you don't chew through blocks too fast.
+	if BreakCooldownTimer > 0 then
+		BreakCooldownTimer = BreakCooldownTimer - deltaTime
+	end
+	if BreakingState.isBreaking then
 		updateBreaking(deltaTime)
-	elseif MouseDown and not BreakingState.isBreaking then
+	elseif MouseDown and BreakCooldownTimer <= 0 then
 		local t, _ = getBlockTarget()
 		if t then startBreaking(t) end
 	end

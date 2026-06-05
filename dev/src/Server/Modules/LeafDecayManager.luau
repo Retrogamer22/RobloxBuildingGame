@@ -66,8 +66,13 @@ local function isLog(block)
 end
 
 -- Check if a block is a decayable leaf
+-- Matches any per-type leaf block (OakLeaves/BirchLeaves/SpruceLeaves) as well as
+-- the legacy "Leaves" name, via substring match -- mirrors how isLog works.
 local function isDecayableLeaf(block)
-	return block:GetAttribute("BlockType") == "Leaves" and block:GetAttribute("CanDecay") == true
+	if block:GetAttribute("CanDecay") ~= true then return false end
+	local blockType = block:GetAttribute("BlockType")
+	if not blockType then return false end
+	return blockType:find("Leaves") ~= nil
 end
 
 -- Spatial query helper: find parts near a position using Roblox's spatial indexing

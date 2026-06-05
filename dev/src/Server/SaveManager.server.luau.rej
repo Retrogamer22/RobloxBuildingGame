@@ -1,0 +1,24 @@
+diff a/dev/src/Server/SaveManager.server.luau b/dev/src/Server/SaveManager.server.luau	(rejected hunks)
+@@ -2874,6 +2905,22 @@ local function loadPlotFromSlot(player, buildArea, plotNumber, slotNumber)
+ 	PlayerActiveSlot[player.UserId] = slotNumber
+ 	LoadSucceeded[player.UserId] = true -- Plot loaded successfully; saving is now safe.
+ 	
++	-- Seed the client's terrain prediction with this plot's dug positions BEFORE it can
++	-- predict into them. Without this, digging next to a previously-dug-out area makes the
++	-- client spawn phantom terrain into the saved hole (it has no session record that those
++	-- cells are dug), which then gets cleaned up a round-trip later -- the "blocks flash in,
++	-- then vanish" glitch. Chunked so no single remote payload is huge on heavily-mined plots.
++	if #clientDugSeed > 0 and TerrainDugPositions then
++		local SEED_CHUNK = 600
++		for i = 1, #clientDugSeed, SEED_CHUNK do
++			local batch = {}
++			for j = i, math.min(i + SEED_CHUNK - 1, #clientDugSeed) do
++				batch[#batch + 1] = clientDugSeed[j]
++			end
++			TerrainDugPositions:FireClient(player, batch)
++		end
++	end
++	
+ 	-- Update metadata
+ 	local meta = getPlayerMeta(player.UserId)
+ 	if meta then

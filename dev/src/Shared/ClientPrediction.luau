@@ -10,10 +10,16 @@
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local TerrainLogic = require(ReplicatedStorage:WaitForChild("TerrainLogic", 10))
 
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("GridConfig", 10))
+-- Free-build (second) place gate. There, the world is one continuous space with
+-- no bounded plots, so prediction resolves any position to the player's owned
+-- center build area instead of a footprint test. Mirrors BlockHandler +
+-- BuildingController. Single source of truth: BetaConfig.
+local BetaConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("BetaConfig", 10))
 
 local ClientPrediction = {}
 
@@ -126,6 +132,20 @@ local function hideBlockCompletely(block)
 		block.Transparency = 1
 		block.CanCollide = false
 		block.CanQuery = false -- CRITICAL: Let raycasts pass through hidden blocks
+		-- Single-part blocks (e.g. leaves) carry their look on child Texture/Decal
+		-- objects, which keep rendering even when the part is fully transparent. Hide
+		-- them too, or the texture lingers on screen until the server destroys the block.
+		for _, child in ipairs(block:GetDescendants()) do
+			if child:IsA("Decal") or child:IsA("Texture") then
+				if not originalData.decals then originalData.decals = {} end
+				table.insert(originalData.decals, { decal = child, transparency = child.Transparency })
+				child.Transparency = 1
+			elseif child:IsA("SurfaceGui") then
+				if not originalData.surfaceGuis then originalData.surfaceGuis = {} end
+				table.insert(originalData.surfaceGuis, { gui = child, enabled = child.Enabled })
+				child.Enabled = false
+			end
+		end
 	elseif block:IsA("Model") then
 		originalData.parts = {}
 		for _, part in ipairs(block:GetDescendants()) do
@@ -363,6 +383,12 @@ function ClientPrediction.OnBlockPlace(blockId, gridPos, placementData, blocksFo
 	-- since those have special positioning logic
 	if not gridPos or not blocksFolder then return end
 
+	-- Leaf blocks receive a randomized biome/season tint server-side. A ghost would
+	-- render the untinted template colour first and visibly flash to the real tint
+	-- once the server block replicates. Skip prediction for leaves so the only colour
+	-- the client ever sees is the final, server-tinted block. [BB-LEAF-TINT]
+	if string.find(blockId, "Leaves") then return end
+
 	local key = posKey(gridPos)
 	if placementPredictions[key] then return end -- Already predicted
 
@@ -490,18 +516,21 @@ function ClientPrediction.RestoreHiddenBlock(block)
 				end
 			end
 		end
-		if original.decals then
-			for _, decalData in ipairs(original.decals) do
-				if decalData.decal and decalData.decal.Parent then
-					decalData.decal.Transparency = decalData.transparency or 0
-				end
+	end
+
+	-- Restore any hidden Texture/Decal/SurfaceGui. Applies to both single-part blocks
+	-- (e.g. leaves, whose textures are hidden in the BasePart branch above) and models.
+	if original.decals then
+		for _, decalData in ipairs(original.decals) do
+			if decalData.decal and decalData.decal.Parent then
+				decalData.decal.Transparency = decalData.transparency or 0
 			end
 		end
-		if original.surfaceGuis then
-			for _, guiData in ipairs(original.surfaceGuis) do
-				if guiData.gui and guiData.gui.Parent then
-					guiData.gui.Enabled = guiData.enabled ~= nil and guiData.enabled or true
-				end
+	end
+	if original.surfaceGuis then
+		for _, guiData in ipairs(original.surfaceGuis) do
+			if guiData.gui and guiData.gui.Parent then
+				guiData.gui.Enabled = guiData.enabled ~= nil and guiData.enabled or true
 			end
 		end
 	end
@@ -558,6 +587,20 @@ function ClientPrediction.IsBlockHidden(block)
 end
 
 function ClientPrediction.GetBuildAreaAtPosition(pos)
+	-- FREE-BUILD PLACE: continuous world, no per-plot footprint. Resolve ANY
+	-- position to the local player's owned center build area (the chunk (0,0)
+	-- model that owns the shared grid + terrain attributes prediction reads).
+	if BetaConfig.IsFreeBuildPlace() then
+		local lp = Players.LocalPlayer
+		for i = 1, 20 do
+			local area = workspace:FindFirstChild("BuildArea" .. i)
+			if area and lp and area:GetAttribute("OwnerUserId") == lp.UserId then
+				return area
+			end
+		end
+		return nil -- not assigned yet
+	end
+
 	-- Search build areas in workspace to find which one contains this position
 	for i = 1, 20 do -- Check up to 20 build areas
 		local area = workspace:FindFirstChild("BuildArea" .. i)

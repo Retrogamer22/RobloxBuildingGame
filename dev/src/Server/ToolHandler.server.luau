@@ -11,6 +11,7 @@ local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("GridConfig", 10))
 local NetherConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("NetherConfig", 10))
 local VinePlacement = require(ReplicatedStorage:WaitForChild("VinePlacement", 10))
+local BreakFX = require(ReplicatedStorage:WaitForChild("BreakFX", 10))
 local FencePlacement = require(ReplicatedStorage:WaitForChild("FencePlacement", 10))
 local BlockSpatialIndex = require(ReplicatedStorage:WaitForChild("BlockSpatialIndex", 10))
 local BlocksFolder = ReplicatedStorage:WaitForChild("Blocks", 10)
@@ -346,7 +347,138 @@ local function cascadeDestroyVinesBelow(startPos, face, blocksFolder)
 	return count
 end
 
+-- Fire a leaf-coloured break-particle burst for a leaf block / leaf-filled frame about
+-- to be sheared. Samples a "Leaves" texture tint first (the leaf colour lives on the
+-- texture, not the part) so the puff reads green, then fires the shared BreakFX burst.
+local function fireLeafShearFX(targetBlock)
+	local fxColor
+	for _, d in ipairs(targetBlock:GetDescendants()) do
+		if (d:IsA("Texture") or d:IsA("Decal")) and d.Name == "Leaves" then
+			fxColor = d.Color3
+			break
+		end
+	end
+	if not fxColor and targetBlock:IsA("BasePart") then
+		fxColor = targetBlock.Color
+	end
+	if fxColor then targetBlock:SetAttribute("BreakFXColor", fxColor) end
+	BreakFX.Fire(targetBlock)
+	targetBlock:SetAttribute("BreakFXColor", nil)
+end
+
+-- ============================================
+-- SHEARS: Strip the leaves off a leaf-FILLED frame block, revealing its branches.
+-- ============================================
+-- A frame filled with leaves is a solid block carrying the leaf fill id on its
+-- FrameFillBlockId attribute (its BlockType stays the frame's, e.g. "FrameBlock").
+-- The fill copied BOTH the leaf model's "Branches" and "Leaves" face textures onto
+-- it (BlockHandler fill path), with the branches keeping their own bark tint.
+-- Shearing removes only the "Leaves" texture in place, leaving the "Branches"
+-- texture, and re-tags the fill as the "<Wood>Branches" variant so save/load
+-- (SaveManager / MegaPlotSaveManager) reproduce the sheared look.
+local function shearFilledFrameLeaves(player, targetBlock)
+	local buildArea = getPlayerBuildArea(player)
+	if not buildArea then return false, "No build area" end
+	local blocksFolder = buildArea:FindFirstChild("Blocks")
+	if not blocksFolder then return false, "No blocks folder" end
+	if targetBlock.Parent ~= blocksFolder then
+		return false, "Block not in your plot"
+	end
+
+	local fillId = targetBlock:GetAttribute("FrameFillBlockId")
+	if not fillId or not string.find(fillId, "Leaves") then
+		return false, "Not a leaf-filled frame"
+	end
+
+	-- Pop a leaf-coloured particle burst (sample the tint before the leaves are stripped).
+	fireLeafShearFX(targetBlock)
+
+	-- Strip the leaf texture(s); the "Branches" texture stays put.
+	local removed = BlockPresets.StripLeaves(targetBlock)
+	if removed == 0 then
+		return false, "Nothing to shear (no leaves)"
+	end
+
+	-- Re-tag the fill as the branches variant so it persists/reloads sheared.
+	local branchFillId = (fillId:gsub("Leaves", "Branches"))
+	targetBlock:SetAttribute("FrameFillBlockId", branchFillId)
+
+	print(string.format("[Shears] Sheared leaf-filled frame -> %s (removed %d leaf texture%s)",
+		branchFillId, removed, removed == 1 and "" or "s"))
+	return true, "Sheared into branches"
+end
+
+-- ============================================
+-- SHEARS: Strip the leaves off a standalone leaf block, revealing its branches.
+-- ============================================
+-- Per-type leaf blocks (OakLeaves/BirchLeaves/SpruceLeaves) carry stacked "Branches"
+-- and "Leaves" face textures; the branches keep their own bark tint (BiomeConfig.
+-- TintLeaves skips "Branches"). Shearing removes only the "Leaves" texture in place,
+-- relabels the block "<Wood>Branches", and stops it from decaying / makes it persist.
+-- On load the hidden "<Wood>Branches" preset (BranchesOnly) strips the leaves again.
+-- (dev still ships the legacy generic "Leaves" model with no per-type leaf/branch
+-- textures, so this is inert here until per-type leaf models are ported.)
+local function shearLeaves(player, targetBlock)
+	local buildArea = getPlayerBuildArea(player)
+	if not buildArea then return false, "No build area" end
+	local blocksFolder = buildArea:FindFirstChild("Blocks")
+	if not blocksFolder then return false, "No blocks folder" end
+	if targetBlock.Parent ~= blocksFolder then
+		return false, "Leaves not in your plot"
+	end
+
+	local leafType = targetBlock:GetAttribute("BlockType")
+	if not leafType or not string.find(leafType, "Leaves") then
+		return false, "Not a leaf block"
+	end
+
+	-- Pop a leaf-coloured particle burst (sample the tint before the leaves are stripped).
+	fireLeafShearFX(targetBlock)
+
+	-- Strip the leaf texture(s); the "Branches" texture (its own bark tint) stays.
+	local removed = BlockPresets.StripLeaves(targetBlock)
+	if removed == 0 then
+		return false, "Nothing to shear (no leaves)"
+	end
+
+	-- Relabel as the branches variant (OakLeaves -> OakBranches, etc.).
+	local branchType = (leafType:gsub("Leaves", "Branches"))
+	targetBlock:SetAttribute("BlockType", branchType)
+	targetBlock.Name = branchType
+
+	-- No longer a leaf: stop decay, and make sure it persists (terrain leaves have no
+	-- PlacedBy and would otherwise be skipped on save).
+	targetBlock:SetAttribute("CanDecay", nil)
+	if targetBlock:GetAttribute("PlacedBy") == nil then
+		targetBlock:SetAttribute("PlacedBy", player.UserId)
+	end
+	targetBlock:SetAttribute("IsLazyLoaded", true)
+
+	print(string.format("[Shears] Sheared %s -> %s (removed %d leaf texture%s)",
+		leafType, branchType, removed, removed == 1 and "" or "s"))
+	return true, "Sheared into branches"
+end
+
 local function useShears(player, targetBlock, _targetPosition)
+	-- Filled frame leaves: a frame filled with a leaf block carries the leaf id on
+	-- FrameFillBlockId (its BlockType stays the frame's). Shearing strips the leaf
+	-- texture in place, leaving the branches, and re-tags the fill for save/load.
+	do
+		local fillId = targetBlock and targetBlock:GetAttribute("FrameFillBlockId")
+		if fillId and string.find(fillId, "Leaves") then
+			return shearFilledFrameLeaves(player, targetBlock)
+		end
+	end
+
+	-- Leaf blocks: Shears strip a standalone leaf block into its "<Wood>Branches"
+	-- variant (matches any per-type leaf via the "Leaves" substring in BlockType).
+	do
+		local bt = targetBlock and targetBlock:GetAttribute("BlockType")
+		if bt and string.find(bt, "Leaves") then
+			return shearLeaves(player, targetBlock)
+		end
+	end
+
 	if not targetBlock or not targetBlock:GetAttribute("IsVine") then
 		return false, "Shears only work on vines"
 	end

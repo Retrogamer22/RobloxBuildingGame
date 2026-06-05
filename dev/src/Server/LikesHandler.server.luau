@@ -17,6 +17,7 @@ local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
+local TweenService = game:GetService("TweenService")
 
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
 
@@ -327,6 +328,125 @@ local function updateSignText(buildArea, likeCount)
 	end
 end
 
+-- Debug toggle for the owner-name banner. Set false to silence [BB-LIKE] logs.
+local DEBUG_LIKE_NAMES = false
+
+-- Cache of resolved owner display names so offline-owner plots don't hit the
+-- web API on every refresh pass.
+local OwnerDisplayNameCache = {} -- [userId] = displayName
+
+-- Best-available DISPLAY name for a plot owner WITHOUT yielding (matches the names
+-- shown in the player list). Order: live player -> cached lookup -> stored username
+-- attribute as a stopgap. Returns nil if nothing is known yet and kicks off a one-shot
+-- background resolve so the next pass (runs every 10s) can show the real display name.
+local function resolveOwnerDisplayName(ownerUserId, ownerNameAttr)
+	local online = Players:GetPlayerByUserId(ownerUserId)
+	if online then return online.DisplayName end
+	if OwnerDisplayNameCache[ownerUserId] then return OwnerDisplayNameCache[ownerUserId] end
+	task.spawn(function()
+		local ok, infos = pcall(function()
+			return Players:GetUserInfosByUserIdsAsync({ ownerUserId })
+		end)
+		if ok and infos and infos[1] and infos[1].DisplayName then
+			OwnerDisplayNameCache[ownerUserId] = infos[1].DisplayName
+		end
+	end)
+	-- Stopgap (username) until the async display-name lookup populates the cache.
+	if ownerNameAttr and ownerNameAttr ~= "" then return ownerNameAttr end
+	return nil
+end
+
+-- Tracks which NamePlates already have a bob tween running (start it only once).
+local namePlateBobStarted = {} -- [part] = true
+
+-- Gently float the NamePlate board up and down forever (subtle bob).
+local function startNamePlateBob(part)
+	if namePlateBobStarted[part] then return end
+	namePlateBobStarted[part] = true
+
+	-- Make sure it's kinematic so the tween fully controls it (no falling).
+	part.Anchored = true
+
+	local base = part.Position
+	local info = TweenInfo.new(
+		1.8,                          -- seconds for each leg of the bob
+		Enum.EasingStyle.Sine,
+		Enum.EasingDirection.InOut,
+		-1,                           -- repeat forever
+		true                          -- reverse (float up, then back down)
+	)
+	local tween = TweenService:Create(part, info, {
+		Position = base + Vector3.new(0, 0.35, 0),
+	})
+	tween:Play()
+end
+
+-- Plot owner's username painted onto the LikeSign's NamePlate board (a flat
+-- SurfaceGui locked to the board's face), plus a gentle up/down float.
+-- Pass username=nil to leave the board blank (e.g. an unowned plot).
+local function updateSignOwnerName(buildArea, username)
+	local likeSign = buildArea:FindFirstChild("LikeSign")
+	if not likeSign then return end
+
+	-- The board may be authored under the LikeSign model OR directly under the
+	-- BuildArea (depending on how it was placed in Studio) — check both.
+	local namePlate = likeSign:FindFirstChild("NamePlate")
+		or buildArea:FindFirstChild("NamePlate")
+	if not namePlate or not namePlate:IsA("BasePart") then return end
+
+	-- Reuse the SurfaceGui authored on the board; create one only if it's missing
+	-- (don't override the Face the board was set up with).
+	local gui = namePlate:FindFirstChildWhichIsA("SurfaceGui")
+	if not gui then
+		gui = Instance.new("SurfaceGui")
+		gui.Name = "NameGui"
+		gui.Face = Enum.NormalId.Front
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+		gui.PixelsPerStud = 50
+		gui.LightInfluence = 0
+		gui.Brightness = 1
+		gui.Parent = namePlate
+	end
+
+	-- Reuse an existing label, else create one that fills the board.
+	local label = gui:FindFirstChildWhichIsA("TextLabel")
+	if not label then
+		label = Instance.new("TextLabel")
+		label.Name = "OwnerName"
+		label.Size = UDim2.new(1, 0, 1, 0)
+		label.BackgroundTransparency = 1
+		label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+		label.TextStrokeTransparency = 0.4
+		label.Font = Enum.Font.Arcade
+		label.TextScaled = true
+		label.Text = ""
+		label.Parent = gui
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 8)
+		padding.PaddingRight = UDim.new(0, 8)
+		padding.PaddingTop = UDim.new(0, 4)
+		padding.PaddingBottom = UDim.new(0, 4)
+		padding.Parent = label
+	end
+
+	-- Always enforce a crisp canvas resolution and the arcade (pixel) font,
+	-- even on a reused SurfaceGui/label.
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 100
+	label.Font = Enum.Font.Arcade
+	label.Text = username or ""
+
+	-- Float the board gently (runs once per board).
+	startNamePlateBob(namePlate)
+
+	if DEBUG_LIKE_NAMES then
+		print(string.format("[BB-LIKE] NamePlate %s | face=%s text=%s",
+			buildArea.Name, tostring(gui.Face), tostring(label.Text)))
+	end
+end
+
 -- Update all signs when plot owners change
 local function updateAllSigns()
 	for i = 1, GridConfig.TOTAL_PLOTS do
@@ -336,8 +456,17 @@ local function updateAllSigns()
 			if ownerUserId then
 				local totalLikes = getTotalLikes(ownerUserId)
 				updateSignText(buildArea, totalLikes)
+
+				local ownerNameAttr = buildArea:GetAttribute("OwnerName")
+				local resolved = resolveOwnerDisplayName(ownerUserId, ownerNameAttr)
+				if DEBUG_LIKE_NAMES then
+					print(string.format("[BB-LIKE] plot %d owned by %s | OwnerName attr=%s | resolved=%s",
+						i, tostring(ownerUserId), tostring(ownerNameAttr), tostring(resolved)))
+				end
+				updateSignOwnerName(buildArea, resolved)
 			else
 				updateSignText(buildArea, 0)
+				updateSignOwnerName(buildArea, nil)
 			end
 		end
 	end

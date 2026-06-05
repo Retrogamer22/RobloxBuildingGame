@@ -16,6 +16,9 @@
 	- /clearfloatinggrass - Delete floating-grass debris (same test as scan); SAVE after
 	- /urgentupdate [message] - Force shutdown all servers with countdown
 	- /preview - Toggle owner inventory preview mode (see what a fresh player sees)
+	- /listsets - List all reward sets with rarity and block ids
+	- /giveset <username> <setname> - Grant a reward set to a player on this server
+	- /givesetall <setname> - Grant a reward set to everyone on this server
 ]]
 
 local Players = game:GetService("Players")
@@ -178,6 +181,23 @@ task.spawn(function()
 		if betaModule then
 			BetaPlayerManager = require(betaModule)
 		end
+	end
+end)
+
+-- Wait for CoinManager + RewardSetPicker (used by /listsets, /giveset, /givesetall)
+local CoinManager = nil
+local RewardSetPicker = nil
+task.spawn(function()
+	local modulesFolder = ServerScriptService:WaitForChild("Modules", 10)
+	if modulesFolder then
+		local coinModule = modulesFolder:WaitForChild("CoinManager", 10)
+		if coinModule then
+			CoinManager = require(coinModule)
+		end
+	end
+	local picker = ReplicatedStorage:WaitForChild("RewardSetPicker", 10)
+	if picker then
+		RewardSetPicker = require(picker)
 	end
 end)
 
@@ -572,6 +592,86 @@ local function handleChatCommand(player, message)
 		})
 		print("[BetaAdmin] Preview mode toggled by", player.Name, "->", stateText)
 		
+	elseif lowerMessage == "/listsets" then
+		-- List all reward sets known to the picker. Useful before /giveset so you
+		-- can copy an exact name and see the block ids that will be granted.
+		if not RewardSetPicker then
+			warn("[BetaAdmin] /listsets: RewardSetPicker not loaded yet")
+			return
+		end
+		local sets = RewardSetPicker.GetAllSets()
+		print("")
+		print("========== REWARD SETS ==========")
+		print(string.format("Total: %d set(s)", #sets))
+		for _, info in ipairs(sets) do
+			print(string.format("  - %s [%s] (%d block%s): %s",
+				info.name,
+				tostring(info.rarity or "Common"),
+				#info.grants,
+				(#info.grants == 1) and "" or "s",
+				table.concat(info.grants, ", ")))
+		end
+		print("==================================")
+		
+	elseif string.match(lowerMessage, "^/givesetall%s+") then
+		-- /givesetall <SetName> - grant to every player on this server.
+		-- Checked BEFORE /giveset because the prefix overlaps.
+		if not CoinManager then
+			warn("[BetaAdmin] /givesetall: CoinManager not loaded yet")
+			return
+		end
+		local setName = string.match(message, "^%S+%s+(.+)$")
+		if setName then setName = setName:match("^%s*(.-)%s*$") end
+		if not setName or setName == "" then
+			warn("[BetaAdmin] Usage: /givesetall <SetName>")
+			return
+		end
+		local targets = Players:GetPlayers()
+		print(string.format("[BetaAdmin] /givesetall '%s' by %s -> %d player(s)",
+			setName, player.Name, #targets))
+		for _, p in ipairs(targets) do
+			local ok, msg = CoinManager.GrantRewardSet(p.UserId, setName)
+			if ok then
+				print(string.format("  - %s: %s", p.Name, msg))
+			else
+				print(string.format("  - %s FAILED: %s", p.Name, tostring(msg)))
+			end
+		end
+		
+	elseif string.match(lowerMessage, "^/giveset%s+") then
+		-- /giveset <Username> <SetName> - grant a single set to one player on this server.
+		if not CoinManager then
+			warn("[BetaAdmin] /giveset: CoinManager not loaded yet")
+			return
+		end
+		local username, setName = string.match(message, "^%S+%s+(%S+)%s+(.+)$")
+		if setName then setName = setName:match("^%s*(.-)%s*$") end
+		if not username or not setName or setName == "" then
+			warn("[BetaAdmin] Usage: /giveset <Username> <SetName>")
+			return
+		end
+		-- Resolve recipient on this server (case-insensitive on Name or DisplayName)
+		local target = nil
+		local lowerUser = string.lower(username)
+		for _, p in ipairs(Players:GetPlayers()) do
+			if string.lower(p.Name) == lowerUser or string.lower(p.DisplayName) == lowerUser then
+				target = p
+				break
+			end
+		end
+		if not target then
+			warn(string.format("[BetaAdmin] /giveset: no player matching '%s' on this server", username))
+			return
+		end
+		local ok, msg = CoinManager.GrantRewardSet(target.UserId, setName)
+		if ok then
+			print(string.format("[BetaAdmin] /giveset by %s -> %s: %s",
+				player.Name, target.Name, msg))
+		else
+			warn(string.format("[BetaAdmin] /giveset failed (%s -> %s): %s",
+				player.Name, target.Name, tostring(msg)))
+		end
+		
 	elseif string.match(lowerMessage, "^/urgentupdate") then
 		-- Urgent server shutdown with countdown (ALL SERVERS)
 		if isShuttingDown then
@@ -620,4 +720,4 @@ for _, player in ipairs(Players:GetPlayers()) do
 	end)
 end
 
-print("[BetaAdminCommands] Initialized - Owner commands: /betastatus, /betalist, /betacount, /update, /version, /resetversion, /changelog, /feedback, /clearfeedback, /scanfloatinggrass, /clearfloatinggrass, /urgentupdate, /preview")
+print("[BetaAdminCommands] Initialized - Owner commands: /betastatus, /betalist, /betacount, /update, /version, /resetversion, /changelog, /feedback, /clearfeedback, /scanfloatinggrass, /clearfloatinggrass, /urgentupdate, /preview, /listsets, /giveset, /givesetall")

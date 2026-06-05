@@ -53,6 +53,7 @@ print("[MegaPlotSaveManager] Private server confirmed, initializing...")
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
 local PlotSerializer = require(ReplicatedStorage:WaitForChild("PlotSerializer", 10))
 local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
+local PaintCanVisual = require(ReplicatedStorage:WaitForChild("PaintCanVisual", 10)) -- Paint Mod
 local SlabPlacement = require(ReplicatedStorage:WaitForChild("SlabPlacement", 10))
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local FencePlacement = require(ReplicatedStorage:WaitForChild("FencePlacement", 10))
@@ -373,6 +374,13 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 	local BlocksSourceFolder = templateCtx and templateCtx.BlocksSourceFolder or getBlocksFolder()
 	local DecorationsSourceFolder = templateCtx and templateCtx.DecorationsSourceFolder or getDecorationsFolder()
 
+	-- LEGACY-SAVE ALIAS: the single "Leaves" block was split into per-type leaf
+	-- blocks (OakLeaves/BirchLeaves/SpruceLeaves). Old saves still store "Leaves";
+	-- map them to OakLeaves so they resolve to a real preset/template and load.
+	if blockData.blockType == "Leaves" then
+		blockData.blockType = "OakLeaves"
+	end
+
 	local preset = BlockPresets.GetPreset(blockData.blockType)
 	if not preset then
 		-- FilledFence has no inventory preset - use a minimal fallback
@@ -655,7 +663,10 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 		if block:IsA("BasePart") then
 			cframe = CFrame.new(topOfBlock + Vector3.new(0, block.Size.Y / 2, 0)) * rotation45
 		elseif block:IsA("Model") then
-			cframe = CFrame.new(topOfBlock) * rotation45
+			-- SugarCaneTrimmed renders half a block high relative to its pivot; lower it
+			-- to line up with regular sugar cane (matches the ToolHandler trim).
+			local yFix = (blockData.blockType == "SugarCaneTrimmed") and -BLOCK_SIZE / 2 or 0
+			cframe = CFrame.new(topOfBlock + Vector3.new(0, yFix, 0)) * rotation45
 		end
 	elseif isStair then
 		local stairRotation = blockData.attributes.Rotation or 0
@@ -952,8 +963,31 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 		end
 	end
 
+	-- Texture-mode coloring (candy canes, etc.): the stripe pattern lives in
+	-- grayscale Texture/Decal children, so tinting them to the variant color
+	-- produces the colored block. Mirrors BlockHandler's Texture branch. Runs
+	-- independently of shouldApplyColor because these presets carry no Material
+	-- (which would gate that path off) and must NOT tint the white Bark part.
+	if preset.StripeColorMode == "Texture" and preset.ApplyColor ~= false and preset.DefaultColor then
+		local tint = preset.DefaultColor
+		for _, desc in ipairs(block:GetDescendants()) do
+			if desc:IsA("Texture") or desc:IsA("Decal") then
+				desc.Color3 = tint
+			elseif desc:IsA("BasePart") and desc.Name == "Core" then
+				desc.Color = tint
+			end
+		end
+		if block:IsA("BasePart") then
+			for _, child in ipairs(block:GetChildren()) do
+				if child:IsA("Texture") or child:IsA("Decal") then
+					child.Color3 = tint
+				end
+			end
+		end
+	end
+
 	-- Apply color/material
-	local shouldApplyColor = (not usedBlockModel or isLadder or isFence or preset.ApplyColor) and preset.DefaultColor and preset.Material and not isDecoration and not isBed
+	local shouldApplyColor = (not usedBlockModel or isLadder or isFence or preset.ApplyColor) and preset.DefaultColor and preset.Material and not isDecoration and not isBed and preset.StripeColorMode ~= "Texture"
 	if shouldApplyColor then
 		local color = preset.DefaultColor
 		local customR = blockData.attributes.CustomColorR
@@ -1031,8 +1065,54 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 		end
 	end
 	
+	-- Glass: never restore with the refractive Glass material.
+	if GlassPlacement.IsAnyGlass(blockData.blockType) then
+		GlassPlacement.NormalizeGlassMaterial(block)
+	end
+
+	-- Colored glass: recolor face textures + 70% transparency to match how it was
+	-- placed. Uses the saved custom color when present, else the preset tint.
+	if GlassPlacement.IsColoredGlass(blockData.blockType) and preset.DefaultColor then
+		local gColor = preset.DefaultColor
+		local cr, cg, cb = blockData.attributes.CustomColorR, blockData.attributes.CustomColorG, blockData.attributes.CustomColorB
+		if cr and cg and cb then gColor = Color3.fromRGB(cr, cg, cb) end
+		GlassPlacement.StyleColoredGlass(block, gColor)
+	end
+
+	-- Paint Mod: brush-painted blocks carry a blended color (CustomColorR/G/B), a coat count
+	-- (PaintCoats) and a primer-coat count (PaintPrimerCoats). shouldApplyColor above only covers
+	-- template/ApplyColor blocks, so restore the paint here for ANY block type. Snapshot the
+	-- default look first (so the sponge can fully revert post-reload), then ApplyCoats re-tints
+	-- the block and rebuilds the concrete cover textures from the primer-coat count. All paint
+	-- attributes round-trip via the generic attribute loop below, so this survives save/load.
+	if blockData.attributes.IsPainted then
+		local pr = blockData.attributes.CustomColorR
+		local pg = blockData.attributes.CustomColorG
+		local pb = blockData.attributes.CustomColorB
+		if pr and pg and pb then
+			local paintColor = Color3.fromRGB(pr, pg, pb)
+			local primerCoats = blockData.attributes.PaintPrimerCoats or 0
+			PaintCanVisual.CaptureOriginal(block)
+			PaintCanVisual.ApplyCoats(block, paintColor, primerCoats)
+		end
+	end
+	
+	-- Paint Mod: restore a placed paint can's PaintColor union. Preset cans derive color from
+	-- the preset; custom (mixer) cans carry cr/cg/cb; empty cans set IsEmptyCan.
+	if BlockPresets.IsPaintCan and BlockPresets.IsPaintCan(blockData.blockType) then
+		local canColor = preset and preset.DefaultColor
+		local ccr = blockData.attributes.CustomColorR
+		local ccg = blockData.attributes.CustomColorG
+		local ccb = blockData.attributes.CustomColorB
+		if ccr and ccg and ccb then canColor = Color3.fromRGB(ccr, ccg, ccb) end
+		PaintCanVisual.ApplyCan(block, canColor, blockData.attributes.IsEmptyCan == true)
+	end
+	
 	-- Restore frame block fill color/material
 	local frameFillId = blockData.attributes.FrameFillBlockId
+	-- LEGACY-SAVE ALIAS: pre-split saves stored the single "Leaves" fill id; map it to
+	-- OakLeaves so it resolves to a real preset/model (mirrors the blockType alias above).
+	if frameFillId == "Leaves" then frameFillId = "OakLeaves" end
 	if frameFillId and (isFrameBlock or blockData.blockType == "FilledFence") then
 		local fillPreset = BlockPresets.GetPreset(frameFillId)
 		if fillPreset then
@@ -1071,6 +1151,119 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 					if part:IsA("BasePart") then
 						part.Color = fillColor; part.Material = fillMaterial
 						part.MaterialVariant = fillMaterialVariant ~= "" and fillMaterialVariant or ""
+					end
+				end
+			end
+			-- Texture-mode fill (candy canes, etc.): stripes live in Texture/Decal
+			-- objects on the source model, not a MaterialVariant. Copy them onto the
+			-- filled block and tint to the fill color; keep the part white as the
+			-- stripe background.
+			if fillPreset.StripeColorMode == "Texture" then
+				local srcFolder = ReplicatedStorage
+				for _, n in ipairs(string.split(fillPreset.BlockModelFolder or "", "/")) do
+					srcFolder = srcFolder and srcFolder:FindFirstChild(n)
+				end
+				local srcModel = srcFolder and srcFolder:FindFirstChild(fillPreset.BlockModelName or frameFillId)
+				if srcModel then
+					local stripes = {}
+					local srcMaterial, srcMatVariant
+					local scanRoot = srcModel:IsA("BasePart") and srcModel:GetChildren() or srcModel:GetDescendants()
+					for _, c in ipairs(scanRoot) do
+						if c:IsA("Texture") or c:IsA("Decal") then table.insert(stripes, c) end
+					end
+					-- Filled candy frames always use the PixelCandyCaneAlt material variant.
+					-- Look it up in MaterialService so we set the matching BaseMaterial — a
+					-- MaterialVariant only renders when part.Material == its BaseMaterial.
+					-- Fall back to the source block's authored material if the variant is missing.
+					local altMV = game:GetService("MaterialService"):FindFirstChild("PixelCandyCaneAlt", true)
+					if altMV and altMV:IsA("MaterialVariant") then
+						srcMaterial = altMV.BaseMaterial
+						srcMatVariant = "PixelCandyCaneAlt"
+					elseif srcModel:IsA("BasePart") then
+						srcMaterial = srcModel.Material
+						srcMatVariant = srcModel.MaterialVariant
+					else
+						local body = srcModel.PrimaryPart or srcModel:FindFirstChild("Bark") or srcModel:FindFirstChildWhichIsA("BasePart")
+						if body then
+							srcMaterial = body.Material
+							srcMatVariant = body.MaterialVariant
+						end
+					end
+					local function applyStripes(part)
+						part.Color = Color3.new(1, 1, 1)
+						if srcMaterial then
+							part.Material = srcMaterial
+							part.MaterialVariant = srcMatVariant or ""
+						end
+						for _, tex in ipairs(stripes) do
+							local copy = tex:Clone()
+							copy.Color3 = fillColor
+							copy.Parent = part
+						end
+					end
+					if block:IsA("BasePart") then
+						applyStripes(block)
+					else
+						for _, part in ipairs(block:GetDescendants()) do
+							if part:IsA("BasePart") then applyStripes(part) end
+						end
+					end
+				end
+			end
+			-- Leaf-mode fill (mirror of BlockHandler): leaf blocks show their colour on the
+			-- Part with a face Texture on top. Recompute the randomized biome/season leaf
+			-- colour from the fill id (same as a placed leaf block on load), then copy the
+			-- leaf Part's transparency/material + face textures. Recomputing means old saves
+			-- (stored flat, pre-texture) auto-upgrade to the textured + randomized look.
+			if string.find(frameFillId, "Leaves") and BiomeConfig then
+				local leafType = (string.find(frameFillId, "Birch") and "Birch")
+					or (string.find(frameFillId, "Spruce") and "Spruce") or "Oak"
+				local fbiome = blockData.attributes.Biome
+				local fseason = blockData.attributes.Season or "Summer"
+				local leafColor
+				if fbiome then
+					leafColor = BiomeConfig.GetRandomizedTintedLeafColor(leafType, fbiome, fseason)
+				else
+					local leafConfig = BiomeConfig.LeafTypes[leafType] or BiomeConfig.LeafTypes.Oak
+					leafColor = BiomeConfig.GetRandomizedLeafColor(leafConfig.Color)
+				end
+				leafColor = leafColor or fillColor
+				local blocksFolder = ReplicatedStorage:FindFirstChild("Blocks")
+				local leafModel = blocksFolder and blocksFolder:FindFirstChild(frameFillId)
+				local leafPart = leafModel and (leafModel:IsA("BasePart") and leafModel or leafModel:FindFirstChildWhichIsA("BasePart"))
+				if leafPart then
+					local faces = {}
+					for _, c in ipairs(leafPart:GetChildren()) do
+						if c:IsA("Texture") or c:IsA("Decal") or c:IsA("SurfaceAppearance") then
+							table.insert(faces, c)
+						end
+					end
+					local function applyLeaf(part)
+						part.Transparency = leafPart.Transparency
+						part.Material = leafPart.Material
+						part.MaterialVariant = leafPart.MaterialVariant or ""
+						part.Color = leafColor
+						for _, ex in ipairs(part:GetChildren()) do
+							if ex:IsA("Texture") or ex:IsA("Decal") or ex:IsA("SurfaceAppearance") then
+								ex:Destroy()
+							end
+						end
+						for _, f in ipairs(faces) do
+							local c = f:Clone()
+							-- Leaves show their colour on the texture (see visibleBlockColor), not
+							-- the part, so tint each copied face or every fill is the same shade.
+							if c:IsA("Texture") or c:IsA("Decal") then
+								c.Color3 = leafColor
+							end
+							c.Parent = part
+						end
+					end
+					if block:IsA("BasePart") then
+						applyLeaf(block)
+					else
+						for _, part in ipairs(block:GetDescendants()) do
+							if part:IsA("BasePart") then applyLeaf(part) end
+						end
 					end
 				end
 			end
@@ -1299,7 +1492,7 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 		end
 		block:SetAttribute("NeedsBiomeColor", savedBiome == nil)
 	end
-	if blockData.blockType == "Leaves" and BiomeConfig then
+	if blockData.blockType and blockData.blockType:find("Leaves") ~= nil and BiomeConfig then
 		local treeType = blockData.attributes.TreeType or "Oak"
 		local leafColor
 		if savedBiome then
@@ -1313,6 +1506,14 @@ local function createBlockFromSave(blockData, blocksFolder, originOffset, templa
 			elseif block:IsA("Model") then
 				for _, part in ipairs(block:GetDescendants()) do
 					if part:IsA("BasePart") then part.Color = leafColor end
+				end
+			end
+			-- Leaves show their colour on the face Texture/Decal, not the part .Color
+			-- (see TreeGenerator.CreateLeaves / visibleBlockColor), so tint those too or
+			-- saved trees reload to a flat, uniform shade.
+			for _, d in ipairs(block:GetDescendants()) do
+				if d:IsA("Decal") then  -- Texture is a subclass of Decal
+					d.Color3 = leafColor
 				end
 			end
 		end
@@ -1560,6 +1761,15 @@ local function reconnectGlass(blocksFolder)
 			local currentType = glass:GetAttribute("GlassConnectionType") or "isolated"
 
 			if newInfo.connectionType ~= currentType then
+				-- Sample the old pane's color first so colored glass keeps its tint after
+				-- the connection-type swap (the freshly cloned template is uncolored).
+				local sampledColor
+				if glass:IsA("BasePart") then
+					sampledColor = glass.Color
+				elseif glass:IsA("Model") then
+					local fp = glass:FindFirstChildWhichIsA("BasePart", true)
+					if fp then sampledColor = fp.Color end
+				end
 				glass:Destroy()
 				local newTemplate = resolveGlassTemplate(glassType, newInfo.templateName)
 				if newTemplate then
@@ -1580,6 +1790,10 @@ local function reconnectGlass(blocksFolder)
 					end
 					newGlass:PivotTo(GlassPlacement.GetGlassCFrame(glassPos, newInfo.rotationCFrame))
 					newGlass.Parent = blocksFolder
+					GlassPlacement.NormalizeGlassMaterial(newGlass)
+					if GlassPlacement.IsColoredGlass(glassType) and sampledColor then
+						GlassPlacement.StyleColoredGlass(newGlass, sampledColor)
+					end
 					passUpdated += 1
 				end
 			end
@@ -1587,6 +1801,9 @@ local function reconnectGlass(blocksFolder)
 
 		if passUpdated == 0 then break end
 	end
+
+	-- Connected-glass texture culling for the freshly loaded mega-plot.
+	GlassPlacement.CullAllGlass(blocksFolder)
 end
 
 -- ============================================
@@ -1662,7 +1879,7 @@ local function setupRemovedBlockTracking(buildArea)
 
 		-- Leaves without PlacedBy (terrain-generated, but might not have IsTreeBlock)
 		local blockType = block:GetAttribute("BlockType")
-		if blockType == "Leaves" and not block:GetAttribute("PlacedBy") and not isGenerated then
+		if blockType and blockType:find("Leaves") ~= nil and not block:GetAttribute("PlacedBy") and not isGenerated then
 			isGenerated = true
 			if block:IsA("BasePart") then
 				worldPos = block.Position
@@ -2093,7 +2310,7 @@ local function loadFromSaveData(saveData, buildArea)
 
 				-- Leaves without PlacedBy
 				local blockType = item:GetAttribute("BlockType")
-				if blockType == "Leaves" and not item:GetAttribute("PlacedBy") and not isGenerated then
+				if blockType and blockType:find("Leaves") ~= nil and not item:GetAttribute("PlacedBy") and not isGenerated then
 					isGenerated = true
 					if item:IsA("BasePart") then
 						worldPos = item.Position

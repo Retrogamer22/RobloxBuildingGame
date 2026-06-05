@@ -508,7 +508,12 @@ BiomeConfig.Biomes = {
 		DisplayName = "Snowy",
 		Description = "Frozen tundra with snow",
 		SortOrder = 9,
-		GrassBlock = "Snow",
+		-- Generate PLAIN grass + a SnowLayer on top, then let the snow-on-grass
+		-- conversion turn it into SnowyGrassBlock (same mechanic as placing a snow
+		-- layer on grass). This keeps the surface + snow reconciled by one code path
+		-- instead of generating SnowyGrassBlock directly (which got green-tinted by
+		-- the biome/blend colour paths and left snow floating on green grass).
+		GrassBlock = "GrassBlock",
 		DirtBlock = "Dirt",
 		TreeTypes = {"Spruce"},
 		TreeDensity = 0.02,

@@ -41,7 +41,9 @@ local NatureBlocks = {
 	["Sandstone"] = true,
 	["Gravel"] = true,
 	["PathBlock"] = true,
-	["Leaves"] = true,
+	["OakLeaves"] = true,
+	["BirchLeaves"] = true,
+	["SpruceLeaves"] = true,
 	["OakLog"] = true,
 	["SpruceLog"] = true,
 	["BirchLog"] = true,
@@ -70,6 +72,9 @@ local SkipAutoPreset = {
 	["Vine"] = true,
 	["VineTrimmed"] = true,
 	["VineTrimmedEnd"] = true,
+	-- SugarCaneTrimmed is registered as an explicit hidden decoration preset below
+	-- (only obtainable via Shears), so skip the auto-decoration pass for it.
+	["SugarCaneTrimmed"] = true,
 	["ColumnTorch"] = true,
 	-- Column pieces (manually registered as single "Column" preset)
 	["ColumnSingle"] = true,
@@ -131,7 +136,9 @@ local SkipVariants = {
 	["OakLogHollow"] = true,
 	["SpruceLogHollow"] = true,
 	["BirchLogHollow"] = true,
-	["Leaves"] = true,
+	["OakLeaves"] = true,
+	["BirchLeaves"] = true,
+	["SpruceLeaves"] = true,
 	["GrassBlock"] = true,
 	["SnowyGrassBlock"] = true,
 	["PathBlock"] = true,
@@ -234,6 +241,11 @@ local BedBlocks = {}
 
 -- Blocks that are chests (wood-colored chest models) - populated dynamically
 local ChestBlocks = {}
+
+-- Paint Mod: paint cans (single PaintCan model tinted per color) - populated dynamically
+local PaintCanBlocks = {}
+-- Paint Mod: primer cans (subset of PaintCanBlocks that cover instead of recolor)
+local PrimerPaintCanBlocks = {}
 
 -- Blocks that are crafting tables (wood-colored with leather tint) - populated dynamically
 local CraftingTableBlocks = {}
@@ -869,6 +881,172 @@ local function generatePresets()
 	})
 	
 	-- ========================================
+	-- PAINT MOD: Paint Cans -> Paint category
+	-- ========================================
+	-- One can per ColorPalette color, all sharing the single PaintCan model
+	-- (Mods/PaintMod/PaintCan). The can body keeps its modeled look; only the PaintColor
+	-- union is tinted, handled by PaintCanVisual on place/load. UseBlockModel=true with NO
+	-- ApplyColor so the generic whole-model tint is skipped.
+	for _, entry in ipairs(ColorPalette.getColorsOrdered()) do
+		local canId = entry.name .. "PaintCan"
+		PaintCanBlocks[canId] = true
+		-- "LightBlue" -> "Light Blue Paint Can"
+		local canDisplay = entry.name:gsub("(%l)(%u)", "%1 %2") .. " Paint Can"
+		table.insert(presets, {
+			Id = canId,
+			Name = canDisplay,
+			Category = "Paint",
+			Shape = "Block",
+			Material = Enum.Material.SmoothPlastic,
+			DefaultColor = entry.color,
+			UseBlockModel = true,
+			BlockModelFolder = "Mods/PaintMod",
+			BlockModelName = "PaintCanModel", -- placed/ground can (Can/Paint/Wrapper); PaintCan is the held/inventory model
+			IsPaintCan = true,
+		})
+	end
+	
+	-- Primer Paint Cans: one per color, using the PrimerPaintCanModel. Same as regular cans but
+	-- flagged PaintIsPrimer so the brush covers (fades in the concrete texture) instead of just
+	-- recoloring. Hidden from the catalog -- players obtain primer cans from the Paint Mixer, not
+	-- the tab -- but registered so placement/save/load and the mixer output treat them as cans.
+	for _, entry in ipairs(ColorPalette.getColorsOrdered()) do
+		local canId = entry.name .. "PrimerPaintCan"
+		PaintCanBlocks[canId] = true
+		PrimerPaintCanBlocks[canId] = true
+		local canDisplay = entry.name:gsub("(%l)(%u)", "%1 %2") .. " Primer Can"
+		table.insert(presets, {
+			Id = canId,
+			Name = canDisplay,
+			Category = "Paint",
+			Shape = "Block",
+			Material = Enum.Material.SmoothPlastic,
+			DefaultColor = entry.color,
+			UseBlockModel = true,
+			BlockModelFolder = "Mods/PaintMod",
+			BlockModelName = "PrimerPaintCanModel",
+			IsPaintCan = true,
+			IsPrimerCan = true,
+			HideFromInventory = true, -- obtained via the mixer, not the catalog
+		})
+	end
+	
+	-- Mixer carrier cans: the Paint Mixer produces ANY color, so it can't map to a per-color
+	-- preset. Instead it grants one of these four generic carriers and overrides the inventory
+	-- slot's Color to the mixed shade. Primer flag + paint mode are encoded by WHICH carrier
+	-- (so the color rides the slot, primer/mode ride the preset -- no inventory-shape change).
+	-- Placement stamps PaintIsPrimer + PaintMode + CustomColorR/G/B from these so the brush and
+	-- save/load behave exactly like a hand-placed can. Hidden from the catalog.
+	for _, carrier in ipairs({
+		{ Id = "MixedPaintCan",            Name = "Paint Can",        Model = "PaintCanModel",       Primer = false, Mode = "blend" },
+		{ Id = "MixedPaintCanMatch",       Name = "Paint Can",        Model = "PaintCanModel",       Primer = false, Mode = "match" },
+		{ Id = "MixedPrimerPaintCan",      Name = "Primer Can",       Model = "PrimerPaintCanModel", Primer = true,  Mode = "blend" },
+		{ Id = "MixedPrimerPaintCanMatch", Name = "Primer Can",       Model = "PrimerPaintCanModel", Primer = true,  Mode = "match" },
+	}) do
+		PaintCanBlocks[carrier.Id] = true
+		if carrier.Primer then PrimerPaintCanBlocks[carrier.Id] = true end
+		table.insert(presets, {
+			Id = carrier.Id,
+			Name = carrier.Name,
+			Category = "Paint",
+			Shape = "Block",
+			Material = Enum.Material.SmoothPlastic,
+			DefaultColor = Color3.fromRGB(200, 200, 200), -- fallback; the slot Color override sets the real shade
+			UseBlockModel = true,
+			BlockModelFolder = "Mods/PaintMod",
+			BlockModelName = carrier.Model,
+			IsPaintCan = true,
+			IsPrimerCan = carrier.Primer or nil,
+			IsMixedCan = true,         -- placement stamps CustomColorR/G/B for these
+			PaintMode = carrier.Mode,  -- placement stamps PaintMode (brush reads it off the can)
+			HideFromInventory = true,  -- granted by the mixer, never shown in the catalog
+		})
+	end
+	
+	-- Empty Paint Can: the "blank" can (mixer input + plain placeable can). Lives in the Paint
+	-- tab next to the colored cans. Registered as a paint can so placement/save/load treat it
+	-- like the others; IsEmptyCan makes it render with no paint swatch.
+	PaintCanBlocks["EmptyPaintCan"] = true
+	table.insert(presets, {
+		Id = "EmptyPaintCan",
+		Name = "Empty Paint Can",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(200, 200, 200),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintCanModel",
+		IsPaintCan = true,
+		IsEmptyCan = true,
+	})
+	
+	-- Paint Brush: held tool that loads color from a placed can and paints anything.
+	-- NOT IsTool: keep it a preset item so GetSelectedBlock returns it (the brush engine
+	-- checks IsPaintbrush) and the hotbar renders it via the model path. placeBlock suppresses
+	-- placement on IsPaintbrush, so it never drops a block.
+	table.insert(presets, {
+		Id = "PaintBrush",
+		Name = "Paint Brush",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(205, 205, 205),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintBrush",
+		IsPaintbrush = true,
+	})
+	
+	-- Sponge: held tool that steps painted blocks backwards (flat -> painted -> default).
+	-- Same NOT-IsTool treatment as the brush so GetSelectedBlock returns it and the hotbar
+	-- renders the model; placeBlock suppresses placement on IsSponge so it never drops a block.
+	table.insert(presets, {
+		Id = "Sponge",
+		Name = "Sponge",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(230, 220, 120),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "Sponge",
+		IsSponge = true,
+	})
+	
+	-- Paint Swatch: empty held item. Right-click a block to capture its visible color; load it
+	-- into the mixer to pre-fill the color sliders. The swatch's six face-textures get tinted to
+	-- the captured color (PaintCanVisual.ApplySwatch). Not consumed by the mixer. NOT IsTool so
+	-- GetSelectedBlock returns it; placeBlock suppresses placement on IsSwatch.
+	table.insert(presets, {
+		Id = "PaintSwatch",
+		Name = "Paint Swatch",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(185, 185, 185),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintSwatch",
+		IsSwatch = true,
+	})
+	
+	-- Paint Mixer: placeable block; interacting with the placed mixer opens the color picker
+	-- (wired up with the mixer system).
+	table.insert(presets, {
+		Id = "PaintMixer",
+		Name = "Paint Mixer",
+		Category = "Paint",
+		Shape = "Block",
+		Material = Enum.Material.SmoothPlastic,
+		DefaultColor = Color3.fromRGB(150, 150, 150),
+		UseBlockModel = true,
+		BlockModelFolder = "Mods/PaintMod",
+		BlockModelName = "PaintMixer",
+		IsPaintMixer = true,
+	})
+	
+	-- ========================================
 	-- WIRING (Buttons, Pressure Plates, Lamps)
 	-- ========================================
 	local blockTemplates = ReplicatedStorage:FindFirstChild("BlockTemplates")
@@ -1039,8 +1217,8 @@ local function generatePresets()
 	if glassFolder then
 		local glassSubFolder = glassFolder:FindFirstChild("Glass")
 		if glassSubFolder then
-			-- Use Glass_0 (all edges) as the preview icon
-			local previewModel = glassSubFolder:FindFirstChild("Glass_0")
+			-- Use GlassPane (all edges) as the preview icon
+			local previewModel = glassSubFolder:FindFirstChild("GlassPane")
 			local color = Color3.fromRGB(200, 220, 255) -- Default light blue tint
 			local material = Enum.Material.Glass
 			
@@ -1057,7 +1235,7 @@ local function generatePresets()
 				DefaultColor = color,
 				UseBlockModel = true,
 				BlockModelFolder = "Decorations/Glass", -- Look in Decorations/Glass subfolder
-				BlockModelName = "Glass_0", -- Show all-edges piece as preview icon
+				BlockModelName = "GlassPane", -- Show all-edges piece as preview icon
 				IsGlass = true,
 				ApplyColor = false, -- Keep original glass appearance
 				SortPriority = 152, -- Group with glass (after glass blocks)
@@ -1120,7 +1298,7 @@ local function generatePresets()
 						DefaultColor = tintColor,
 						UseBlockModel = true,
 						BlockModelFolder = "Decorations/Glass",
-						BlockModelName = "Glass_0",
+						BlockModelName = "GlassPane",
 						IsGlass = true,
 						ApplyColor = true,
 						BaseBlock = glassPaneId,
@@ -1590,6 +1768,26 @@ local function generatePresets()
 				HideFromInventory = true, -- Only obtainable via Shears
 			})
 		end
+
+		-- SugarCaneTrimmed: hidden decoration preset (created by Shears, not placeable
+		-- directly). IsDecoration so it saves/loads through the decoration path; the
+		-- SugarCaneHandler growth system skips it (and counts it toward column height).
+		local sugarCaneTrimmedModel = decorationsFolder:FindFirstChild("SugarCaneTrimmed")
+		if sugarCaneTrimmedModel then
+			local c, m = extractBlockProperties(sugarCaneTrimmedModel)
+			table.insert(presets, {
+				Id = "SugarCaneTrimmed",
+				Name = "Sugar Cane (Trimmed)",
+				Category = "Decoration",
+				Shape = "Decoration",
+				Material = m,
+				DefaultColor = c,
+				UseBlockModel = false, -- decorations load from the Decorations folder
+				IsDecoration = true,
+				DecorationName = "SugarCaneTrimmed",
+				HideFromInventory = true, -- Only obtainable via Shears
+			})
+		end
 	end
 	
 	-- ========================================
@@ -2050,6 +2248,7 @@ local Categories = {
 	{ Name = "Frames", IconBlock = "FrameBlock", IconFolder = "FrameBlocks" },
 	{ Name = "Wiring", IconBlock = "Piston", IconFolder = "Blocks" },
 	{ Name = "Items", IconBlock = "WireTool", IconFolder = "Tools" },
+	{ Name = "Paint", IconBlock = "PaintMixer", IconFolder = "Mods/PaintMod" }, -- Paint Mod tab icon = the mixer
 }
 
 -- Lookup functions
@@ -2249,6 +2448,19 @@ local function IsChest(id)
 	return ChestBlocks[id] == true
 end
 
+local function IsPaintCan(id)
+	return PaintCanBlocks[id] == true
+end
+
+local function IsPrimerCan(id)
+	return PrimerPaintCanBlocks[id] == true
+end
+
+local function IsSwatch(id)
+	local preset = GetPreset(id)
+	return preset and preset.IsSwatch == true
+end
+
 local function IsBed(id)
 	return BedBlocks[id] == true
 end
@@ -2259,6 +2471,10 @@ end
 
 local function IsFurnace(id)
 	return id == "Furnace"
+end
+
+local function IsPaintMixer(id)
+	return id == "PaintMixer"
 end
 
 local function GetCraftingTableLeatherTint(id)
@@ -2349,6 +2565,9 @@ return {
 	IsDoor = IsDoor,
 	IsFence = IsFence,
 	IsGlass = IsGlass,
+	IsPaintCan = IsPaintCan,
+	IsPrimerCan = IsPrimerCan,
+	IsSwatch = IsSwatch,
 	IsSapling = IsSapling,
 	GetSaplingTreeType = GetSaplingTreeType,
 	IsLadder = IsLadder,
@@ -2366,6 +2585,7 @@ return {
 	IsBed = IsBed,
 	IsCraftingTable = IsCraftingTable,
 	IsFurnace = IsFurnace,
+	IsPaintMixer = IsPaintMixer,
 	GetCraftingTableLeatherTint = GetCraftingTableLeatherTint,
 	IsFrameBlock = IsFrameBlock,
 	IsArch = IsArch,

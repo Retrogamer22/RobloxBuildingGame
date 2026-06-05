@@ -334,7 +334,18 @@ local function createBlock(blockType, position, parent, terrainDepth, isLazyLoad
 		block.Anchored = true
 		block.CanCollide = true
 		block.CanTouch = false      -- Terrain doesn't need touch events
-		block.CastShadow = false    -- Massive memory savings (~285MB for 9 plots)
+		-- block.CastShadow = false    -- Massive memory savings (~285MB for 9 plots)  -- TEMP: commented to test terrain shadows
+		-- SnowLayer is a thin slab. `position` is the CENTRE of the grid cell it
+		-- occupies (one cell above the snowy grass, so the snow<->grass manager sees
+		-- it at gy+1). Visually drop it so its base rests on that cell's floor (the
+		-- grass top face) instead of floating centred in the cell / half-buried.
+		-- The stored BlockPos* attributes below stay at `position` (the true cell),
+		-- so grid registration is unaffected -- only the rendered Y shifts.
+		if blockType == "SnowLayer" then
+			local cellFloorY = position.Y - BLOCK_SIZE / 2
+			block.CFrame = CFrame.new(position.X, cellFloorY + block.Size.Y / 2, position.Z)
+			block.CanCollide = false
+		end
 	elseif block:IsA("Model") then
 		local offsetCFrame = CFrame.new(position - Vector3.new(0, BLOCK_SIZE / 2, 0)) * CFrame.Angles(0, randomYRotation, 0)
 		block:PivotTo(offsetCFrame)
@@ -343,7 +354,7 @@ local function createBlock(blockType, position, parent, terrainDepth, isLazyLoad
 				part.Anchored = true
 				part.CanCollide = true
 				part.CanTouch = false      -- Terrain doesn't need touch events
-				part.CastShadow = false    -- Massive memory savings
+				-- part.CastShadow = false    -- Massive memory savings  -- TEMP: commented to test terrain shadows
 			end
 		end
 	end
@@ -510,6 +521,105 @@ local function compressHeightMap(heightMap, gridSizeX, gridSizeZ)
 	end
 	
 	return heightMap
+end
+
+-- ============================================
+-- WORLD-SPACE BIOME FIELD  (chunk world only)
+-- ============================================
+-- Assigns a biome to every cell using ABSOLUTE world coordinates, so two
+-- adjacent chunks compute the SAME biome + blend at their shared border ->
+-- biomes, height-blending and grass colour all flow seamlessly across chunks
+-- (Minecraft-like). Pure function of (world cell, worldSeed): no per-chunk
+-- randomness. Uses a jittered world-space Voronoi lattice (no bitwise ops --
+-- Luau has none on numbers; everything is math.noise based).
+-- Returns: biomeMap[gx][gz], blendMap[gx][gz]={secondBiome,factor}, palette.
+local WORLD_BIOME_REGION = 48   -- grid cells per biome region (~48*BLOCK_SIZE studs). Bigger = larger biomes.
+local WORLD_BIOME_BLEND  = 14   -- blend zone width in cells (matches the per-plot BLEND_WIDTH)
+
+local function computeWorldBiomeMaps(startX, startZ, gridSizeX, gridSizeZ, worldSeed)
+	local palette = BiomeConfig.GetGeneratableBiomeNames()
+	local paletteCount = #palette
+	local seedF = worldSeed * 0.0001
+
+	-- Memoize each region's jittered centre + biome (9 regions reused by many cells).
+	local regionCache = {}
+	local function getRegion(rx, rz)
+		local key = rx .. "_" .. rz
+		local cached = regionCache[key]
+		if cached then return cached end
+		local jx = math.noise(rx * 0.9 + seedF, rz * 0.9 - seedF)
+		local jz = math.noise(rx * 0.9 + seedF + 31.7, rz * 0.9 - seedF + 12.3)
+		local cx = (rx + 0.5 + jx * 0.7) * WORLD_BIOME_REGION
+		local cz = (rz + 0.5 + jz * 0.7) * WORLD_BIOME_REGION
+		local bsel = math.noise(rx * 1.7 + seedF + 100.5, rz * 1.7 + seedF + 100.5)
+		local idx = (math.floor((bsel + 0.5) * 977) % paletteCount) + 1
+		local point = { cx = cx, cz = cz, biome = palette[idx] }
+		regionCache[key] = point
+		return point
+	end
+
+	local baseCellX = math.round(startX / BLOCK_SIZE)
+	local baseCellZ = math.round(startZ / BLOCK_SIZE)
+
+	local biomeMap = {}
+	local blendMap = {}
+
+	for gridX = 0, gridSizeX - 1 do
+		biomeMap[gridX] = {}
+		blendMap[gridX] = {}
+		local wcx = baseCellX + gridX
+		for gridZ = 0, gridSizeZ - 1 do
+			local wcz = baseCellZ + gridZ
+			-- World-space warp -> organic wiggly borders (continuous across chunks).
+			local warpX = math.noise(wcx * 0.02 + seedF, wcz * 0.02) * 14
+			local warpZ = math.noise(wcx * 0.02, wcz * 0.02 + seedF) * 14
+			local qx = wcx + warpX
+			local qz = wcz + warpZ
+
+			local r0x = math.floor(qx / WORLD_BIOME_REGION)
+			local r0z = math.floor(qz / WORLD_BIOME_REGION)
+
+			local nearestBiome = palette[1]
+			local secondBiome = palette[1]
+			local minDist = math.huge
+			local secondDist = math.huge
+
+			for drx = -1, 1 do
+				for drz = -1, 1 do
+					local point = getRegion(r0x + drx, r0z + drz)
+					local dx = qx - point.cx
+					local dz = qz - point.cz
+					local dist = dx * dx + dz * dz
+					if dist < minDist then
+						secondDist = minDist
+						secondBiome = nearestBiome
+						minDist = dist
+						nearestBiome = point.biome
+					elseif dist < secondDist then
+						secondDist = dist
+						secondBiome = point.biome
+					end
+				end
+			end
+
+			biomeMap[gridX][gridZ] = nearestBiome
+
+			local blendFactor = 0
+			if secondDist < math.huge and nearestBiome ~= secondBiome then
+				local nearSqrt = math.sqrt(minDist)
+				local secondSqrt = math.sqrt(secondDist)
+				local edgeDist = (secondSqrt - nearSqrt) / 2
+				if edgeDist < WORLD_BIOME_BLEND then
+					local t = math.clamp(edgeDist / WORLD_BIOME_BLEND, 0, 1)
+					blendFactor = 1 - (t * t * (3 - 2 * t))
+				end
+			end
+			blendMap[gridX][gridZ] = { secondBiome = secondBiome, factor = blendFactor }
+		end
+		if gridX % 10 == 0 then task.wait() end
+	end
+
+	return biomeMap, blendMap, palette
 end
 
 -- ============================================
@@ -898,6 +1008,7 @@ end
 -- TreeGenerator and LeafDecayManager loaded separately (BiomeConfig already cached above)
 local TreeGenerator = nil
 local LeafDecayManager = nil
+local SnowyGrassManager = nil  -- chunk-world snowy-grass conversion (Snowy biome: plain grass + snow -> snowy grass)
 
 local function loadBiomeDependencies()
 	-- BiomeConfig is already loaded via loadBiomeConfig() at the top
@@ -912,6 +1023,11 @@ local function loadBiomeDependencies()
 	if not LeafDecayManager then
 		pcall(function()
 			LeafDecayManager = require(game:GetService("ServerScriptService"):WaitForChild("Modules"):WaitForChild("LeafDecayManager"))
+		end)
+	end
+	if not SnowyGrassManager then
+		pcall(function()
+			SnowyGrassManager = require(game:GetService("ServerScriptService"):WaitForChild("Modules"):WaitForChild("SnowyGrassManager"))
 		end)
 	end
 end
@@ -940,6 +1056,13 @@ end
 -- from the player outward. This replaces the old layer-by-layer
 -- (3D printer) spawning with distance-based chunk loading.
 local function spawnBlocksInChunks(params)
+	-- Cap how many block instances get parented into the world per frame. A chunk
+	-- heavy with trees holds hundreds of small leaf/log parts; parenting them all
+	-- in one frame is the spike players feel as "trees lag". Parenting in capped
+	-- batches with a yield spreads that insertion cost across a few frames while
+	-- still completing the chunk before moving outward to the next.
+	local MAX_PARENTS_PER_FRAME = 60
+
 	local layers = params.layers
 	local startX = params.startX
 	local startZ = params.startZ
@@ -1026,6 +1149,11 @@ local function spawnBlocksInChunks(params)
 	
 	for chunkIndex, chunk in ipairs(sortedChunks) do
 		local pendingInChunk = {}
+		-- Tree blocks (logs + leaves) are collected separately so they can be
+		-- INTERLEAVED with terrain at parent time rather than appended after it.
+		-- Appending trees last made them parent in the final frame(s) of the batched
+		-- parent loop -- the "trees pop in after the terrain" the player sees.
+		local pendingTrees = {}
 		
 		-- Spawn terrain blocks in this chunk
 		for _, blockData in ipairs(chunk.terrainBlocks) do
@@ -1043,9 +1171,25 @@ local function spawnBlocksInChunks(params)
 						block.Color = blockData.blendedGrassColor
 					end
 				end
-				table.insert(pendingInChunk, block)
-				blocksCreated = blocksCreated + 1
-				spawnedCount = spawnedCount + 1
+				-- SNOWY BIOME: the surface generated as PLAIN grass; convert it to
+				-- SnowyGrassBlock now, via the same mechanic that fires when a snow
+				-- layer is placed on grass. The conversion parents the snowy block and
+				-- destroys this grass one, so we DON'T add it to pendingInChunk. If the
+				-- manager isn't available, we leave the plain grass (still has snow on
+				-- top) rather than failing generation.
+				if blockData.convertToSnowy and SnowyGrassManager then
+					block.Parent = blocksFolder
+					local ok = false
+					pcall(function()
+						ok = SnowyGrassManager.ConvertGrassToSnowy(block, blocksFolder)
+					end)
+					blocksCreated = blocksCreated + 1
+					spawnedCount = spawnedCount + 1
+				else
+					table.insert(pendingInChunk, block)
+					blocksCreated = blocksCreated + 1
+					spawnedCount = spawnedCount + 1
+				end
 			end
 		end
 		
@@ -1068,6 +1212,11 @@ local function spawnBlocksInChunks(params)
 				if treeBlock then treeBlocksCreated = treeBlocksCreated + 1; spawnedCount = spawnedCount + 1 end
 			elseif treeData.blockType == "l" then
 				treeBlock = TreeGenerator.CreateLeaves(treeData.position, nil, treeData.treeType, true, treeData.biomeName, treeData.seasonName)
+				if treeBlock then treeBlocksCreated = treeBlocksCreated + 1; spawnedCount = spawnedCount + 1 end
+			elseif treeData.blockType == "SnowLayer" then
+				-- Snow cap on a sky-exposed top leaf (snowy biome). Reuse the terrain
+				-- SnowLayer path so it gets the same rest-on-top drop + no-collide.
+				treeBlock = createBlock("SnowLayer", treeData.position, nil, 0, false, treeData.biomeName, treeData.seasonName)
 				if treeBlock then treeBlocksCreated = treeBlocksCreated + 1; spawnedCount = spawnedCount + 1 end
 			elseif treeData.blockType == "FallenLog" then
 				local logTemplate = getBlockTemplate(treeData.logType)
@@ -1115,13 +1264,51 @@ local function spawnBlocksInChunks(params)
 			end
 			
 			if treeBlock then
-				table.insert(pendingInChunk, treeBlock)
+				table.insert(pendingTrees, treeBlock)
 			end
 		end
 		
-		-- Parent all blocks in this chunk at once (batched for performance)
-		for _, block in ipairs(pendingInChunk) do
+		-- Parent this chunk's blocks into the world. Terrain + decor are cheap, but
+		-- trees add many small parts, so a tree-dense chunk can stall a frame if we
+		-- dump everything at once. Parent in capped batches and yield between them so
+		-- the insertion cost is spread across frames (kills the tree pop-in spike).
+		--
+		-- INTERLEAVE terrain/decor with trees as we go, so each capped frame-batch
+		-- contains a proportional share of both. Without this, trees (collected in a
+		-- separate list) would all parent in the last frame and visibly pop in after
+		-- the ground. We walk both lists at a stride so a tree lands every few terrain
+		-- blocks -- terrain and its trees appear together.
+		local nTerrain = #pendingInChunk
+		local nTrees = #pendingTrees
+		local parentedThisFrame = 0
+		local ti = 1 -- next terrain/decor index
+		local ri = 1 -- next tree index
+		-- Parent one tree roughly every `treeStride` terrain blocks (>=1).
+		local treeStride = (nTrees > 0) and math.max(1, math.floor(nTerrain / nTrees)) or math.huge
+		local sinceTree = 0
+
+		local function parentOne(block)
 			block.Parent = blocksFolder
+			parentedThisFrame = parentedThisFrame + 1
+			if parentedThisFrame >= MAX_PARENTS_PER_FRAME then
+				parentedThisFrame = 0
+				task.wait()
+			end
+		end
+
+		while ti <= nTerrain or ri <= nTrees do
+			-- Emit a terrain/decor block (if any remain).
+			if ti <= nTerrain then
+				parentOne(pendingInChunk[ti])
+				ti = ti + 1
+				sinceTree = sinceTree + 1
+			end
+			-- Drop in a tree once we've passed the stride (or terrain is exhausted).
+			if ri <= nTrees and (sinceTree >= treeStride or ti > nTerrain) then
+				parentOne(pendingTrees[ri])
+				ri = ri + 1
+				sinceTree = 0
+			end
 		end
 		
 		-- Update progress
@@ -1409,6 +1596,8 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 			local grassPos = Vector3.new(x, surfaceY, z)
 			local layer = getOrCreateLayer(surfaceY)
 			
+			local isSnowyCell = (biomeName == "Snowy")
+
 			table.insert(layer.terrainBlocks, {
 				blockType = grassType,
 				position = grassPos,
@@ -1416,7 +1605,27 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 				surfaceY = surfaceY,
 				biomeName = biomeName,  -- Pass biome for grass coloring
 				seasonName = currentSeason,  -- Pass season for seasonal tinting
+				-- Snowy biome generates PLAIN grass; mark it so the spawner runs the
+				-- snow-on-grass conversion (-> SnowyGrassBlock) right after creating it.
+				-- Parity with the same handling in GenerateDefaultTerrain.
+				convertToSnowy = isSnowyCell,
 			})
+
+			-- SNOWY BIOME: lay a thin SnowLayer block in the cell ABOVE the surface,
+			-- registered at surfaceY + BLOCK_SIZE so its BlockPosY rounds to gy+1 --
+			-- exactly where SnowyGrassManager looks for "snow above". The grass below
+			-- converts to snowy grass at spawn time (convertToSnowy), so the pair reads
+			-- as one snowy-grass-with-snow surface. (Single-biome parity with Default.)
+			if isSnowyCell then
+				local snowPos = Vector3.new(x, surfaceY + BLOCK_SIZE, z)
+				local snowLayer = getOrCreateLayer(snowPos.Y)
+				table.insert(snowLayer.terrainBlocks, {
+					blockType = "SnowLayer",
+					position = snowPos,
+					depth = 0,
+					surfaceY = surfaceY,
+				})
+			end
 			
 			-- Check for decoration
 			local hasDecoration = false
@@ -1597,7 +1806,7 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 								fillBlock.CanCollide = true
 								fillBlock.CanQuery = false
 								fillBlock.CanTouch = false
-								fillBlock.CastShadow = false
+								-- fillBlock.CastShadow = false  -- TEMP: commented to test terrain shadows
 								fillBlock.Color = Color3.fromRGB(126, 92, 60)
 								fillBlock.Material = Enum.Material.Ground
 								fillBlock.MaterialVariant = "Dirt 1"
@@ -1831,7 +2040,9 @@ function TerrainGenerator.InitializeDecorationCleanup(buildArea)
 			end
 			
 			-- Track removed tree blocks (logs and leaves)
-			if isTreeBlock or (blockType == "Leaves" and not hasPlacedBy) then
+			-- Leaves match by substring so per-type leaf blocks (OakLeaves/BirchLeaves/
+			-- SpruceLeaves) and the legacy "Leaves" name are all caught.
+			if isTreeBlock or (blockType and blockType:find("Leaves") ~= nil and not hasPlacedBy) then
 				local posX = child:GetAttribute("BlockPosX")
 				local posY = child:GetAttribute("BlockPosY")
 				local posZ = child:GetAttribute("BlockPosZ")
@@ -1985,7 +2196,7 @@ end
 -- with temperature-based clustering
 -- ============================================
 
-function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSeed, preferredBiomes)
+function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSeed, preferredBiomes, worldContinuous)
 	if not TERRAIN.ENABLED then return end
 	
 	loadBiomeDependencies()
@@ -2220,6 +2431,19 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 		if gridX % 10 == 0 then task.wait() end
 	end
 	
+	-- CHUNK WORLD: replace the per-plot RANDOM biome map with a deterministic
+	-- world-space biome field so biomes (and the height/colour blending that
+	-- depends on them) flow seamlessly across chunk borders. Heights are already
+	-- world-continuous: every chunk shares one worldSeed (-> noiseSeed) and
+	-- samples height noise in absolute world coords.
+	if worldContinuous then
+		biomeMap, blendMap, selectedBiomes = computeWorldBiomeMaps(startX, startZ, gridSizeX, gridSizeZ, noiseSeed)
+		-- Re-seed the decoration/tree RNG per-chunk so plants vary between chunks
+		-- (heights + biomes stay world-continuous; only the scatter detail differs).
+		local decoSeed = (math.floor(startX) * 92837 + math.floor(startZ) * 689287) % 2147483647
+		terrainRng = Random.new((decoSeed + noiseSeed) % 2147483647)
+	end
+	
 	-- Store biome map as attribute for save/load
 	local biomeMapData = {}
 	local biomeIndexMap = {}
@@ -2426,6 +2650,8 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				end
 			end
 			
+			local isSnowyCell = (cellBiome == "Snowy")
+
 			table.insert(layer.terrainBlocks, {
 				blockType = grassType,
 				position = grassPos,
@@ -2434,7 +2660,29 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				biomeName = cellBiome,
 				seasonName = currentSeason,
 				blendedGrassColor = blendedGrassColor,
+				-- Snowy biome generates PLAIN grass; mark it so the spawner runs the
+				-- snow-on-grass conversion (-> SnowyGrassBlock) right after creating it.
+				convertToSnowy = isSnowyCell,
 			})
+			
+			-- SNOWY BIOME: lay a thin SnowLayer block in the grid cell ABOVE the
+			-- surface. It's a real terrain block (lives in Blocks, rides the normal
+			-- chunk-spawn path -- no decoration folder needed). We register it at the
+			-- FULL cell above (surfaceY + BLOCK_SIZE) so its stored BlockPosY rounds to
+			-- gy+1 -- exactly where SnowyGrassManager looks for "snow above". The grass
+			-- beneath is converted to snowy grass at spawn time (see convertToSnowy),
+			-- so the pair reads as one snowy-grass-with-snow surface. createBlock
+			-- visually drops the thin slab onto the grass top face so it isn't buried.
+			if isSnowyCell then
+				local snowPos = Vector3.new(x, surfaceY + BLOCK_SIZE, z)
+				local snowLayer = getOrCreateLayer(snowPos.Y)
+				table.insert(snowLayer.terrainBlocks, {
+					blockType = "SnowLayer",
+					position = snowPos,
+					depth = 0,
+					surfaceY = surfaceY,
+				})
+			end
 			
 			-- Decorations
 			local hasDecoration = false
@@ -2537,8 +2785,19 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				end
 			end
 			
-			-- Fill dirt below surface
+			-- Fill dirt below surface.
+			-- AIR-EXPOSURE CULLING: a fill block is only ever visible if at least one
+			-- of its 4 cardinal neighbors has open air beside it at that height (i.e.
+			-- that neighbor's surface sits BELOW the fill block). A block walled in on
+			-- all four sides (and buried below grass) can never be seen, so we skip
+			-- creating the part entirely -- the single biggest part-count saving on a
+			-- big chunk world. Digging still works: OnTerrainBlockBroken regenerates
+			-- sub-surface blocks on demand from surface math, so a culled block
+			-- materializes the moment a player exposes it. Grid-edge columns (neighbor
+			-- out of bounds) are treated as exposed so chunk borders never leave a gap.
 			local lowestAdjacentSurface = surfaceY
+			-- Cardinal neighbor surface Ys (nil = out of bounds => treat as exposed).
+			local cardN, cardS, cardE, cardW
 			for dx = -1, 1 do
 				for dz = -1, 1 do
 					if dx == 0 and dz == 0 then continue end
@@ -2548,6 +2807,11 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 						local adjHeight = heightMap[adjX] and heightMap[adjX][adjZ] or 0
 						local adjSurfaceY = baseSurfaceY + adjHeight * BLOCK_SIZE
 						lowestAdjacentSurface = math.min(lowestAdjacentSurface, adjSurfaceY)
+						-- Record the 4 cardinal surfaces for the per-block exposure test.
+						if dx == 1 and dz == 0 then cardE = adjSurfaceY
+						elseif dx == -1 and dz == 0 then cardW = adjSurfaceY
+						elseif dx == 0 and dz == 1 then cardN = adjSurfaceY
+						elseif dx == 0 and dz == -1 then cardS = adjSurfaceY end
 					end
 				end
 			end
@@ -2555,14 +2819,24 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 			local fillStartY = math.min(baseSurfaceY, lowestAdjacentSurface)
 			local fillY = fillStartY
 			while fillY < surfaceY - 0.5 do
-				local depthFromSurface = math.round((surfaceY - fillY) / BLOCK_SIZE)
-				local fillLayer = getOrCreateLayer(fillY)
-				table.insert(fillLayer.terrainBlocks, {
-					blockType = "Dirt",
-					position = Vector3.new(x, fillY, z),
-					depth = depthFromSurface,
-					surfaceY = surfaceY,
-				})
+				-- Exposed if any cardinal neighbor is out of bounds (nil) OR its surface
+				-- is below this fill height (open air on that side). Otherwise this block
+				-- is walled in on all four sides -> cull it.
+				local exposed =
+					(cardN == nil or cardN < fillY - 0.5) or
+					(cardS == nil or cardS < fillY - 0.5) or
+					(cardE == nil or cardE < fillY - 0.5) or
+					(cardW == nil or cardW < fillY - 0.5)
+				if exposed then
+					local depthFromSurface = math.round((surfaceY - fillY) / BLOCK_SIZE)
+					local fillLayer = getOrCreateLayer(fillY)
+					table.insert(fillLayer.terrainBlocks, {
+						blockType = "Dirt",
+						position = Vector3.new(x, fillY, z),
+						depth = depthFromSurface,
+						surfaceY = surfaceY,
+					})
+				end
 				fillY = fillY + BLOCK_SIZE
 			end
 		end

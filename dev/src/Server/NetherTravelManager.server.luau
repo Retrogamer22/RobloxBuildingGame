@@ -406,6 +406,14 @@ local function buildReturnPortal(destArea, interiorBottomLeft, wideAxis)
 		-- the player lands somewhere that looks like a cave; digging outward streams
 		-- the rest via OnNetherBlockBroken. Half-extents are in BLOCKS (a 12-radius box
 		-- = ~25 cells per side). Only in the nether; runs once per portal build.
+		--
+		-- NOTE: This call is ALSO made unconditionally from handleTravel below (every
+		-- arrival, not just new portal builds) so a visitor arriving through someone
+		-- else's portal still gets a bubble around them. GenerateNetherBubble is
+		-- idempotent (skips existing blocks), so calling it twice on a fresh portal is
+		-- harmless — the second call sees the blocks from the first and does nothing.
+		-- The reason it's STILL here is so a freshly-built portal lands with terrain
+		-- in the same code path, even if the handleTravel post-call ever changes.
 		if TerrainGenerator and TerrainGenerator.GenerateNetherBubble
 			and destArea.Name:match("^" .. NetherConfig.NETHER_PLOT_PREFIX) then
 			local key = netherTerrainKey(destArea)
@@ -488,14 +496,26 @@ local function resolveTravel(player)
 		end
 	end
 
-	-- Otherwise they should be on their overworld plot.
-	local plotNumber, overworld = getPlayerPlot(player)
-	if not plotNumber then return nil, nil, nil, "No assigned plot" end
-	local portal = findPortalPlayerIsIn(player, overworld)
-	if not portal then return nil, nil, nil, "Not standing in a lit portal" end
-	local nether = getNetherPlot(plotNumber)
-	if not nether then return nil, nil, nil, "NetherPlot" .. plotNumber .. " missing" end
-	return overworld, nether, portal, nil
+	-- Otherwise they should be in SOME overworld plot — their own or someone
+	-- else's. Public-portal behaviour: any player can use any lit portal regardless
+	-- of who owns the plot it sits in. Iterate every BuildArea (same way the nether
+	-- branch above iterates every NetherPlot) and find the one whose Blocks folder
+	-- has a portal the player is currently standing in. The destination is the
+	-- NETHER plot matching whichever overworld plot they entered from — going
+	-- through plot 3's portal takes you to plot 3's nether, regardless of owner.
+	-- The return trip naturally lands them back in that same overworld plot.
+	for i = 1, GridConfig.TOTAL_PLOTS do
+		local overworld = Workspace:FindFirstChild(GridConfig.BUILD_AREA_PREFIX .. i)
+		if overworld then
+			local portal = findPortalPlayerIsIn(player, overworld)
+			if portal then
+				local nether = getNetherPlot(i)
+				if not nether then return nil, nil, nil, "NetherPlot" .. i .. " missing" end
+				return overworld, nether, portal, nil
+			end
+		end
+	end
+	return nil, nil, nil, "Not standing in a lit portal"
 end
 
 -- ============================================
@@ -549,6 +569,28 @@ local function handleTravel(player)
 	if not targetPos then
 		warn(LOG .. " Failed to find or build return portal")
 		return
+	end
+	
+	-- Ensure terrain exists AROUND the arrival point, regardless of whether the
+	-- portal was newly built or reused. Without this, a visitor walking through
+	-- someone else's portal can arrive in a sparse area: the owner's first trip
+	-- generated a 12-block bubble around their portal, but the visitor's arrival
+	-- doesn't trigger any new generation, so they only see what the owner had
+	-- already revealed (which might be only the small initial pocket). With this
+	-- call, every arrival grows/refreshes the bubble around the player. The
+	-- function is idempotent (skips cells that already have a block), so this is
+	-- cheap when terrain is already there. Only runs for nether destinations.
+	if destArea.Name:match("^" .. NetherConfig.NETHER_PLOT_PREFIX)
+		and TerrainGenerator and TerrainGenerator.GenerateNetherBubble then
+		local key = netherTerrainKey(destArea)
+		if key then
+			local seed = destArea:GetAttribute("NetherSeed")
+			pcall(function()
+				TerrainGenerator.GenerateNetherBubble(destArea, key, seed, {
+					centre = targetPos, hx = 12, hy = 12, hz = 12,
+				})
+			end)
+		end
 	end
 
 	-- Tag the dest area as nether (for later systems) and pair it.

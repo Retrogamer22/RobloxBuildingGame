@@ -245,6 +245,33 @@ local function createDecoration(decorationType, blockPosition, parent, biomeName
 	local decoration = template:Clone()
 	decoration.Name = decorationType .. "_" .. tRandom(100000, 999999)
 	
+	-- SnowLayer is a thin slab that should lie FLAT and CENTERED on the surface
+	-- block (no grass-style jitter or 45-deg spin, no tint). Handle it separately
+	-- so it reads as a clean sheet of snow rather than a scattered tuft.
+	if decorationType == "SnowLayer" then
+		local topY = blockPosition.Y + BLOCK_SIZE / 2
+		if decoration:IsA("BasePart") then
+			decoration.CFrame = CFrame.new(blockPosition.X, topY + decoration.Size.Y / 2, blockPosition.Z)
+			decoration.Anchored = true
+			decoration.CanCollide = false
+		elseif decoration:IsA("Model") then
+			decoration:PivotTo(CFrame.new(blockPosition.X, topY, blockPosition.Z))
+			for _, part in ipairs(decoration:GetDescendants()) do
+				if part:IsA("BasePart") then
+					part.Anchored = true
+					part.CanCollide = false
+				end
+			end
+		end
+		decoration:SetAttribute("BlockType", decorationType)
+		decoration:SetAttribute("IsDecoration", true)
+		decoration:SetAttribute("ParentBlockX", blockPosition.X)
+		decoration:SetAttribute("ParentBlockY", blockPosition.Y)
+		decoration:SetAttribute("ParentBlockZ", blockPosition.Z)
+		decoration.Parent = parent
+		return decoration
+	end
+	
 	local decorationY = blockPosition.Y + BLOCK_SIZE / 2
 	local maxOffset = 0.8
 	local offsetX = (tRandom() - 0.5) * 2 * maxOffset
@@ -334,7 +361,18 @@ local function createBlock(blockType, position, parent, terrainDepth, isLazyLoad
 		block.Anchored = true
 		block.CanCollide = true
 		block.CanTouch = false      -- Terrain doesn't need touch events
-		block.CastShadow = false    -- Massive memory savings (~285MB for 9 plots)
+		-- block.CastShadow = false    -- Massive memory savings (~285MB for 9 plots)  -- TEMP: commented to test terrain shadows
+		-- SnowLayer is a thin slab. `position` is the CENTRE of the grid cell it
+		-- occupies (one cell above the snowy grass, so the snow<->grass manager sees
+		-- it at gy+1). Visually drop it so its base rests on that cell's floor (the
+		-- grass top face) instead of floating centred in the cell / half-buried.
+		-- The stored BlockPos* attributes below stay at `position` (the true cell),
+		-- so grid registration is unaffected -- only the rendered Y shifts.
+		if blockType == "SnowLayer" then
+			local cellFloorY = position.Y - BLOCK_SIZE / 2
+			block.CFrame = CFrame.new(position.X, cellFloorY + block.Size.Y / 2, position.Z)
+			block.CanCollide = false
+		end
 	elseif block:IsA("Model") then
 		local offsetCFrame = CFrame.new(position - Vector3.new(0, BLOCK_SIZE / 2, 0)) * CFrame.Angles(0, randomYRotation, 0)
 		block:PivotTo(offsetCFrame)
@@ -343,7 +381,7 @@ local function createBlock(blockType, position, parent, terrainDepth, isLazyLoad
 				part.Anchored = true
 				part.CanCollide = true
 				part.CanTouch = false      -- Terrain doesn't need touch events
-				part.CastShadow = false    -- Massive memory savings
+				-- part.CastShadow = false    -- Massive memory savings  -- TEMP: commented to test terrain shadows
 			end
 		end
 	end
@@ -510,6 +548,105 @@ local function compressHeightMap(heightMap, gridSizeX, gridSizeZ)
 	end
 	
 	return heightMap
+end
+
+-- ============================================
+-- WORLD-SPACE BIOME FIELD  (chunk world only)
+-- ============================================
+-- Assigns a biome to every cell using ABSOLUTE world coordinates, so two
+-- adjacent chunks compute the SAME biome + blend at their shared border ->
+-- biomes, height-blending and grass colour all flow seamlessly across chunks
+-- (Minecraft-like). Pure function of (world cell, worldSeed): no per-chunk
+-- randomness. Uses a jittered world-space Voronoi lattice (no bitwise ops --
+-- Luau has none on numbers; everything is math.noise based).
+-- Returns: biomeMap[gx][gz], blendMap[gx][gz]={secondBiome,factor}, palette.
+local WORLD_BIOME_REGION = 48   -- grid cells per biome region (~48*BLOCK_SIZE studs). Bigger = larger biomes.
+local WORLD_BIOME_BLEND  = 14   -- blend zone width in cells (matches the per-plot BLEND_WIDTH)
+
+local function computeWorldBiomeMaps(startX, startZ, gridSizeX, gridSizeZ, worldSeed)
+	local palette = BiomeConfig.GetGeneratableBiomeNames()
+	local paletteCount = #palette
+	local seedF = worldSeed * 0.0001
+
+	-- Memoize each region's jittered centre + biome (9 regions reused by many cells).
+	local regionCache = {}
+	local function getRegion(rx, rz)
+		local key = rx .. "_" .. rz
+		local cached = regionCache[key]
+		if cached then return cached end
+		local jx = math.noise(rx * 0.9 + seedF, rz * 0.9 - seedF)
+		local jz = math.noise(rx * 0.9 + seedF + 31.7, rz * 0.9 - seedF + 12.3)
+		local cx = (rx + 0.5 + jx * 0.7) * WORLD_BIOME_REGION
+		local cz = (rz + 0.5 + jz * 0.7) * WORLD_BIOME_REGION
+		local bsel = math.noise(rx * 1.7 + seedF + 100.5, rz * 1.7 + seedF + 100.5)
+		local idx = (math.floor((bsel + 0.5) * 977) % paletteCount) + 1
+		local point = { cx = cx, cz = cz, biome = palette[idx] }
+		regionCache[key] = point
+		return point
+	end
+
+	local baseCellX = math.round(startX / BLOCK_SIZE)
+	local baseCellZ = math.round(startZ / BLOCK_SIZE)
+
+	local biomeMap = {}
+	local blendMap = {}
+
+	for gridX = 0, gridSizeX - 1 do
+		biomeMap[gridX] = {}
+		blendMap[gridX] = {}
+		local wcx = baseCellX + gridX
+		for gridZ = 0, gridSizeZ - 1 do
+			local wcz = baseCellZ + gridZ
+			-- World-space warp -> organic wiggly borders (continuous across chunks).
+			local warpX = math.noise(wcx * 0.02 + seedF, wcz * 0.02) * 14
+			local warpZ = math.noise(wcx * 0.02, wcz * 0.02 + seedF) * 14
+			local qx = wcx + warpX
+			local qz = wcz + warpZ
+
+			local r0x = math.floor(qx / WORLD_BIOME_REGION)
+			local r0z = math.floor(qz / WORLD_BIOME_REGION)
+
+			local nearestBiome = palette[1]
+			local secondBiome = palette[1]
+			local minDist = math.huge
+			local secondDist = math.huge
+
+			for drx = -1, 1 do
+				for drz = -1, 1 do
+					local point = getRegion(r0x + drx, r0z + drz)
+					local dx = qx - point.cx
+					local dz = qz - point.cz
+					local dist = dx * dx + dz * dz
+					if dist < minDist then
+						secondDist = minDist
+						secondBiome = nearestBiome
+						minDist = dist
+						nearestBiome = point.biome
+					elseif dist < secondDist then
+						secondDist = dist
+						secondBiome = point.biome
+					end
+				end
+			end
+
+			biomeMap[gridX][gridZ] = nearestBiome
+
+			local blendFactor = 0
+			if secondDist < math.huge and nearestBiome ~= secondBiome then
+				local nearSqrt = math.sqrt(minDist)
+				local secondSqrt = math.sqrt(secondDist)
+				local edgeDist = (secondSqrt - nearSqrt) / 2
+				if edgeDist < WORLD_BIOME_BLEND then
+					local t = math.clamp(edgeDist / WORLD_BIOME_BLEND, 0, 1)
+					blendFactor = 1 - (t * t * (3 - 2 * t))
+				end
+			end
+			blendMap[gridX][gridZ] = { secondBiome = secondBiome, factor = blendFactor }
+		end
+		if gridX % 10 == 0 then task.wait() end
+	end
+
+	return biomeMap, blendMap, palette
 end
 
 -- ============================================
@@ -680,6 +817,50 @@ function TerrainGenerator.OnTerrainBlockBroken(position, buildArea, plotNumber, 
 	if plotNumber and not skipMarkingAsDug then 
 		markPositionAsDug(snappedPos, plotNumber)
 		if DEBUG_TERRAIN_NET then print(string.format("[BB-NET] TERRAIN marked as dug: key=%s", getPositionKey(snappedPos))) end
+	end
+	
+	-- Clean up orphaned spread-grass left floating above the dug cell. When dirt is
+	-- removed from under a block of GrownFromSpread grass, that grass has no support
+	-- and should fall away too (otherwise it becomes a floating phantom that persists
+	-- in the save via IsLazyLoaded and reappears every load). We walk upward from the
+	-- dug position and remove each consecutive GrownFromSpread grass block that now has
+	-- nothing solid directly below it. Hand-placed grass never has GrownFromSpread, so
+	-- this can only ever remove auto-spread debris, never an intentional build.
+	if BlockSpatialIndex then
+		local index = BlockSpatialIndex.GetOrCreate(blocksFolder)
+		if index then
+			local function isSpreadGrass(b)
+				if not b or not b:GetAttribute("GrownFromSpread") then return false end
+				local bt = b:GetAttribute("BlockType")
+				return bt == "GrassBlock" or bt == "SnowyGrassBlock"
+					or bt == "SnowGrassBlock" or bt == "TaigaGrassBlock"
+			end
+			-- Track cells we clear this pass; the spatial index's ChildRemoved update is
+			-- deferred, so we can't rely on it reflecting our removals mid-loop.
+			local clearedThisPass = {}
+			local function cellEmpty(p)
+				if clearedThisPass[getPositionKey(p)] then return true end
+				return not index:HasBlockAt(p)
+			end
+			clearedThisPass[getPositionKey(snappedPos)] = true -- the cell we just dug
+			local checkPos = snappedPos + Vector3.new(0, BLOCK_SIZE, 0)
+			local belowPos = snappedPos
+			local guard = 0
+			while guard < TERRAIN.MAX_DEPTH + 2 do
+				guard += 1
+				-- Only remove if the cell directly below is unsupported (empty / dug).
+				if not cellEmpty(belowPos) then break end
+				local above = index:GetBlockAt(checkPos)
+				if not isSpreadGrass(above) then break end
+				if DEBUG_LAZY_LOAD then
+					print(string.format("[LazyLoad] Removing orphaned spread-grass at (%.1f,%.1f,%.1f)", checkPos.X, checkPos.Y, checkPos.Z))
+				end
+				above:Destroy()
+				clearedThisPass[getPositionKey(checkPos)] = true
+				belowPos = checkPos
+				checkPos = checkPos + Vector3.new(0, BLOCK_SIZE, 0)
+			end
+		end
 	end
 	
 	local blocksSpawned = 0
@@ -854,6 +1035,7 @@ end
 -- TreeGenerator and LeafDecayManager loaded separately (BiomeConfig already cached above)
 local TreeGenerator = nil
 local LeafDecayManager = nil
+local SnowyGrassManager = nil  -- chunk-world snowy-grass conversion (Snowy biome: plain grass + snow -> snowy grass)
 
 local function loadBiomeDependencies()
 	-- BiomeConfig is already loaded via loadBiomeConfig() at the top
@@ -868,6 +1050,11 @@ local function loadBiomeDependencies()
 	if not LeafDecayManager then
 		pcall(function()
 			LeafDecayManager = require(game:GetService("ServerScriptService"):WaitForChild("Modules"):WaitForChild("LeafDecayManager"))
+		end)
+	end
+	if not SnowyGrassManager then
+		pcall(function()
+			SnowyGrassManager = require(game:GetService("ServerScriptService"):WaitForChild("Modules"):WaitForChild("SnowyGrassManager"))
 		end)
 	end
 end
@@ -896,6 +1083,13 @@ end
 -- from the player outward. This replaces the old layer-by-layer
 -- (3D printer) spawning with distance-based chunk loading.
 local function spawnBlocksInChunks(params)
+	-- Cap how many block instances get parented into the world per frame. A chunk
+	-- heavy with trees holds hundreds of small leaf/log parts; parenting them all
+	-- in one frame is the spike players feel as "trees lag". Parenting in capped
+	-- batches with a yield spreads that insertion cost across a few frames while
+	-- still completing the chunk before moving outward to the next.
+	local MAX_PARENTS_PER_FRAME = 60
+
 	local layers = params.layers
 	local startX = params.startX
 	local startZ = params.startZ
@@ -982,6 +1176,11 @@ local function spawnBlocksInChunks(params)
 	
 	for chunkIndex, chunk in ipairs(sortedChunks) do
 		local pendingInChunk = {}
+		-- Tree blocks (logs + leaves) are collected separately so they can be
+		-- INTERLEAVED with terrain at parent time rather than appended after it.
+		-- Appending trees last made them parent in the final frame(s) of the batched
+		-- parent loop -- the "trees pop in after the terrain" the player sees.
+		local pendingTrees = {}
 		
 		-- Spawn terrain blocks in this chunk
 		for _, blockData in ipairs(chunk.terrainBlocks) do
@@ -999,9 +1198,25 @@ local function spawnBlocksInChunks(params)
 						block.Color = blockData.blendedGrassColor
 					end
 				end
-				table.insert(pendingInChunk, block)
-				blocksCreated = blocksCreated + 1
-				spawnedCount = spawnedCount + 1
+				-- SNOWY BIOME: the surface generated as PLAIN grass; convert it to
+				-- SnowyGrassBlock now, via the same mechanic that fires when a snow
+				-- layer is placed on grass. The conversion parents the snowy block and
+				-- destroys this grass one, so we DON'T add it to pendingInChunk. If the
+				-- manager isn't available, we leave the plain grass (still has snow on
+				-- top) rather than failing generation.
+				if blockData.convertToSnowy and SnowyGrassManager then
+					block.Parent = blocksFolder
+					local ok = false
+					pcall(function()
+						ok = SnowyGrassManager.ConvertGrassToSnowy(block, blocksFolder)
+					end)
+					blocksCreated = blocksCreated + 1
+					spawnedCount = spawnedCount + 1
+				else
+					table.insert(pendingInChunk, block)
+					blocksCreated = blocksCreated + 1
+					spawnedCount = spawnedCount + 1
+				end
 			end
 		end
 		
@@ -1024,6 +1239,11 @@ local function spawnBlocksInChunks(params)
 				if treeBlock then treeBlocksCreated = treeBlocksCreated + 1; spawnedCount = spawnedCount + 1 end
 			elseif treeData.blockType == "l" then
 				treeBlock = TreeGenerator.CreateLeaves(treeData.position, nil, treeData.treeType, true, treeData.biomeName, treeData.seasonName)
+				if treeBlock then treeBlocksCreated = treeBlocksCreated + 1; spawnedCount = spawnedCount + 1 end
+			elseif treeData.blockType == "SnowLayer" then
+				-- Snow cap on a sky-exposed top leaf (snowy biome). Reuse the terrain
+				-- SnowLayer path so it gets the same rest-on-top drop + no-collide.
+				treeBlock = createBlock("SnowLayer", treeData.position, nil, 0, false, treeData.biomeName, treeData.seasonName)
 				if treeBlock then treeBlocksCreated = treeBlocksCreated + 1; spawnedCount = spawnedCount + 1 end
 			elseif treeData.blockType == "FallenLog" then
 				local logTemplate = getBlockTemplate(treeData.logType)
@@ -1071,13 +1291,51 @@ local function spawnBlocksInChunks(params)
 			end
 			
 			if treeBlock then
-				table.insert(pendingInChunk, treeBlock)
+				table.insert(pendingTrees, treeBlock)
 			end
 		end
 		
-		-- Parent all blocks in this chunk at once (batched for performance)
-		for _, block in ipairs(pendingInChunk) do
+		-- Parent this chunk's blocks into the world. Terrain + decor are cheap, but
+		-- trees add many small parts, so a tree-dense chunk can stall a frame if we
+		-- dump everything at once. Parent in capped batches and yield between them so
+		-- the insertion cost is spread across frames (kills the tree pop-in spike).
+		--
+		-- INTERLEAVE terrain/decor with trees as we go, so each capped frame-batch
+		-- contains a proportional share of both. Without this, trees (collected in a
+		-- separate list) would all parent in the last frame and visibly pop in after
+		-- the ground. We walk both lists at a stride so a tree lands every few terrain
+		-- blocks -- terrain and its trees appear together.
+		local nTerrain = #pendingInChunk
+		local nTrees = #pendingTrees
+		local parentedThisFrame = 0
+		local ti = 1 -- next terrain/decor index
+		local ri = 1 -- next tree index
+		-- Parent one tree roughly every `treeStride` terrain blocks (>=1).
+		local treeStride = (nTrees > 0) and math.max(1, math.floor(nTerrain / nTrees)) or math.huge
+		local sinceTree = 0
+
+		local function parentOne(block)
 			block.Parent = blocksFolder
+			parentedThisFrame = parentedThisFrame + 1
+			if parentedThisFrame >= MAX_PARENTS_PER_FRAME then
+				parentedThisFrame = 0
+				task.wait()
+			end
+		end
+
+		while ti <= nTerrain or ri <= nTrees do
+			-- Emit a terrain/decor block (if any remain).
+			if ti <= nTerrain then
+				parentOne(pendingInChunk[ti])
+				ti = ti + 1
+				sinceTree = sinceTree + 1
+			end
+			-- Drop in a tree once we've passed the stride (or terrain is exhausted).
+			if ri <= nTrees and (sinceTree >= treeStride or ti > nTerrain) then
+				parentOne(pendingTrees[ri])
+				ri = ri + 1
+				sinceTree = 0
+			end
 		end
 		
 		-- Update progress
@@ -1091,16 +1349,10 @@ local function spawnBlocksInChunks(params)
 			task.wait()
 		end
 		
-		-- Progress logging every 25%
-		if chunkIndex == 1 or chunkIndex == totalChunks or chunkIndex % math.max(1, math.floor(totalChunks / 4)) == 0 then
-			print(string.format("[TerrainGenerator] Chunk %d/%d spawned (%d blocks)", chunkIndex, totalChunks, spawnedCount))
-		end
 	end
 	
 	if progressValue then progressValue.Value = 1 end
 	
-	print(string.format("[TerrainGenerator] Chunk loading complete: %d terrain + %d deco + %d tree blocks",
-		blocksCreated, decorationsCreated, treeBlocksCreated))
 	
 	return blocksCreated, decorationsCreated, treeBlocksCreated
 end
@@ -1173,7 +1425,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	-- FLAT TERRAIN: Simple grass-only generation
 	-- ============================================
 	if terrainStyle == "Flat" then
-		print("[TerrainGenerator] Generating flat grass terrain (Season: " .. currentSeason .. ")...")
 		
 		local grassType = TERRAIN.GRASS_BLOCK
 		local blocksCreated = 0
@@ -1197,7 +1448,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 		end
 		
 		local elapsed = tick() - startTime
-		print(string.format("[TerrainGenerator] Done! %d grass blocks in %.2fs", blocksCreated, elapsed))
 		GeneratingPlots[plotNumber] = nil  -- Mark generation complete
 		buildArea:SetAttribute("TerrainGenerationInProgress", nil)  -- Clear flag
 		BulkOperationFlags.EndBulkOperation(buildArea)  -- Re-enable handlers
@@ -1208,7 +1458,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	-- NATURAL TERRAIN: Full biome with hills, trees, decorations
 	-- ============================================
 	if not biomeConfig then
-		print("[TerrainGenerator] No biome config found, falling back to flat terrain")
 		-- Fall back to flat if no biome config
 		GeneratedPlots[plotNumber] = nil
 		return TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, biomeName, "Flat", savedSeed)
@@ -1219,9 +1468,7 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	local useFastMode = isMegaPlot and GENERATION_SETTINGS.MEGA_PLOT_FAST_MODE
 	
 	if useFastMode then
-		print("[TerrainGenerator] Generating " .. biomeName .. " (Natural) - FAST MODE for MegaPlot...")
 	else
-		print("[TerrainGenerator] Generating " .. biomeName .. " (Natural) 3D-printer style...")
 	end
 	
 	-- Noise settings from biome
@@ -1233,7 +1480,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	
 	buildArea:SetAttribute("TerrainSeed", noiseSeed)
 	terrainRng = Random.new(noiseSeed)  -- Isolated RNG for deterministic generation
-	print("[TerrainGenerator] Using seed: " .. noiseSeed)
 	
 	-- Pre-calculate height map (or restore from saved data for exact terrain reproduction)
 	local heightMap = {}
@@ -1258,14 +1504,11 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		print(string.format("[TerrainGenerator] Using SAVED height map for exact terrain restoration (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	else
 		-- Generate new height map from noise (first-time generation)
 		if savedHeightMapStr then
 			-- Clear stale height map that doesn't match current grid dimensions
 			buildArea:SetAttribute("TerrainHeightMap", nil)
-			print("[TerrainGenerator] Cleared stale saved height map (grid size mismatch)")
 		end
 		
 		local terrainShape = biomeConfig.TerrainShape  -- Optional shaping curve
@@ -1320,9 +1563,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		
-		print(string.format("[TerrainGenerator] Generated NEW height map from noise (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	end
 	
 	-- Collect all blocks by Y level (terrain + trees)
@@ -1383,6 +1623,8 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 			local grassPos = Vector3.new(x, surfaceY, z)
 			local layer = getOrCreateLayer(surfaceY)
 			
+			local isSnowyCell = (biomeName == "Snowy")
+
 			table.insert(layer.terrainBlocks, {
 				blockType = grassType,
 				position = grassPos,
@@ -1390,7 +1632,27 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 				surfaceY = surfaceY,
 				biomeName = biomeName,  -- Pass biome for grass coloring
 				seasonName = currentSeason,  -- Pass season for seasonal tinting
+				-- Snowy biome generates PLAIN grass; mark it so the spawner runs the
+				-- snow-on-grass conversion (-> SnowyGrassBlock) right after creating it.
+				-- Parity with the same handling in GenerateDefaultTerrain.
+				convertToSnowy = isSnowyCell,
 			})
+
+			-- SNOWY BIOME: lay a thin SnowLayer block in the cell ABOVE the surface,
+			-- registered at surfaceY + BLOCK_SIZE so its BlockPosY rounds to gy+1 --
+			-- exactly where SnowyGrassManager looks for "snow above". The grass below
+			-- converts to snowy grass at spawn time (convertToSnowy), so the pair reads
+			-- as one snowy-grass-with-snow surface. (Single-biome parity with Default.)
+			if isSnowyCell then
+				local snowPos = Vector3.new(x, surfaceY + BLOCK_SIZE, z)
+				local snowLayer = getOrCreateLayer(snowPos.Y)
+				table.insert(snowLayer.terrainBlocks, {
+					blockType = "SnowLayer",
+					position = snowPos,
+					depth = 0,
+					surfaceY = surfaceY,
+				})
+			end
 			
 			-- Check for decoration
 			local hasDecoration = false
@@ -1539,7 +1801,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	-- Edge walls disabled - floor is deep enough now that they aren't needed
 	local edgeBlocksCreated = 0
 	if false then -- Previously: not isMegaPlot
-		print("[TerrainGenerator] Spawning edge walls for individual plot...")
 		local edgeBatchCount = 0
 		local edgeYieldInterval = 50
 		
@@ -1572,7 +1833,7 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 								fillBlock.CanCollide = true
 								fillBlock.CanQuery = false
 								fillBlock.CanTouch = false
-								fillBlock.CastShadow = false
+								-- fillBlock.CastShadow = false  -- TEMP: commented to test terrain shadows
 								fillBlock.Color = Color3.fromRGB(126, 92, 60)
 								fillBlock.Material = Enum.Material.Ground
 								fillBlock.MaterialVariant = "Dirt 1"
@@ -1605,7 +1866,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 			if gridX % 10 == 0 then task.wait() end
 		end
 	else
-		print("[TerrainGenerator] MegaPlot: Skipping edge walls")
 	end
 	
 	-- ============================================
@@ -1649,8 +1909,6 @@ function TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, bi
 	buildArea:SetAttribute("TerrainHeightMap", table.concat(heightData, ","))
 	
 	local elapsed = tick() - startTime
-	print(string.format("[TerrainGenerator] Done! %d terrain + %d edge + %d deco + %d tree/log/cactus blocks (%d trees, %d fallen logs, %d cacti) in %.2fs",
-		blocksCreated, edgeBlocksCreated, decorationsCreated, treeBlocksCreated, treesPlanned, fallenLogsPlanned, cactusPlanned, elapsed))
 	
 	if LeafDecayManager and treesPlanned > 0 then
 		LeafDecayManager.Initialize(buildArea)
@@ -1707,7 +1965,6 @@ function TerrainGenerator.GenerateFlatTerrain(buildArea, plotNumber)
 	-- Initialize decoration cleanup
 	TerrainGenerator.InitializeDecorationCleanup(buildArea)
 	
-	print("[TerrainGenerator] Flat terrain: " .. blocksCreated .. " blocks")
 	return blocksCreated
 end
 
@@ -1810,7 +2067,9 @@ function TerrainGenerator.InitializeDecorationCleanup(buildArea)
 			end
 			
 			-- Track removed tree blocks (logs and leaves)
-			if isTreeBlock or (blockType == "Leaves" and not hasPlacedBy) then
+			-- Leaves match by substring so per-type leaf blocks (OakLeaves/BirchLeaves/
+			-- SpruceLeaves) and the legacy "Leaves" name are all caught.
+			if isTreeBlock or (blockType and blockType:find("Leaves") ~= nil and not hasPlacedBy) then
 				local posX = child:GetAttribute("BlockPosX")
 				local posY = child:GetAttribute("BlockPosY")
 				local posZ = child:GetAttribute("BlockPosZ")
@@ -1921,8 +2180,6 @@ function TerrainGenerator.UpdateTerrainColors(buildArea, biomeName, seasonName)
 	end
 	
 	local biomeColors = BiomeConfig.GetBiomeColors(biomeName)
-	print(string.format("[TerrainGenerator] UpdateTerrainColors: biome=%s season=%s grassColor=%s",
-		biomeName, seasonName, biomeColors.GrassColor and tostring(biomeColors.GrassColor) or "nil"))
 	
 	local updated = 0
 	local skipped = 0
@@ -1937,7 +2194,6 @@ function TerrainGenerator.UpdateTerrainColors(buildArea, biomeName, seasonName)
 	}
 	
 	local children = blocksFolder:GetChildren()
-	print("[TerrainGenerator] Total children in Blocks folder:", #children)
 	
 	for i, child in ipairs(children) do
 		local blockType = child:GetAttribute("BlockType")
@@ -1958,8 +2214,6 @@ function TerrainGenerator.UpdateTerrainColors(buildArea, biomeName, seasonName)
 		-- Yield occasionally to avoid freezing on large plots
 		if i % 500 == 0 then task.wait() end
 	end
-	
-	print(string.format("[TerrainGenerator] Color update done: %d updated, %d skipped (biome=%s season=%s)", updated, skipped, biomeName, seasonName))
 	return updated
 end
 
@@ -1969,7 +2223,7 @@ end
 -- with temperature-based clustering
 -- ============================================
 
-function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSeed, preferredBiomes)
+function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSeed, preferredBiomes, worldContinuous)
 	if not TERRAIN.ENABLED then return end
 	
 	loadBiomeDependencies()
@@ -2108,9 +2362,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 	
 	local numBiomes = #selectedBiomes
 	
-	print("[TerrainGenerator] Default terrain with biomes: " .. table.concat(selectedBiomes, ", "))
-	print("[TerrainGenerator] Using seed: " .. noiseSeed)
-	
 	-- Generate Voronoi control points for biome regions
 	local biomePoints = {}
 	for i, biomeName in ipairs(selectedBiomes) do
@@ -2207,6 +2458,19 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 		if gridX % 10 == 0 then task.wait() end
 	end
 	
+	-- CHUNK WORLD: replace the per-plot RANDOM biome map with a deterministic
+	-- world-space biome field so biomes (and the height/colour blending that
+	-- depends on them) flow seamlessly across chunk borders. Heights are already
+	-- world-continuous: every chunk shares one worldSeed (-> noiseSeed) and
+	-- samples height noise in absolute world coords.
+	if worldContinuous then
+		biomeMap, blendMap, selectedBiomes = computeWorldBiomeMaps(startX, startZ, gridSizeX, gridSizeZ, noiseSeed)
+		-- Re-seed the decoration/tree RNG per-chunk so plants vary between chunks
+		-- (heights + biomes stay world-continuous; only the scatter detail differs).
+		local decoSeed = (math.floor(startX) * 92837 + math.floor(startZ) * 689287) % 2147483647
+		terrainRng = Random.new((decoSeed + noiseSeed) % 2147483647)
+	end
+	
 	-- Store biome map as attribute for save/load
 	local biomeMapData = {}
 	local biomeIndexMap = {}
@@ -2235,7 +2499,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 	local useFastMode = isMegaPlot and GENERATION_SETTINGS.MEGA_PLOT_FAST_MODE
 	
 	local startTime = tick()
-	print("[TerrainGenerator] Generating Default multi-biome terrain (Season: " .. currentSeason .. ")...")
 	
 	-- Pre-calculate height map using per-cell biome settings
 	-- Heights are blended at biome borders for smooth transitions
@@ -2261,13 +2524,10 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		print(string.format("[TerrainGenerator] Default: Using SAVED height map for exact terrain restoration (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	else
 		-- Generate new height map from noise (first-time generation)
 		if savedHeightMapStr then
 			buildArea:SetAttribute("TerrainHeightMap", nil)
-			print("[TerrainGenerator] Default: Cleared stale saved height map (grid size mismatch)")
 		end
 		
 		-- Helper: compute raw height for a biome config at world position
@@ -2347,9 +2607,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				maxHeight = math.max(maxHeight, h)
 			end
 		end
-		
-		print(string.format("[TerrainGenerator] Default: Generated NEW height map from noise (%dx%d, range %d to %d)",
-			gridSizeX, gridSizeZ, minHeight, maxHeight))
 	end
 	
 	-- Store height map
@@ -2420,6 +2677,8 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				end
 			end
 			
+			local isSnowyCell = (cellBiome == "Snowy")
+
 			table.insert(layer.terrainBlocks, {
 				blockType = grassType,
 				position = grassPos,
@@ -2428,7 +2687,29 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				biomeName = cellBiome,
 				seasonName = currentSeason,
 				blendedGrassColor = blendedGrassColor,
+				-- Snowy biome generates PLAIN grass; mark it so the spawner runs the
+				-- snow-on-grass conversion (-> SnowyGrassBlock) right after creating it.
+				convertToSnowy = isSnowyCell,
 			})
+			
+			-- SNOWY BIOME: lay a thin SnowLayer block in the grid cell ABOVE the
+			-- surface. It's a real terrain block (lives in Blocks, rides the normal
+			-- chunk-spawn path -- no decoration folder needed). We register it at the
+			-- FULL cell above (surfaceY + BLOCK_SIZE) so its stored BlockPosY rounds to
+			-- gy+1 -- exactly where SnowyGrassManager looks for "snow above". The grass
+			-- beneath is converted to snowy grass at spawn time (see convertToSnowy),
+			-- so the pair reads as one snowy-grass-with-snow surface. createBlock
+			-- visually drops the thin slab onto the grass top face so it isn't buried.
+			if isSnowyCell then
+				local snowPos = Vector3.new(x, surfaceY + BLOCK_SIZE, z)
+				local snowLayer = getOrCreateLayer(snowPos.Y)
+				table.insert(snowLayer.terrainBlocks, {
+					blockType = "SnowLayer",
+					position = snowPos,
+					depth = 0,
+					surfaceY = surfaceY,
+				})
+			end
 			
 			-- Decorations
 			local hasDecoration = false
@@ -2531,8 +2812,19 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 				end
 			end
 			
-			-- Fill dirt below surface
+			-- Fill dirt below surface.
+			-- AIR-EXPOSURE CULLING: a fill block is only ever visible if at least one
+			-- of its 4 cardinal neighbors has open air beside it at that height (i.e.
+			-- that neighbor's surface sits BELOW the fill block). A block walled in on
+			-- all four sides (and buried below grass) can never be seen, so we skip
+			-- creating the part entirely -- the single biggest part-count saving on a
+			-- big chunk world. Digging still works: OnTerrainBlockBroken regenerates
+			-- sub-surface blocks on demand from surface math, so a culled block
+			-- materializes the moment a player exposes it. Grid-edge columns (neighbor
+			-- out of bounds) are treated as exposed so chunk borders never leave a gap.
 			local lowestAdjacentSurface = surfaceY
+			-- Cardinal neighbor surface Ys (nil = out of bounds => treat as exposed).
+			local cardN, cardS, cardE, cardW
 			for dx = -1, 1 do
 				for dz = -1, 1 do
 					if dx == 0 and dz == 0 then continue end
@@ -2542,6 +2834,11 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 						local adjHeight = heightMap[adjX] and heightMap[adjX][adjZ] or 0
 						local adjSurfaceY = baseSurfaceY + adjHeight * BLOCK_SIZE
 						lowestAdjacentSurface = math.min(lowestAdjacentSurface, adjSurfaceY)
+						-- Record the 4 cardinal surfaces for the per-block exposure test.
+						if dx == 1 and dz == 0 then cardE = adjSurfaceY
+						elseif dx == -1 and dz == 0 then cardW = adjSurfaceY
+						elseif dx == 0 and dz == 1 then cardN = adjSurfaceY
+						elseif dx == 0 and dz == -1 then cardS = adjSurfaceY end
 					end
 				end
 			end
@@ -2549,14 +2846,24 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 			local fillStartY = math.min(baseSurfaceY, lowestAdjacentSurface)
 			local fillY = fillStartY
 			while fillY < surfaceY - 0.5 do
-				local depthFromSurface = math.round((surfaceY - fillY) / BLOCK_SIZE)
-				local fillLayer = getOrCreateLayer(fillY)
-				table.insert(fillLayer.terrainBlocks, {
-					blockType = "Dirt",
-					position = Vector3.new(x, fillY, z),
-					depth = depthFromSurface,
-					surfaceY = surfaceY,
-				})
+				-- Exposed if any cardinal neighbor is out of bounds (nil) OR its surface
+				-- is below this fill height (open air on that side). Otherwise this block
+				-- is walled in on all four sides -> cull it.
+				local exposed =
+					(cardN == nil or cardN < fillY - 0.5) or
+					(cardS == nil or cardS < fillY - 0.5) or
+					(cardE == nil or cardE < fillY - 0.5) or
+					(cardW == nil or cardW < fillY - 0.5)
+				if exposed then
+					local depthFromSurface = math.round((surfaceY - fillY) / BLOCK_SIZE)
+					local fillLayer = getOrCreateLayer(fillY)
+					table.insert(fillLayer.terrainBlocks, {
+						blockType = "Dirt",
+						position = Vector3.new(x, fillY, z),
+						depth = depthFromSurface,
+						surfaceY = surfaceY,
+					})
+				end
 				fillY = fillY + BLOCK_SIZE
 			end
 		end
@@ -2584,9 +2891,6 @@ function TerrainGenerator.GenerateDefaultTerrain(buildArea, plotNumber, savedSee
 	})
 	
 	local elapsed = tick() - startTime
-	print(string.format("[TerrainGenerator] Default terrain done! %d terrain + %d deco + %d tree/cactus blocks (%d trees, %d logs, %d cacti) in %.2fs",
-		blocksCreated, decorationsCreated, treeBlocksCreated, treesPlanned, fallenLogsPlanned, cactusPlanned, elapsed))
-	print("[TerrainGenerator] Biomes: " .. table.concat(selectedBiomes, ", "))
 	
 	if LeafDecayManager and treesPlanned > 0 then
 		LeafDecayManager.Initialize(buildArea)
@@ -2822,6 +3126,20 @@ function TerrainGenerator.GetSurfaceY(buildArea)
 	return buildArea:GetAttribute("TerrainSurfaceY") or 0
 end
 
+-- Public, lazy-aware check: has the given world position been dug out on this plot?
+-- Snaps to the terrain grid first so callers can pass any nearby world position.
+-- Used by cleanup tools to tell "floating debris" (terrain below was dug) apart from
+-- grass resting on lazy terrain that simply hasn't spawned yet.
+function TerrainGenerator.IsPositionDug(position, plotNumber, buildArea)
+	if not plotNumber then return false end
+	local checkPos = position
+	if buildArea then
+		local ok, snapped = pcall(snapToTerrainGrid, position, buildArea)
+		if ok and snapped then checkPos = snapped end
+	end
+	return isPositionDug(checkPos, plotNumber)
+end
+
 function TerrainGenerator.GetTerrainDepth()
 	return TERRAIN.MAX_DEPTH
 end
@@ -2978,11 +3296,20 @@ function TerrainGenerator.RepairMissingTerrain(buildArea, plotNumber)
 					local worldZ = startZ + gz * BLOCK_SIZE
 					local worldPos = Vector3.new(worldX, expectedSurfaceY, worldZ)
 					
-					local grassType = TERRAIN.GRASS_BLOCK
-					local block = createBlock(grassType, worldPos, blocksFolder, 0, false, currentBiome, currentSeason)
-					if block then
-						block:SetAttribute("SurfaceY", expectedSurfaceY)
-						repaired = repaired + 1
+					-- GUARD: never "repair" a surface cell the player deliberately dug out.
+					-- A dug pit has nothing below it within range, which looks identical to a
+					-- strip bug to the hasBlocksBelow heuristic. DugPositions is the authoritative
+					-- record of intentional digging; restoring grass here is exactly what created
+					-- floating grass over hollowed pits. Genuine strip-bug cells were never dug,
+					-- so they aren't in DugPositions and still get repaired below.
+					local isDug = plotNumber and isPositionDug(worldPos, plotNumber)
+					if not isDug then
+						local grassType = TERRAIN.GRASS_BLOCK
+						local block = createBlock(grassType, worldPos, blocksFolder, 0, false, currentBiome, currentSeason)
+						if block then
+							block:SetAttribute("SurfaceY", expectedSurfaceY)
+							repaired = repaired + 1
+						end
 					end
 				end
 			end
@@ -3036,10 +3363,74 @@ end
 
 -- Nether tuning (kept local to this block; promote to GridConfig later if desired)
 local NETHER_BLOCK = (TERRAIN.NETHER_BLOCK) or "Netherrack"
-local NETHER_HALF_HEIGHT_BLOCKS = 64          -- 64 up + 64 down from baseplate = 128 tall
-local NETHER_NOISE_SCALE = 0.07               -- cave feature size; smaller = larger caverns
-local NETHER_DENSITY_THRESHOLD = -0.15        -- > threshold = solid; tune for cavey-ness
+-- Vertical extent (top-only). The cave used to be a symmetric 64-up/64-down
+-- (128 tall) bubble centred on the baseplate; it's now a shallow basin BELOW the
+-- baseplate that holds the lava sea, plus the main cave ABOVE. The player arrives
+-- near the baseplate, sitting just above the lava.
+local NETHER_DEPTH_BELOW_BLOCKS = 8           -- cells below the baseplate (the lava basin)
+local NETHER_HEIGHT_ABOVE_BLOCKS = 56         -- cells above the baseplate (the main cave)
+-- Lava sea: any OPEN cell at or below this voxel index (above the bottom shell)
+-- is filled with lava. Held a couple of cells under the baseplate so the portal
+-- arrival point stays dry.
+local NETHER_LAVA_TOP_BLOCKS = NETHER_DEPTH_BELOW_BLOCKS - 2
+-- Shore taper: just ABOVE the lava surface, bias toward air over this many cells
+-- so the banks slope down into the sea (lava laps up to a shoreline) instead of a
+-- sheer rock wall capping it. BIAS is how strongly the waterline is opened.
+local NETHER_LAVA_SHORE_FADE = 3
+local NETHER_LAVA_SHORE_BIAS = 0.8
+local NETHER_NOISE_SCALE = 0.05               -- cave feature size; smaller = larger caverns + more solid mass between them
+local NETHER_DENSITY_THRESHOLD = -0.35        -- > threshold = solid; LOWER = more filled rock, fewer/smaller caverns
 local NETHER_FACE_SHELL = 1                    -- forced-solid voxel layers at each bound
+
+-- Cave-SHAPE tuning (added). The base field above (NETHER_NOISE_SCALE/THRESHOLD)
+-- is the "cheese": big open caverns. A single thresholded field on its own reads
+-- as disconnected blobs, so two extra behaviours are layered on top -- a second
+-- cheese octave, winding "spaghetti" tunnels, and a floor/ceiling gradient. Every
+-- value here is safe to tune live; the cave stays deterministic from NetherSeed.
+--
+-- 2nd cheese octave: wider lacunarity than the old 2.1 gives a clearer
+-- big-cavern + fine-detail split instead of uniform blob-iness.
+local NETHER_OCTAVE2_LACUNARITY = 2.7
+local NETHER_OCTAVE2_WEIGHT = 0.30
+--
+-- SPAGHETTI/NOODLE tunnels: two independent low-frequency noise fields; air is
+-- carved only where BOTH cross near zero, so their intersection forms winding
+-- tube-like channels that connect caverns (instead of flat sheets of air). Lower
+-- scale = longer/smoother tunnels; larger radius = wider tunnels (and more).
+local NETHER_TUNNEL_SCALE = 0.04
+local NETHER_TUNNEL_RADIUS = 0.06
+--
+-- CEILING GRADIENT: within this many cells of the TOP, bias the density toward
+-- solid so there's always a roof. (The floor is no longer biased solid -- the
+-- lava sea is the floor now, resting on the forced bottom shell.) BIAS is how
+-- hard the ceiling is pushed solid.
+local NETHER_CEIL_FADE_BLOCKS = 10
+local NETHER_CEIL_BIAS = 1.0
+
+-- SOULSAND BIOMES: a SECOND noise field (different scale + offset, so it's
+-- uncorrelated with the cave-density field) decides which solid voxels are
+-- SoulSand instead of Netherrack. We use a LOW noise scale so the result is a
+-- few large biome-sized regions per cave (think Minecraft's soul-sand valley)
+-- rather than tiny speckle patches scattered everywhere. A second octave at
+-- higher frequency breaks up the smooth boundary so the biome edges look
+-- ragged/natural instead of perfectly spherical. Deterministic from the same
+-- NetherSeed as the cave, so dig-reveal regrows the same biomes.
+local SOULSAND_BLOCK = "SoulSand"
+local SOULSAND_NOISE_SCALE = 0.025            -- LOW scale = big biome-sized regions (was 0.12 = speckles)
+local SOULSAND_DETAIL_SCALE = 0.10            -- secondary octave to ragged-up the biome edges
+local SOULSAND_DETAIL_WEIGHT = 0.25           -- how much the detail octave deforms the boundary
+local SOULSAND_THRESHOLD = 0.20               -- noise > threshold = SoulSand biome; ~10-15% of cave volume
+local SOULSAND_SEED_OFFSET = 7919             -- prime offset so the two noise fields don't align
+
+-- NETHER FIRES: after the cave is built, top-facing exposed voxels have a tiny
+-- per-voxel chance to carry a Top-face Fire (or FireBlue on SoulSand). The
+-- decision is deterministic from the same NetherSeed (uses a hash of the voxel
+-- coords + a fire-specific seed offset) so the same fires appear on regen and
+-- on dig-reveal of buried tops, never doubling up. Rates intentionally low --
+-- the user asked for "some here and there", not a wall of flame.
+local NETHER_FIRE_CHANCE_NETHERRACK = 0.010   -- 1.0% of netherrack tops carry fire
+local NETHER_FIRE_CHANCE_SOULSAND   = 0.050   -- 5%   of soulsand   tops carry blue fire
+local NETHER_FIRE_SEED_OFFSET = 31337         -- prime offset for the fire-decision noise
 
 -- 6 axis neighbours (reuse the module's BLOCK_SIZE).
 local NETHER_NEIGHBORS = {
@@ -3065,15 +3456,16 @@ local function getNetherFrame(buildArea)
 	-- Grid origin matches snapToTerrainGrid: first cell centre on each axis.
 	local startX = posX - sizeX / 2 + BLOCK_SIZE / 2
 	local startZ = posZ - sizeZ / 2 + BLOCK_SIZE / 2
-	-- Bubble straddles the baseplate Y. Cell centres step by BLOCK_SIZE from the
-	-- bottom of the bubble; baseplate Y sits at the vertical middle.
-	local startY = posY - NETHER_HALF_HEIGHT_BLOCKS * BLOCK_SIZE + BLOCK_SIZE / 2
+	-- Cave is top-only now: a shallow basin below the baseplate (lava) plus the
+	-- main cave above. Cell iy=0 is the basin floor; the baseplate sits at
+	-- iy = NETHER_DEPTH_BELOW_BLOCKS.
+	local startY = posY - NETHER_DEPTH_BELOW_BLOCKS * BLOCK_SIZE + BLOCK_SIZE / 2
 
 	return {
 		startX = startX, startY = startY, startZ = startZ,
 		gridSizeX = math.floor(sizeX / BLOCK_SIZE),
 		gridSizeZ = math.floor(sizeZ / BLOCK_SIZE),
-		gridSizeY = NETHER_HALF_HEIGHT_BLOCKS * 2,
+		gridSizeY = NETHER_DEPTH_BELOW_BLOCKS + NETHER_HEIGHT_ABOVE_BLOCKS,
 	}
 end
 
@@ -3108,11 +3500,58 @@ local function netherIsSolid(frame, seed, ix, iy, iz)
 		or iz < NETHER_FACE_SHELL or iz >= frame.gridSizeZ - NETHER_FACE_SHELL then
 		return true
 	end
-	-- Interior: two octaves of 3D Perlin noise carve caverns/overhangs.
+
+	-- LAVA BASIN: force the sub-surface band OPEN so the lava sea actually FILLS it
+	-- -- every open cell there becomes lava (see netherIsFilledCached). Without this
+	-- the noise packs the basin with mostly rock and lava only peeks through in thin
+	-- strips. The bottom shell (above) is the basin bed; the side shell walls contain
+	-- the sea.
+	if iy <= NETHER_LAVA_TOP_BLOCKS then
+		return false
+	end
+
+	-- CHEESE: two octaves of 3D Perlin carve the big caverns/overhangs.
 	local wx, wy, wz = ix * NETHER_NOISE_SCALE, iy * NETHER_NOISE_SCALE, iz * NETHER_NOISE_SCALE
 	local d = math.noise(wx + seed, wy + seed, wz + seed)
-	d = d + math.noise(wx * 2.1 + seed + 300, wy * 2.1, wz * 2.1 + seed + 300) * 0.5
-	return d > NETHER_DENSITY_THRESHOLD
+	d = d + math.noise(
+		wx * NETHER_OCTAVE2_LACUNARITY + seed + 300,
+		wy * NETHER_OCTAVE2_LACUNARITY,
+		wz * NETHER_OCTAVE2_LACUNARITY + seed + 300
+	) * NETHER_OCTAVE2_WEIGHT
+
+	-- SHORE TAPER: just above the lava surface, bias toward AIR so rock banks slope
+	-- down into the sea (open cells there fill with lava as shoreline pools) rather
+	-- than walling the lava off. Strongest right at the waterline, fading out over
+	-- NETHER_LAVA_SHORE_FADE cells.
+	local aboveLava = iy - NETHER_LAVA_TOP_BLOCKS   -- >= 1 here (basin already returned)
+	if aboveLava <= NETHER_LAVA_SHORE_FADE then
+		d = d - NETHER_LAVA_SHORE_BIAS * (1 - (aboveLava - 1) / NETHER_LAVA_SHORE_FADE)
+	end
+
+	-- CEILING GRADIENT: push toward solid near the TOP so there's always a roof.
+	-- The floor is intentionally left to the noise -- the lava sea fills the low
+	-- open cells, and the forced bottom shell is the basin bed beneath it.
+	local distCeil = frame.gridSizeY - 1 - iy
+	if distCeil < NETHER_CEIL_FADE_BLOCKS then
+		d = d + NETHER_CEIL_BIAS * (1 - distCeil / NETHER_CEIL_FADE_BLOCKS)
+	end
+
+	local solid = d > NETHER_DENSITY_THRESHOLD
+
+	-- SPAGHETTI/NOODLE: carve connecting tubes through solid rock so caverns link
+	-- up instead of reading as isolated bubbles. Air only where BOTH tunnel fields
+	-- cross near zero (their intersection is a tube, not a wall). Skipped near the
+	-- ceiling so a tunnel never punches through the roof.
+	if solid and distCeil >= NETHER_CEIL_FADE_BLOCKS then
+		local tx, ty, tz = ix * NETHER_TUNNEL_SCALE, iy * NETHER_TUNNEL_SCALE, iz * NETHER_TUNNEL_SCALE
+		local tA = math.noise(tx + seed + 1500, ty + seed + 1500, tz + seed + 1500)
+		local tB = math.noise(tx + seed + 9000, ty + seed + 9000, tz + seed + 9000)
+		if math.abs(tA) < NETHER_TUNNEL_RADIUS and math.abs(tB) < NETHER_TUNNEL_RADIUS then
+			return false
+		end
+	end
+
+	return solid
 end
 
 -- A voxel should have a VISIBLE block iff it's solid AND at least one of its 6
@@ -3129,9 +3568,278 @@ local function netherIsExposed(frame, seed, ix, iy, iz)
 	return false
 end
 
+-- ---------------------------------------------------------------------------
+-- SOLIDITY MEMO (perf): netherIsSolid is pure for a fixed (frame, seed), but the
+-- exposure test queries each voxel up to 7x (itself + its 6 neighbours), and
+-- adjacent voxels re-query the same cells -- so across a full-bubble walk every
+-- voxel's two Perlin evaluations run ~7x over. That redundancy is the dominant
+-- cost of the ~6s on-load cave walk. A per-generation memo computes each voxel's
+-- solidity exactly once. The cache is a plain table created fresh per generation
+-- call and dropped when it returns, so it never accumulates across plots.
+--
+-- Key: a single packed integer. Coords are small (X/Z < a few hundred, Y <= 128)
+-- and the +1024 bias keeps the 1-voxel neighbour halo non-negative; the result
+-- stays well within the exact-integer range of a Lua double.
+local function packVoxelKey(ix, iy, iz)
+	return ((ix + 1024) * 4096 + (iy + 1024)) * 4096 + (iz + 1024)
+end
+
+local function netherIsSolidCached(cache, frame, seed, ix, iy, iz)
+	if not cache then return netherIsSolid(frame, seed, ix, iy, iz) end
+	local key = packVoxelKey(ix, iy, iz)
+	local v = cache[key]
+	if v == nil then
+		v = netherIsSolid(frame, seed, ix, iy, iz)
+		cache[key] = v
+	end
+	return v
+end
+
+-- Cached mirror of netherIsExposed: identical logic, but every solidity query
+-- goes through the memo so repeated cells (a voxel seen as several neighbours'
+-- neighbour) are free hits instead of fresh noise evaluations.
+local function netherIsExposedCached(cache, frame, seed, ix, iy, iz)
+	if not netherIsSolidCached(cache, frame, seed, ix, iy, iz) then return false end
+	if not netherIsSolidCached(cache, frame, seed, ix + 1, iy, iz) then return true end
+	if not netherIsSolidCached(cache, frame, seed, ix - 1, iy, iz) then return true end
+	if not netherIsSolidCached(cache, frame, seed, ix, iy + 1, iz) then return true end
+	if not netherIsSolidCached(cache, frame, seed, ix, iy - 1, iz) then return true end
+	if not netherIsSolidCached(cache, frame, seed, ix, iy, iz + 1) then return true end
+	if not netherIsSolidCached(cache, frame, seed, ix, iy, iz - 1) then return true end
+	return false
+end
+
+-- ---------------------------------------------------------------------------
+-- LAVA-SEA FILL. The basin at/below NETHER_LAVA_TOP_BLOCKS is a lava sea: any
+-- OPEN (non-solid) cell there is lava. "Filled" therefore means rock OR lava, and
+-- the generation passes test exposure against THIS so the lava surface and pool
+-- edges render as faces exactly like rock walls do.
+local function netherIsLavaCell(iy)
+	return iy <= NETHER_LAVA_TOP_BLOCKS
+end
+
+local function netherIsFilledCached(cache, frame, seed, ix, iy, iz)
+	-- Out of bounds = open (not filled). The lava test needs the X/Z bounds guard
+	-- because netherIsLavaCell only looks at iy.
+	if ix < 0 or ix >= frame.gridSizeX
+		or iy < 0 or iy >= frame.gridSizeY
+		or iz < 0 or iz >= frame.gridSizeZ then
+		return false
+	end
+	if netherIsSolidCached(cache, frame, seed, ix, iy, iz) then return true end
+	return netherIsLavaCell(iy)
+end
+
+-- Exposure against "filled" (rock OR lava) instead of solid alone.
+local function netherIsExposedFilledCached(cache, frame, seed, ix, iy, iz)
+	if not netherIsFilledCached(cache, frame, seed, ix, iy, iz) then return false end
+	if not netherIsFilledCached(cache, frame, seed, ix + 1, iy, iz) then return true end
+	if not netherIsFilledCached(cache, frame, seed, ix - 1, iy, iz) then return true end
+	if not netherIsFilledCached(cache, frame, seed, ix, iy + 1, iz) then return true end
+	if not netherIsFilledCached(cache, frame, seed, ix, iy - 1, iz) then return true end
+	if not netherIsFilledCached(cache, frame, seed, ix, iy, iz + 1) then return true end
+	if not netherIsFilledCached(cache, frame, seed, ix, iy, iz - 1) then return true end
+	return false
+end
+
+-- SOULSAND ORACLE. Given an EXPOSED solid voxel, return its block type: either
+-- "Netherrack" or "SoulSand". Driven by a SECOND noise field at a LOW scale so
+-- the result is a few large biome-shaped regions per cave (instead of tiny
+-- scattered patches), with a higher-frequency detail octave laid on top to
+-- ragged-up the biome boundary so the edges look natural instead of perfectly
+-- spherical. Deterministic from the same NetherSeed so dig-reveal regrows the
+-- same biomes. Boundary-shell voxels stay Netherrack (we want the bubble walls
+-- to be a uniform colour, not biome-coloured).
+local function netherBlockTypeAt(frame, seed, ix, iy, iz)
+	if ix < NETHER_FACE_SHELL or ix >= frame.gridSizeX - NETHER_FACE_SHELL
+		or iy < NETHER_FACE_SHELL or iy >= frame.gridSizeY - NETHER_FACE_SHELL
+		or iz < NETHER_FACE_SHELL or iz >= frame.gridSizeZ - NETHER_FACE_SHELL then
+		return NETHER_BLOCK
+	end
+	-- Base biome shape: low-frequency noise = large, smooth regions.
+	local bx = ix * SOULSAND_NOISE_SCALE
+	local by = iy * SOULSAND_NOISE_SCALE
+	local bz = iz * SOULSAND_NOISE_SCALE
+	local base = math.noise(bx + seed + SOULSAND_SEED_OFFSET, by + seed, bz + seed + SOULSAND_SEED_OFFSET)
+	-- Detail octave: higher-frequency noise that nudges the boundary +/- a bit so
+	-- the biome edge looks ragged/natural instead of a perfect smooth blob.
+	local dx = ix * SOULSAND_DETAIL_SCALE
+	local dy = iy * SOULSAND_DETAIL_SCALE
+	local dz = iz * SOULSAND_DETAIL_SCALE
+	local detail = math.noise(dx + seed + SOULSAND_SEED_OFFSET + 1000, dy + seed, dz + seed + SOULSAND_SEED_OFFSET + 1000)
+	local combined = base + detail * SOULSAND_DETAIL_WEIGHT
+	if combined > SOULSAND_THRESHOLD then
+		return SOULSAND_BLOCK
+	end
+	return NETHER_BLOCK
+end
+
+-- FIRE ORACLE. Should this EXPOSED solid voxel carry a Top-face Fire?
+-- Conditions: the cell directly ABOVE must be air (so the fire has room to
+-- sit), and a per-voxel deterministic roll must come up under the chance
+-- threshold. The chance is higher on SoulSand so soul-sand biomes feel
+-- meaningfully on fire. We use a modulo-based integer hash for the roll
+-- (NOT math.noise, which clusters values around 0.5 and makes the tail
+-- probabilities much rarer than the threshold suggests) so each voxel rolls
+-- an effectively uniform [0,1) value independent of its neighbours.
+local function netherShouldHaveFire(frame, seed, ix, iy, iz, blockType, cache)
+	-- Cell directly above must be AIR (no solid block sitting on top of the host),
+	-- so the top-face fire has room to occupy that cell. Routed through the shared
+	-- solidity memo when one is supplied (the cell above is already cached from the
+	-- exposure pass, so this is a free hit during bulk generation).
+	if netherIsSolidCached(cache, frame, seed, ix, iy + 1, iz) then return false end
+	-- ...and that air cell must open into real cavern space, not a sealed 1-cell
+	-- pocket. A flame in an enclosed pocket is invisible itself but bleeds its glow
+	-- out through the seams of the surrounding blocks -- the "fire trapped in a
+	-- bubble" look. Accept the spot only if there's headroom (the cell two above is
+	-- also air) OR the air cell above has >=2 open side neighbours (a low but open
+	-- cavern). All lookups hit the shared memo, so this is cheap.
+	if netherIsSolidCached(cache, frame, seed, ix, iy + 2, iz) then
+		local ay = iy + 1
+		local open = 0
+		if not netherIsSolidCached(cache, frame, seed, ix + 1, ay, iz) then open += 1 end
+		if not netherIsSolidCached(cache, frame, seed, ix - 1, ay, iz) then open += 1 end
+		if not netherIsSolidCached(cache, frame, seed, ix, ay, iz + 1) then open += 1 end
+		if not netherIsSolidCached(cache, frame, seed, ix, ay, iz - 1) then open += 1 end
+		if open < 2 then return false end
+	end
+	-- Integer hash: combine the coords + seed with prime multipliers then mod a
+	-- large prime. Result is [0, M) with uniform-ish distribution; divide to [0,1).
+	-- math.floor + % keep everything in the safe integer range (no overflow).
+	local M = 2147483647 -- Mersenne prime, plenty of range for a roll
+	local s = (seed + NETHER_FIRE_SEED_OFFSET) % M
+	local h = ((ix + 100000) * 73856093) % M
+	h = (h + ((iy + 100000) * 19349663) % M) % M
+	h = (h + ((iz + 100000) * 83492791) % M) % M
+	h = (h + s * 2654435761) % M
+	local r = h / M
+	local chance = (blockType == SOULSAND_BLOCK) and NETHER_FIRE_CHANCE_SOULSAND or NETHER_FIRE_CHANCE_NETHERRACK
+	return r < chance
+end
+
+-- Build a Top-face Fire on top of a nether terrain block. Inlined (not a require
+-- of FireHandler) because TerrainGenerator is a shared module loaded before
+-- ServerScriptService handlers exist; this keeps it dependency-free. Mirrors
+-- the FireHandler/ToolHandler buildFireBlock for the Top-face case only -- we
+-- deliberately don't spawn Side/Bottom fires on cave walls (too chaotic).
+--   variant = "Blue" on SoulSand, anything else picks the normal Fire template.
+local function buildNetherFire(blocksFolder, hostCenter, variant)
+	local templates = ReplicatedStorage:FindFirstChild("BlockTemplates")
+	if not templates then return nil end
+	local templateName = (variant == "Blue") and "FireBlue" or "Fire"
+	local template = templates:FindFirstChild(templateName)
+	if not template and variant == "Blue" then
+		template = templates:FindFirstChild("Fire") -- fall back to normal if FireBlue missing
+	end
+	if not template then return nil end
+
+	local fire = template:Clone()
+	fire.Name = template.Name
+	if fire:IsA("BasePart") then
+		fire.Anchored = true
+		fire.CanCollide = false
+		fire.CanQuery = true
+		fire.CanTouch = false
+		fire.CastShadow = false
+	elseif fire:IsA("Model") then
+		for _, d in ipairs(fire:GetDescendants()) do
+			if d:IsA("BasePart") then
+				d.Anchored = true
+				d.CanCollide = false
+				d.CanQuery = true
+				d.CanTouch = false
+				d.CastShadow = false
+			end
+		end
+	end
+
+	-- Top-face placement: fire occupies the cell ABOVE the host; correct only the
+	-- X/Z pivot offset (off-centre model) -- mirrors FireHandler's Top branch.
+	local visualPos = hostCenter + Vector3.new(0, BLOCK_SIZE, 0)
+	if fire:IsA("BasePart") then
+		fire.Position = visualPos
+	elseif fire:IsA("Model") then
+		local pivotCF = fire:GetPivot()
+		local boxCF = fire:GetBoundingBox()
+		local off = pivotCF:ToObjectSpace(boxCF).Position
+		fire:PivotTo(CFrame.new(visualPos - Vector3.new(off.X, 0, off.Z)))
+	end
+
+	fire:SetAttribute("BlockType", "Fire")
+	fire:SetAttribute("IsFire", true)
+	fire:SetAttribute("FireFace", "Top")
+	if variant == "Blue" then
+		fire:SetAttribute("FireVariant", "Blue")
+	end
+	fire:SetAttribute("BlockPosX", visualPos.X)
+	fire:SetAttribute("BlockPosY", visualPos.Y)
+	fire:SetAttribute("BlockPosZ", visualPos.Z)
+	fire:SetAttribute("HostBlockX", hostCenter.X)
+	fire:SetAttribute("HostBlockY", hostCenter.Y)
+	fire:SetAttribute("HostBlockZ", hostCenter.Z)
+	fire:SetAttribute("IsNaturalFire", true) -- spawned by the cave, not a player
+	fire:SetAttribute("IsTerrainBlock", true) -- regenerated from seed; don't save
+
+	fire.Parent = blocksFolder
+	return fire
+end
+
+-- Build ONE static source-lava cube for the nether sea. Mirrors LavaHandler's
+-- source block (full-cube Neon, opaque, walk-through-but-queryable) but inlined
+-- and dependency-free, same as buildNetherFire. NO per-cell PointLight -- a sea of
+-- lights would blow the light budget; the Neon material glows on its own. Tagged
+-- IsLava + LavaLevel 0 so existing lava code recognises it, IsTerrainBlock so it
+-- regenerates from seed and isn't saved, and NOT PlacedBy (it's natural). Nether
+-- plots aren't watched by LavaHandler, so this never triggers flow simulation.
+local function buildNetherLava(blocksFolder, centre)
+	local lava = Instance.new("Part")
+	lava.Name = "Lava"
+	lava.Anchored = true
+	lava.CanCollide = false
+	lava.CanQuery = true
+	lava.CanTouch = false
+	lava.CastShadow = false
+	lava.Size = Vector3.new(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
+	lava.Color = Color3.fromRGB(255, 90, 20)
+	lava.Material = Enum.Material.Neon
+	lava.TopSurface = Enum.SurfaceType.Smooth
+	lava.BottomSurface = Enum.SurfaceType.Smooth
+	lava.CFrame = CFrame.new(centre)
+	lava:SetAttribute("BlockType", "Lava")
+	lava:SetAttribute("IsLava", true)
+	lava:SetAttribute("LavaLevel", 0)
+	lava:SetAttribute("IsNaturalLava", true)
+	lava:SetAttribute("IsTerrainBlock", true) -- regenerated from seed; don't save
+	lava:SetAttribute("BlockPosX", centre.X)
+	lava:SetAttribute("BlockPosY", centre.Y)
+	lava:SetAttribute("BlockPosZ", centre.Z)
+	lava.Parent = blocksFolder
+	return lava
+end
+
+-- Build the correct terrain block for an exposed FILLED voxel: rock (with a
+-- possible top fire) when the voxel is solid, otherwise a lava-sea cube. Shared by
+-- the bubble walk, the carve reveal, and the dig reveal so all three agree.
+-- Returns true if a block was created.
+local function buildNetherCell(cache, frame, seed, blocksFolder, ix, iy, iz, pos)
+	if netherIsSolidCached(cache, frame, seed, ix, iy, iz) then
+		local blockType = netherBlockTypeAt(frame, seed, ix, iy, iz)
+		local b = createBlock(blockType, pos, blocksFolder, 0, false, nil, nil)
+		if not b then return false end
+		if netherShouldHaveFire(frame, seed, ix, iy, iz, blockType, cache) then
+			local variant = (blockType == SOULSAND_BLOCK) and "Blue" or "Normal"
+			buildNetherFire(blocksFolder, pos, variant)
+		end
+		return true
+	end
+	-- Open cell inside the lava sea -> lava surface/edge.
+	return buildNetherLava(blocksFolder, pos) ~= nil
+end
+
 -- Public: does the nether want a block at this WORLD position? Used by the dig
 -- reveal path. Returns (shouldHave, blockType). A position should have a block
--- if it's an exposed solid voxel and hasn't been dug.
+-- if it's an exposed solid voxel and hasn't been dug. blockType is per-voxel:
+-- either "Netherrack" or "SoulSand" (from netherBlockTypeAt).
 function TerrainGenerator.ShouldHaveNetherAt(position, buildArea, plotNumber)
 	local seed = buildArea:GetAttribute("NetherSeed")
 	if not seed then return false, nil end
@@ -3140,7 +3848,7 @@ function TerrainGenerator.ShouldHaveNetherAt(position, buildArea, plotNumber)
 	local ix, iy, iz = netherWorldToIndex(frame, position)
 	if isPositionDug(position, plotNumber) then return false, nil end
 	if netherIsExposed(frame, seed, ix, iy, iz) then
-		return true, NETHER_BLOCK
+		return true, netherBlockTypeAt(frame, seed, ix, iy, iz)
 	end
 	return false, nil
 end
@@ -3198,20 +3906,34 @@ function TerrainGenerator.GenerateNetherBubble(buildArea, plotNumber, savedSeed,
 	end
 
 	local blocksCreated = 0
+	-- Per-generation solidity memo (see netherIsSolidCached): each voxel's noise is
+	-- evaluated once instead of ~7x. Dropped when this call returns.
+	local solidCache = {}
+	-- Budget-based yield (matches the codebase's 8ms-frame-budget pattern): yield
+	-- only after holding the thread ~8ms, instead of a fixed every-2-slabs cadence
+	-- that over-yields once the memo makes each slab cheap. Checked per Z-column so
+	-- a single wide slab can't spike a frame before the next yield.
+	local lastYield = os.clock()
 	for ix = x0, x1 do
 		for iz = z0, z1 do
 			for iy = y0, y1 do
-				if netherIsExposed(frame, seed, ix, iy, iz) then
+				if netherIsExposedFilledCached(solidCache, frame, seed, ix, iy, iz) then
 					local pos = netherIndexToWorld(frame, ix, iy, iz)
 					if not isPositionDug(pos, plotNumber) and not blockExistsAt(pos, blocksFolder) then
-						-- isLazyLoaded=false: initial cave regenerates from seed, isn't saved.
-						local b = createBlock(NETHER_BLOCK, pos, blocksFolder, 0, false, nil, nil)
-						if b then blocksCreated = blocksCreated + 1 end
+						-- Rock (Netherrack/SoulSand, + sparse top fire) when solid; a
+						-- lava-sea cube when it's an open cell in the basin. Regenerates
+						-- from seed either way (not saved).
+						if buildNetherCell(solidCache, frame, seed, blocksFolder, ix, iy, iz, pos) then
+							blocksCreated = blocksCreated + 1
+						end
 					end
 				end
 			end
+			if os.clock() - lastYield >= 0.008 then
+				task.wait()
+				lastYield = os.clock()
+			end
 		end
-		if ix % 2 == 0 then task.wait() end
 	end
 
 	-- Bounded mode leaves the plot "open" for more streaming: clear GeneratedPlots
@@ -3223,7 +3945,7 @@ function TerrainGenerator.GenerateNetherBubble(buildArea, plotNumber, savedSeed,
 	end
 
 	local elapsed = tick() - startTime
-	print(string.format("[TerrainGenerator] Nether bubble done! %d exposed blocks in %.2fs (plot %d)%s",
+	print(string.format("[TerrainGenerator] Nether bubble done! %d exposed blocks (rock + lava) in %.2fs (plot %d)%s",
 		blocksCreated, elapsed, plotNumber, bounded and " [bounded region]" or " [full]"))
 
 	GeneratingPlots[plotNumber] = nil
@@ -3250,14 +3972,19 @@ function TerrainGenerator.OnNetherBlockBroken(position, buildArea, plotNumber)
 	markPositionAsDug(snapped, plotNumber)
 
 	local spawned = 0
+	-- Small per-call memo: the 6 neighbours' exposure tests overlap, so caching
+	-- avoids re-noising shared cells. Negligible memory (a handful of voxels).
+	local solidCache = {}
 	for _, off in ipairs(NETHER_NEIGHBORS) do
 		local npos = snapped + off
 		local nix, niy, niz = netherWorldToIndex(frame, npos)
 		if not isPositionDug(npos, plotNumber)
 			and not blockExistsAt(npos, blocksFolder)
-			and netherIsExposed(frame, seed, nix, niy, niz) then
-			local b = createBlock(NETHER_BLOCK, npos, blocksFolder, 0, false, nil, nil)
-			if b then spawned = spawned + 1 end
+			and netherIsExposedFilledCached(solidCache, frame, seed, nix, niy, niz) then
+			-- Rock (+ fire) or lava, whichever the voxel calls for.
+			if buildNetherCell(solidCache, frame, seed, blocksFolder, nix, niy, niz, npos) then
+				spawned = spawned + 1
+			end
 		end
 	end
 	return spawned
@@ -3293,7 +4020,10 @@ function TerrainGenerator.CarveNetherPocket(buildArea, plotNumber, centreWorld, 
 				local pos = netherIndexToWorld(frame, cix + dx, ciy + dy, ciz + dz)
 				markPositionAsDug(pos, plotNumber)
 				local existing = index and index:GetAnyBlockAt(pos)
-				if existing and existing:GetAttribute("BlockType") == NETHER_BLOCK
+				if existing and (existing:GetAttribute("BlockType") == NETHER_BLOCK
+						or existing:GetAttribute("BlockType") == SOULSAND_BLOCK
+						or existing:GetAttribute("IsLava")     -- drain natural lava from the arrival pocket
+						or existing:GetAttribute("IsFire")) -- snuff any natural fire in the pocket too
 					and not existing:GetAttribute("PlacedBy") then
 					existing:Destroy()
 					cleared = cleared + 1
@@ -3306,6 +4036,9 @@ function TerrainGenerator.CarveNetherPocket(buildArea, plotNumber, centreWorld, 
 	-- the carved box, spawn it if the oracle says it's now an exposed solid voxel
 	-- and it isn't dug or already present. (Mirrors OnNetherBlockBroken's reveal.)
 	if seed then
+		-- Per-call solidity memo: the reveal shell re-checks neighbouring cells, so
+		-- caching keeps each voxel's noise to a single evaluation.
+		local solidCache = {}
 		for dx = -hx - 1, hx + 1 do
 			for dy = -hy - 1, hy + 1 do
 				for dz = -hz - 1, hz + 1 do
@@ -3313,8 +4046,9 @@ function TerrainGenerator.CarveNetherPocket(buildArea, plotNumber, centreWorld, 
 					local pos = netherIndexToWorld(frame, ix, iy, iz)
 					if not isPositionDug(pos, plotNumber)
 						and not blockExistsAt(pos, blocksFolder)
-						and netherIsExposed(frame, seed, ix, iy, iz) then
-						createBlock(NETHER_BLOCK, pos, blocksFolder, 0, false, nil, nil)
+						and netherIsExposedFilledCached(solidCache, frame, seed, ix, iy, iz) then
+						-- Rock (+ fire) or lava, whichever the voxel calls for.
+						buildNetherCell(solidCache, frame, seed, blocksFolder, ix, iy, iz, pos)
 					end
 				end
 			end

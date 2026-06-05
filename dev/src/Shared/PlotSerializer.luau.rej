@@ -1,0 +1,14 @@
+diff a/dev/src/Shared/PlotSerializer.luau b/dev/src/Shared/PlotSerializer.luau	(rejected hunks)
+@@ -131,6 +128,12 @@ local AttributeBlacklist = {
+ 	["PathBaseX"] = true,        -- Used for grid calculation during save only
+ 	["PathBaseY"] = true,        -- Used for grid calculation during save only
+ 	["PathBaseZ"] = true,        -- Used for grid calculation during save only
++	-- ChestSecondary absolute coords are NOT saved; we save origin-relative csx/csy/csz
++	-- instead (see chest block below). Saving absolutes caused double chests to teleport
++	-- out of the plot when reloaded at a different origin.
++	["ChestSecondaryX"] = true,
++	["ChestSecondaryY"] = true,
++	["ChestSecondaryZ"] = true,
+ }
+ 
+ local ShortToExtraKey = {}

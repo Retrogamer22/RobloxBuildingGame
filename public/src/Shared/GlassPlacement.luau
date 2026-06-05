@@ -67,7 +67,7 @@ GlassPlacement.GLASS_BASE_TYPES = {
 GlassPlacement.GLASS_TYPE_CONFIG = {
 	Glass = {
 		folder = "Decorations/Glass",
-		single  = "Glass_0",
+		single  = "GlassPane",
 		corner  = "Glass_Corner",
 		tee     = "Glass_Tee",
 		fourway = "Glass_4_Way",
@@ -100,6 +100,74 @@ function GlassPlacement.ResolveTemplate(glassType, genericName)
 	local cfg = GlassPlacement.GLASS_TYPE_CONFIG[baseType] or GlassPlacement.GLASS_TYPE_CONFIG.Glass
 	local key = GENERIC_TEMPLATE_TO_KEY[genericName] or "single"
 	return cfg.folder, cfg[key]
+end
+
+-- ============================================
+-- COLORED GLASS STYLING
+-- ============================================
+-- A glass model is an invisible Part (Transparency 1, Plastic) whose visible look
+-- comes entirely from per-face Texture children (Back / Front / Top / ...). The plain
+-- clear "Glass" / "GlassBlock" keep that template look untouched. The tinted variants
+-- (RedGlass, BlueGlassBlock, ...) instead get every face Texture recolored to the
+-- glass color and the part turned partially transparent IN that color, so the tint
+-- reads as colored glass rather than an invisible pane.
+GlassPlacement.COLORED_GLASS_TRANSPARENCY = 0.7
+
+-- True only for the tinted glass variants (RedGlass / RedGlassBlock / ...), never for
+-- the plain clear "Glass" or "GlassBlock". Colored variants always carry a color-name
+-- prefix, so an exact match against the two clear names is enough to exclude them.
+function GlassPlacement.IsColoredGlass(blockType)
+	if not blockType then return false end
+	if blockType == "Glass" or blockType == "GlassBlock" then return false end
+	return string.match(blockType, "GlassBlock$") ~= nil or string.match(blockType, "Glass$") ~= nil
+end
+
+-- Apply the colored-glass look to a freshly created/cloned glass instance: recolor
+-- every face Texture/Decal to `color` and make each pane COLORED_GLASS_TRANSPARENCY
+-- transparent in that same color. Accepts either a single Part or a Model. Hitbox /
+-- ClimbSensor helper parts are skipped so collision/interaction stays invisible.
+function GlassPlacement.StyleColoredGlass(instance, color)
+	if not instance or not color then return end
+	local function stylePart(part)
+		if part.Name == "Hitbox" or part.Name == "ClimbSensor" then return end
+		part.Transparency = GlassPlacement.COLORED_GLASS_TRANSPARENCY
+		part.Color = color
+		-- SmoothPlastic, not Glass: the Glass material's refraction/sheen washes the
+		-- tint out and looks wrong on these textured panes.
+		part.Material = Enum.Material.SmoothPlastic
+	end
+	if instance:IsA("BasePart") then stylePart(instance) end
+	for _, desc in ipairs(instance:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			stylePart(desc)
+		elseif desc:IsA("Texture") or desc:IsA("Decal") then
+			desc.Color3 = color
+		end
+	end
+end
+
+-- True for ANY glass (clear or tinted, pane or full block). Used to force the material.
+function GlassPlacement.IsAnyGlass(blockType)
+	if not blockType then return false end
+	return string.match(blockType, "Glass$") ~= nil or string.match(blockType, "GlassBlock$") ~= nil
+end
+
+-- Force every glass part to SmoothPlastic. The refractive Glass material washes the
+-- panes out and looks wrong with their textures, so no glass should ever use it -
+-- this normalizes both clear and colored glass regardless of what the template/preset
+-- left the material as. Hitbox/ClimbSensor helper parts are left alone.
+function GlassPlacement.NormalizeGlassMaterial(instance)
+	if not instance then return end
+	local function fix(part)
+		if part.Name == "Hitbox" or part.Name == "ClimbSensor" then return end
+		if part.Material == Enum.Material.Glass then
+			part.Material = Enum.Material.SmoothPlastic
+		end
+	end
+	if instance:IsA("BasePart") then fix(instance) end
+	for _, desc in ipairs(instance:GetDescendants()) do
+		if desc:IsA("BasePart") then fix(desc) end
+	end
 end
 
 -- Valid orientations
@@ -389,6 +457,9 @@ local function detectGlassConnection(position, blocksFolder, paneOrientation, al
 			else -- hasWest and hasSouth
 				rotationDegrees = 0
 			end
+			-- The Glass_Corner model faces the opposite way from the old set, so flip
+			-- every corner 180° to point its open side back along the wall run.
+			rotationDegrees = (rotationDegrees + 180) % 360
 			return {
 				templateName = "Glass_Corner",
 				cornerType = "corner",
@@ -577,6 +648,12 @@ local function fixupGlassAtPosition(existing, blocksFolder, createGlassFunc, all
 			end
 		end
 
+		-- Colored glass: re-apply the tinted-texture + 70% transparency look so it
+		-- survives the flat<->corner<->tee<->4way conversion. Clear glass is skipped.
+		if GlassPlacement.IsColoredGlass(oldBlockType) and fallbackColor then
+			GlassPlacement.StyleColoredGlass(newGlass, fallbackColor)
+		end
+
 		-- Store rotation degrees so future fixups can detect rotation-only changes.
 		newGlass:SetAttribute("GlassRotationDegrees", replaceWith.rotationDegrees)
 		return {
@@ -590,6 +667,185 @@ local function fixupGlassAtPosition(existing, blocksFolder, createGlassFunc, all
 	end
 
 	return nil
+end
+
+-- ============================================
+-- CONNECTED-BLOCK FACE CULLING (glass + leaves)
+-- ============================================
+-- When a textured see-through block (glass, or leaves) abuts another block of the SAME
+-- kind, the textures on the faces where the two cells meet read as doubled clutter seen
+-- through them. We hide the texture on any face that points at a neighboring cell of the
+-- same kind (restoring it when the neighbor goes away), so a run/volume of connected
+-- glass -- or a clump of leaves -- reads as one clean surface; only outward faces keep
+-- their texture. Direction comes from each Texture's Face mapped through the part's world
+-- CFrame, so it works for any orientation, the corner/tee/4way models, full glass blocks,
+-- leaf blocks, and leaf-filled frames.
+--
+-- Culling is per-kind ("group"): glass only culls against glass, leaves only against
+-- leaves -- so a leaf next to glass keeps both textures.
+
+local CULL_NEIGHBOR_DIRS = {
+	Vector3.new( BLOCK_SIZE, 0, 0), Vector3.new(-BLOCK_SIZE, 0, 0),
+	Vector3.new(0,  BLOCK_SIZE, 0), Vector3.new(0, -BLOCK_SIZE, 0),
+	Vector3.new(0, 0,  BLOCK_SIZE), Vector3.new(0, 0, -BLOCK_SIZE),
+}
+
+-- Snap a (roughly axis-aligned) world vector to its nearest unit cardinal direction.
+local function toCardinal(v)
+	local ax, ay, az = math.abs(v.X), math.abs(v.Y), math.abs(v.Z)
+	if ax >= ay and ax >= az then
+		return Vector3.new(v.X >= 0 and 1 or -1, 0, 0)
+	elseif ay >= az then
+		return Vector3.new(0, v.Y >= 0 and 1 or -1, 0)
+	else
+		return Vector3.new(0, 0, v.Z >= 0 and 1 or -1)
+	end
+end
+
+-- True for leaves that should cull: leaf blocks and leaf-filled frames, but NOT
+-- leaf-filled frame doors (and never anything door-like).
+function GlassPlacement.IsCullableLeaf(block, blockType)
+	blockType = blockType or (block and block:GetAttribute("BlockType"))
+	-- Never cull doors, including leaf-filled frame doors.
+	if blockType and string.find(blockType, "Door") then return false end
+	if block and block:GetAttribute("IsDoor") then return false end
+	-- A leaf block (BirchLeaves, OakLeaves, ...).
+	if blockType and string.find(blockType, "Leaves") then return true end
+	-- A frame filled with leaves.
+	local fill = block and block:GetAttribute("FrameFillBlockId")
+	if fill and string.find(fill, "Leaves") then return true end
+	return false
+end
+
+-- Which cull group a block belongs to ("glass" / "leaves"), or nil if it doesn't
+-- participate. Faces only cull against neighbors of the SAME group.
+local function cullGroupOf(block)
+	if not block then return nil end
+	local bt = block:GetAttribute("BlockType")
+	if block:GetAttribute("IsGlass") or (bt and GlassPlacement.IsAnyGlass(bt)) then
+		return "glass"
+	end
+	if GlassPlacement.IsCullableLeaf(block, bt) then
+		return "leaves"
+	end
+	return nil
+end
+
+-- Grid position of a block (prefers stored attributes; falls back to pivot/position).
+local function blockGridPos(block)
+	local bx = block:GetAttribute("BlockPosX")
+	local by = block:GetAttribute("BlockPosY")
+	local bz = block:GetAttribute("BlockPosZ")
+	if bx and by and bz then return Vector3.new(bx, by, bz) end
+	if block:IsA("Model") then return block:GetPivot().Position end
+	if block:IsA("BasePart") then return block.Position end
+	return nil
+end
+
+-- Find a cullable block occupying the given cell. If `wantGroup` is given, only matches
+-- that group. Returns (block, gridPos, group) or nil.
+local function findCullableAt(position, blocksFolder, wantGroup)
+	local index = getSpatialIndex(blocksFolder)
+	local candidates = index and index:GetBlocksAt(position) or blocksFolder:GetChildren()
+	for _, block in ipairs(candidates) do
+		if block.Parent then
+			local g = cullGroupOf(block)
+			if g and (wantGroup == nil or g == wantGroup) then
+				local bpos = blockGridPos(block)
+				if bpos then
+					local d = position - bpos
+					if math.abs(d.X) < 1.5 and math.abs(d.Y) < 1.5 and math.abs(d.Z) < 1.5 then
+						return block, bpos, g
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- Show or hide a single face texture, caching its authored transparency the first time
+-- so it can be restored when the neighbor is removed.
+local function setTextureHidden(tex, hidden)
+	if tex:GetAttribute("BaseTransparency") == nil then
+		tex:SetAttribute("BaseTransparency", tex.Transparency)
+	end
+	tex.Transparency = hidden and 1 or tex:GetAttribute("BaseTransparency")
+end
+
+-- Hide `instance`'s face textures on any side abutting another cell of the SAME group,
+-- and show the rest. `pos` is the instance's grid cell. (Name kept for existing callers;
+-- works for glass and leaves alike.)
+function GlassPlacement.CullGlassFaces(instance, pos, blocksFolder)
+	if not instance or not pos or not blocksFolder then return end
+	local group = cullGroupOf(instance)
+	if not group then return end
+
+	-- Probe each of the six neighbor cells at most once, even for multi-part models.
+	local neighborCache = {}
+	local function sameKindInDirection(dir)
+		local key = dir.X .. "," .. dir.Y .. "," .. dir.Z
+		local cached = neighborCache[key]
+		if cached == nil then
+			cached = findCullableAt(pos + dir * BLOCK_SIZE, blocksFolder, group) ~= nil
+			neighborCache[key] = cached
+		end
+		return cached
+	end
+
+	-- Collect the instance's own part (if any) AND every BasePart descendant, so blocks
+	-- that carry more than one set of face textures -- e.g. leaf blocks with an inner and
+	-- outer texture layer on nested parts -- all get culled, not just the top-level part.
+	local parts = {}
+	if instance:IsA("BasePart") then
+		table.insert(parts, instance)
+	end
+	for _, p in ipairs(instance:GetDescendants()) do
+		if p:IsA("BasePart") then table.insert(parts, p) end
+	end
+	if #parts == 0 then return end
+
+	for _, part in ipairs(parts) do
+		if part.Name ~= "Hitbox" and part.Name ~= "ClimbSensor" then
+			-- Every Texture/Decal on the part (a face may carry several layers; cull each).
+			for _, child in ipairs(part:GetChildren()) do
+				if child:IsA("Texture") or child:IsA("Decal") then
+					local worldDir = toCardinal(part.CFrame:VectorToWorldSpace(Vector3.FromNormalId(child.Face)))
+					setTextureHidden(child, sameKindInDirection(worldDir))
+				end
+			end
+		end
+	end
+end
+
+-- Re-cull the cullable block at `pos` and each of its six neighbors (each against its
+-- own group). Call after any glass/leaf block is placed, removed, or converted.
+function GlassPlacement.RefreshGlassFaces(pos, blocksFolder)
+	if not pos or not blocksFolder then return end
+	local function refreshAt(p)
+		local inst, ipos = findCullableAt(p, blocksFolder, nil)
+		if inst then
+			GlassPlacement.CullGlassFaces(inst, ipos, blocksFolder)
+		end
+	end
+	refreshAt(pos)
+	for _, dir in ipairs(CULL_NEIGHBOR_DIRS) do
+		refreshAt(pos + dir)
+	end
+end
+
+-- Cull every cullable block (glass + leaves) in the folder. Used once after a plot
+-- loads, where blocks are created straight from saved data rather than via placement.
+function GlassPlacement.CullAllGlass(blocksFolder)
+	if not blocksFolder then return end
+	for _, block in ipairs(blocksFolder:GetChildren()) do
+		if cullGroupOf(block) then
+			local pos = blockGridPos(block)
+			if pos then
+				GlassPlacement.CullGlassFaces(block, pos, blocksFolder)
+			end
+		end
+	end
 end
 
 -- ============================================
@@ -613,6 +869,10 @@ function GlassPlacement.UpdateAdjacentGlass(position, blocksFolder, createGlassF
 		end
 	end
 
+	-- Keep connected-glass texture culling in sync (covers place, remove, and
+	-- solid-block-near-glass, since they all funnel through here).
+	GlassPlacement.RefreshGlassFaces(position, blocksFolder)
+
 	return updated
 end
 
@@ -625,7 +885,9 @@ function GlassPlacement.FixupGlassAtPosition(position, blocksFolder, createGlass
 	if not blocksFolder or not createGlassFunc then return nil end
 	local existing = GlassPlacement.GetGlassAtPosition(position, blocksFolder)
 	if not existing then return nil end
-	return fixupGlassAtPosition(existing, blocksFolder, createGlassFunc, true)
+	local result = fixupGlassAtPosition(existing, blocksFolder, createGlassFunc, true)
+	GlassPlacement.RefreshGlassFaces(position, blocksFolder)
+	return result
 end
 
 -- Called when a SOLID BLOCK is placed or removed near glass panes.

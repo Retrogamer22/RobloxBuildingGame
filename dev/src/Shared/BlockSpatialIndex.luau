@@ -12,6 +12,14 @@
 local BLOCK_SIZE = 3
 local TOLERANCE = 1.5  -- Half a block for snapping
 
+-- Skip per-block index updates once the server is tearing down. On the free-build
+-- terrain world (tens of thousands of blocks) the ChildRemoved cascade at shutdown
+-- would otherwise blow Studio's shutdown deadline. Nil-safe; always false on client.
+local BulkOperationFlags = nil
+pcall(function()
+	BulkOperationFlags = require(game:GetService("ReplicatedStorage"):WaitForChild("BulkOperationFlags", 5))
+end)
+
 local BlockSpatialIndex = {}
 BlockSpatialIndex.__index = BlockSpatialIndex
 
@@ -74,10 +82,12 @@ function BlockSpatialIndex.new(blocksFolder)
 	
 	-- Listen for changes
 	table.insert(self._connections, blocksFolder.ChildAdded:Connect(function(block)
+		if BulkOperationFlags and BulkOperationFlags.IsShuttingDown() then return end
 		self:_addBlock(block)
 	end))
 	
 	table.insert(self._connections, blocksFolder.ChildRemoved:Connect(function(block)
+		if BulkOperationFlags and BulkOperationFlags.IsShuttingDown() then return end
 		self:_removeBlock(block)
 	end))
 	

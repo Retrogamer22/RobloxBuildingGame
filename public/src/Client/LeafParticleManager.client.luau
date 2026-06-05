@@ -107,6 +107,18 @@ particleFolder.Name = "FallingLeaves"
 particleFolder.Parent = Workspace.Terrain
 
 -- Get leaf color - mostly from source, with slight seasonal tint
+-- Textured leaf blocks carry their colour on the face Texture/Decal objects, not
+-- the part .Color. Prefer a visible texture's Color3 so falling leaves match what's
+-- on screen; fall back to the part colour for untextured blocks.
+local function visibleLeafColor(part)
+	for _, d in ipairs(part:GetDescendants()) do
+		if d:IsA("Decal") and d.Transparency < 1 then  -- Texture is a subclass of Decal
+			return d.Color3
+		end
+	end
+	return part.Color
+end
+
 local function getSeasonalLeafColor(sourceColor)
 	local seasonColors = CONFIG.SEASON_LEAF_COLORS[currentSeason]
 	if not seasonColors or #seasonColors == 0 then
@@ -350,9 +362,10 @@ local function updateLeafCache()
 	
 	-- Search only within our plot's blocks folder
 	for _, block in ipairs(currentPlotBlocksFolder:GetChildren()) do
-		-- Check if it's a leaf block
+		-- Check if it's a leaf block (per-type: OakLeaves/BirchLeaves/SpruceLeaves,
+		-- plus legacy "Leaves" -- substring match catches them all)
 		local blockType = block:GetAttribute("BlockType")
-		if blockType == "Leaves" then
+		if blockType and blockType:find("Leaves") ~= nil then
 			totalLeaves = totalLeaves + 1
 			-- Check distance
 			local blockPos
@@ -390,13 +403,13 @@ local function spawnLeafParticles()
 			if leaf:IsA("BasePart") then
 				leafPos = leaf.Position
 				leafSize = leaf.Size
-				leafColor = leaf.Color
+				leafColor = visibleLeafColor(leaf)
 			elseif leaf:IsA("Model") then
 				local primary = leaf.PrimaryPart or leaf:FindFirstChildWhichIsA("BasePart")
 				if primary then
 					leafPos = primary.Position
 					leafSize = primary.Size
-					leafColor = primary.Color
+					leafColor = visibleLeafColor(primary)
 				end
 			end
 			
@@ -473,7 +486,8 @@ local function setCurrentPlot(blocksFolder, plotCenter, plotSize)
 		-- Count leaves in the plot
 		local leafCount = 0
 		for _, block in ipairs(blocksFolder:GetChildren()) do
-			if block:GetAttribute("BlockType") == "Leaves" then
+			local bt = block:GetAttribute("BlockType")
+			if bt and bt:find("Leaves") ~= nil then
 				leafCount = leafCount + 1
 			end
 		end

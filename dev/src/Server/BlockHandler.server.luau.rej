@@ -1,0 +1,26 @@
+diff a/dev/src/Server/BlockHandler.server.luau b/dev/src/Server/BlockHandler.server.luau	(rejected hunks)
+@@ -4092,8 +4189,22 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
+ 					local px = item:GetAttribute("ParentBlockX")
+ 					local py = item:GetAttribute("ParentBlockY")
+ 					local pz = item:GetAttribute("ParentBlockZ")
+-					if px and py and pz and (Vector3.new(px, py, pz) - blockPos).Magnitude < 1 then
+-						table.insert(itemsToDestroy, item)
++					if px and py and pz then
++						-- Grid-snap both sides before comparing (see note in the spatial-index
++						-- path above) so decorations on off-grid blocks still match.
++						local snappedParent = Vector3.new(
++							math.round(px / BLOCK_SIZE) * BLOCK_SIZE,
++							math.round(py / BLOCK_SIZE) * BLOCK_SIZE,
++							math.round(pz / BLOCK_SIZE) * BLOCK_SIZE
++						)
++						local snappedBlock = Vector3.new(
++							math.round(blockPos.X / BLOCK_SIZE) * BLOCK_SIZE,
++							math.round(blockPos.Y / BLOCK_SIZE) * BLOCK_SIZE,
++							math.round(blockPos.Z / BLOCK_SIZE) * BLOCK_SIZE
++						)
++						if (snappedParent - snappedBlock).Magnitude < 1 then
++							table.insert(itemsToDestroy, item)
++						end
+ 					end
+ 				elseif item:GetAttribute("IsTorch") or item:GetAttribute("IsLantern") or item:GetAttribute("IsSignStanding") or item:GetAttribute("IsWallSign") then
+ 					local hx = item:GetAttribute("HostBlockX")

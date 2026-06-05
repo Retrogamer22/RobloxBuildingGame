@@ -358,6 +358,8 @@ function BlockCollision.CanPlace(blockType: string, gridPos: Vector3, blocksFold
 			if existingBlock:GetAttribute("IsDecoration") then continue end
 			if existingBlock:GetAttribute("IsSurfaceBlock") then continue end
 			if existingBlock:GetAttribute("IsWater") then continue end -- Water is replaceable by blocks
+			if existingBlock:GetAttribute("IsLava") then continue end -- Lava is replaceable by blocks (placing destroys it)
+			if existingBlock:GetAttribute("IsFire") then continue end -- Fire is replaceable by blocks (placing snuffs it out)
 			if existingBlock:GetAttribute("IsBed") then continue end -- Beds don't block placement (low-profile, like decorations)
 			if existingBlock:GetAttribute("IsWallpaperFrame") then continue end -- Wallpaper is paper-thin, doesn't block placement
 			

@@ -7,12 +7,40 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+
+-- Onboarding milestone fire (one-shot per player per session; the analytics
+-- Worker dedupes across sessions via its UNIQUE index). Fully optional: silently
+-- no-ops if the AnalyticsEvents module is missing or HTTP is disabled.
+local _MilestoneAE, _milestoneTried = nil, false
+local _milestoneFired = {}
+local function fireMilestone(player, name)
+	if not player or not player.Parent then return end
+	local seen = _milestoneFired[player.UserId]
+	if not seen then seen = {}; _milestoneFired[player.UserId] = seen end
+	if seen[name] then return end
+	seen[name] = true
+	if not _MilestoneAE and not _milestoneTried then
+		_milestoneTried = true
+		local mods = ServerScriptService:FindFirstChild("Modules")
+		local sib = mods and mods:FindFirstChild("AnalyticsEvents")
+		if sib then local ok, m = pcall(require, sib); if ok then _MilestoneAE = m end end
+	end
+	if _MilestoneAE then
+		_MilestoneAE.Post("milestone", { userId = player.UserId, username = player.Name, milestone = name })
+	end
+end
+Players.PlayerRemoving:Connect(function(plr) _milestoneFired[plr.UserId] = nil end)
 
 local BlockPresetsModule = ReplicatedStorage:WaitForChild("BlockPresets", 10)
 local BlockPresets = BlockPresetsModule and require(BlockPresetsModule)
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("GridConfig", 10))
 local NetherConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("NetherConfig", 10))
 local BiomeConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("BiomeConfig", 10))
+-- Single source of truth for the free-build (second) place gate. On that place
+-- there are no bounded plots -- the player builds anywhere in the chunk world --
+-- so placement/break permission skips the footprint test (see canPlayerBuildAtPosition).
+local BetaConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("BetaConfig", 10))
 local StairPlacement = require(ReplicatedStorage:WaitForChild("StairPlacement", 10))
 local LogPlacement = require(ReplicatedStorage:WaitForChild("LogPlacement", 10))
 local SlabPlacement = require(ReplicatedStorage:WaitForChild("SlabPlacement", 10))
@@ -29,8 +57,33 @@ local WallpaperPlacement = require(ReplicatedStorage:WaitForChild("WallpaperPlac
 local CarpetPlacement = require(ReplicatedStorage:WaitForChild("CarpetPlacement", 10))
 local VinePlacement = require(ReplicatedStorage:WaitForChild("VinePlacement", 10))
 local ColumnPlacement = require(ReplicatedStorage:WaitForChild("ColumnPlacement", 10))
+local DebugTrace = require(ReplicatedStorage:WaitForChild("DebugTrace", 10))
+
+-- Resolve a glass-style block's template Model from its type + generic shape name.
+-- Standard glass lives in Decorations/Glass; glass-style reward sets (CandyLattice)
+-- live in their RewardSets folder. GlassPlacement.ResolveTemplate is the single
+-- source of truth for the folder + model name per type. Returns the template
+-- Instance or nil. Used by the in-place glass-rebuild closures below.
+local function resolveGlassTemplate(glassType, genericTemplateName)
+	local folderPath, modelName = GlassPlacement.ResolveTemplate(glassType, genericTemplateName)
+	local folder = ReplicatedStorage
+	for _, folderName in ipairs(string.split(folderPath, "/")) do
+		folder = folder and folder:FindFirstChild(folderName)
+	end
+	if not folder then
+		warn(string.format("[Glass] Folder not found: %s (type=%s)", tostring(folderPath), tostring(glassType)))
+		return nil
+	end
+	local template = folder:FindFirstChild(modelName)
+	if not template then
+		warn(string.format("[Glass] Template not found: %s in %s (type=%s)", tostring(modelName), tostring(folderPath), tostring(glassType)))
+		return nil
+	end
+	return template
+end
 local ArchitravePlacement = require(ReplicatedStorage:WaitForChild("ArchitravePlacement", 10))
 local BlockCollision = require(ReplicatedStorage:WaitForChild("BlockCollision", 10))
+local PaintCanVisual = require(ReplicatedStorage:WaitForChild("PaintCanVisual", 10)) -- Paint Mod
 local BlockTemplates = ReplicatedStorage:WaitForChild("BlockTemplates", 10)
 local BlocksFolder = ReplicatedStorage:WaitForChild("Blocks", 10)
 local DecorationsFolder = ReplicatedStorage:WaitForChild("Decorations", 10)
@@ -77,6 +130,21 @@ task.spawn(function()
 		end
 	else
 		warn("[BlockHandler] Modules folder NOT FOUND in ServerScriptService!")
+	end
+end)
+
+-- Load ChunkStreamManager (free-build streaming) so breaking/placing on streamed
+-- terrain can PIN that chunk (prevents its StreamTerrain folder unloading out from
+-- under a player edit). Only meaningful on the free-build place; nil elsewhere.
+local ChunkStreamManager = nil
+task.spawn(function()
+	local modulesFolder = ServerScriptService:WaitForChild("Modules", 10)
+	if modulesFolder then
+		local csmModule = modulesFolder:FindFirstChild("ChunkStreamManager")
+		if csmModule then
+			local ok, m = pcall(require, csmModule)
+			if ok then ChunkStreamManager = m end
+		end
 	end
 end)
 
@@ -145,6 +213,90 @@ end
 
 local BLOCK_SIZE = GridConfig.BLOCK_SIZE
 
+-- ===========================================================================
+-- [BB-BREAK-FX] Universal block-break particles
+-- When anything in the Blocks folder is broken, spawn a Minecraft-style
+-- cube-shard burst on nearby clients, coloured to match the broken thing.
+-- The server only extracts a representative colour/size/position and fires
+-- Remotes.BlockBreakFX; the animation lives in BlockBreakParticles.client.luau
+-- (mirrors the existing BurntShatterFX pattern). Called only from the
+-- player-initiated break paths, never bulk load/save, so it can't storm
+-- particles during world loads.
+-- ===========================================================================
+local BreakFX = Remotes:FindFirstChild("BlockBreakFX")
+if not BreakFX then
+	BreakFX = Instance.new("RemoteEvent")
+	BreakFX.Name = "BlockBreakFX"
+	BreakFX.Parent = Remotes
+	print("[BlockHandler] Created BlockBreakFX remote")
+end
+
+local BREAK_FX_RADIUS = 90 -- only players within this many studs get the burst
+
+-- A textured block (leaves, candy cane, etc.) shows its colour on its face
+-- Texture/Decal objects, not the part .Color. Prefer a visible texture's Color3
+-- so the break burst matches what's on screen; fall back to the part colour.
+local function visibleBlockColor(part)
+	for _, d in ipairs(part:GetDescendants()) do
+		if d:IsA("Decal") and d.Transparency < 1 then  -- Texture is a subclass of Decal
+			return d.Color3
+		end
+	end
+	return part.Color
+end
+
+local function fireBreakFX(thing)
+	if not thing then return end
+
+	local color, size, pos, material, materialVariant
+	if thing:IsA("BasePart") then
+		color, size, pos = visibleBlockColor(thing), thing.Size, thing.Position
+		material, materialVariant = thing.Material, thing.MaterialVariant
+	elseif thing:IsA("Model") then
+		-- Largest VISIBLE part = representative colour, so multi-part decorations
+		-- (flowers, chests, lamps...) burst in their dominant tone. Skip invisible
+		-- helper parts (Hitbox/ClimbSensor and anything fully transparent) so vines
+		-- and other decorations don't sample their clear sensor cubes and burst grey.
+		local best, bestVol
+		for _, d in ipairs(thing:GetDescendants()) do
+			if d:IsA("BasePart") and d.Name ~= "Hitbox" and d.Name ~= "ClimbSensor" and d.Transparency < 1 then
+				local v = d.Size.X * d.Size.Y * d.Size.Z
+				if not bestVol or v > bestVol then bestVol, best = v, d end
+			end
+		end
+		if not best then
+			for _, d in ipairs(thing:GetDescendants()) do
+				if d:IsA("BasePart") then
+					local v = d.Size.X * d.Size.Y * d.Size.Z
+					if not bestVol or v > bestVol then bestVol, best = v, d end
+				end
+			end
+		end
+		color = best and visibleBlockColor(best) or Color3.fromRGB(160, 160, 160)
+		material = best and best.Material or Enum.Material.SmoothPlastic
+		materialVariant = best and best.MaterialVariant or ""
+		local ok, _, bsize = pcall(function() return thing:GetBoundingBox() end)
+		size = (ok and bsize) or Vector3.new(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
+		pos = thing:GetPivot().Position
+	else
+		return
+	end
+
+	-- Optional per-block override: set a BreakFXColor (Color3) attribute to force
+	-- the burst colour (useful for textured blocks whose .Color reads off).
+	local override = thing:GetAttribute("BreakFXColor")
+	if typeof(override) == "Color3" then color = override end
+
+	local data = { pos = pos, size = size, color = color, material = material, materialVariant = materialVariant }
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if hrp and (hrp.Position - pos).Magnitude <= BREAK_FX_RADIUS then
+			BreakFX:FireClient(plr, data)
+		end
+	end
+end
+
 -- Wait for plot permission check (created by PlotPermissionHandler)
 local CheckPlotBuildPermission = nil
 task.spawn(function()
@@ -211,6 +363,24 @@ local function gridFmt(v)
 end
 
 local function getPlayerBuildArea(player)
+	-- FREE-BUILD PLACE: ONE shared world container, no per-player ownership. Every
+	-- player resolves to the same shared BuildArea (the chunk-(0,0) container that
+	-- holds Blocks + StreamTerrain). It has no OwnerUserId, so we match the shared
+	-- container by name instead -- prefer the one advertising ChunkCenterReady (the
+	-- real spawn container), falling back to any BuildArea model.
+	if BetaConfig.IsFreeBuildPlace() then
+		local fallback = nil
+		for _, child in ipairs(workspace:GetChildren()) do
+			if child:IsA("Model") and child.Name:match("^" .. GridConfig.BUILD_AREA_PREFIX .. "%d+$") then
+				if child:GetAttribute("ChunkCenterReady") ~= nil then
+					return child
+				end
+				fallback = fallback or child
+			end
+		end
+		return fallback
+	end
+
 	for i = 1, GridConfig.TOTAL_PLOTS do
 		local buildArea = workspace:FindFirstChild(GridConfig.BUILD_AREA_PREFIX .. i)
 		if buildArea and buildArea:GetAttribute("OwnerUserId") == player.UserId then
@@ -322,6 +492,37 @@ end
 
 -- Check if player can build at position (own plot OR shared plot OR private server)
 local function canPlayerBuildAtPosition(player, position)
+	-- FREE-BUILD PLACE: no bounded plots. The chunk world is one continuous space
+	-- and the player may build/break ANYWHERE in it, so we skip the per-plot
+	-- footprint test entirely and resolve to the player's center build area (the
+	-- chunk (0,0) model they own, where all their blocks are parented). We keep a
+	-- generous vertical sanity bound so stray clicks far above/below the world
+	-- (or a malformed position) still get rejected. Gated to the free-build place
+	-- only -- the main game keeps its strict plot boundaries untouched.
+	if BetaConfig.IsFreeBuildPlace() then
+		local buildArea = getPlayerBuildArea(player)
+		if not buildArea then
+			return false, nil -- player has no assigned chunk-world area yet
+		end
+
+		-- Vertical sanity check only (no X/Z footprint clamp). Anchor off the
+		-- center chunk's plate top so the allowed band matches normal plots:
+		-- down to max terrain depth, up to plot height above the surface.
+		local posY = buildArea:GetAttribute("BasePlatePositionY")
+		local sizeY = buildArea:GetAttribute("BasePlateSizeY")
+		local plateTop = buildArea:GetAttribute("BasePlateTop")
+			 or (posY and sizeY and (posY + sizeY / 2))
+		if plateTop then
+			local minY = plateTop - (GridConfig.TERRAIN.MAX_DEPTH * BLOCK_SIZE) - BLOCK_SIZE
+			local maxY = plateTop + GridConfig.PLOT_HEIGHT
+			if position.Y < minY or position.Y > maxY then
+				return false, nil
+			end
+		end
+
+		return true, buildArea
+	end
+
 	local buildArea, plotNumber = getBuildAreaAtPosition(position)
 	if not buildArea or plotNumber == nil then
 		print(string.format("[Permission] %s: position not in any plot", player.Name))
@@ -643,7 +844,7 @@ local function applyColorToBlock(block, color, material, materialVariant)
 	end
 end
 
-local function createBlockFromTemplate(templateName, blockId, useBlockModel, blockModelName, blockModelFolder, applyColor, defaultColor, customVariantChild, presetMaterial, presetMaterialVariant)
+local function createBlockFromTemplate(templateName, blockId, useBlockModel, blockModelName, blockModelFolder, applyColor, defaultColor, customVariantChild, presetMaterial, presetMaterialVariant, stripeColorMode)
 	local template
 	local actuallyUsedBlockModel = false
 	
@@ -711,6 +912,50 @@ local function createBlockFromTemplate(templateName, blockId, useBlockModel, blo
 	
 	local block = template:Clone()
 	block.Name = blockId or templateName
+	
+	-- TEXTURE mode (stripeColorMode == "Texture"): the block's grayscale Texture
+	-- children carry the stripe pattern; tinting them produces the colored variant.
+	-- Tint targets:
+	--   * Every Texture/Decal descendant (the stripes)
+	--   * Any Part named "Core" (the swirl on candy-cane log end caps)
+	-- Everything else (the white "Bark" part) keeps its template color so the
+	-- background between stripes stays white. Used by Candy Cane variants.
+	if stripeColorMode == "Texture" then
+		if block:IsA("BasePart") then
+			block.Anchored = true
+		elseif block:IsA("Model") then
+			for _, part in ipairs(block:GetDescendants()) do
+				if part:IsA("BasePart") then part.Anchored = true end
+			end
+		end
+		if applyColor and defaultColor then
+			-- Tint all Texture/Decal descendants (the stripes painted on the bark/faces).
+			for _, desc in ipairs(block:GetDescendants()) do
+				if desc:IsA("Texture") or desc:IsA("Decal") then
+					desc.Color3 = defaultColor
+				end
+			end
+			-- Tint Parts NAMED "Core" ΓÇö the swirl-pattern end-caps of a candy-cane log.
+			-- The body (Bark) intentionally stays its template color (white) so the
+			-- background between stripes remains white.
+			for _, desc in ipairs(block:GetDescendants()) do
+				if desc:IsA("BasePart") and desc.Name == "Core" then
+					desc.Color = defaultColor
+				end
+			end
+			-- Top-level Texture/Decal children on a Part template (CandyCaneFull is a
+			-- Union with Texture children directly).
+			if block:IsA("BasePart") then
+				for _, child in ipairs(block:GetChildren()) do
+					if child:IsA("Texture") or child:IsA("Decal") then
+						child.Color3 = defaultColor
+					end
+				end
+			end
+		end
+		print("[Server] Created block: " .. tostring(blockId or templateName) .. " | UsedBlockModel: " .. tostring(actuallyUsedBlockModel) .. " | ApplyColor: " .. tostring(applyColor) .. " (Texture mode)")
+		return block, actuallyUsedBlockModel
+	end
 	
 	if block:IsA("BasePart") then
 		block.Anchored = true
@@ -824,15 +1069,34 @@ local function createBlockFromTemplate(templateName, blockId, useBlockModel, blo
 	return block, actuallyUsedBlockModel
 end
 
-local function createDecorationFromTemplate(decorationName)
-	if not DecorationsFolder then
+local function createDecorationFromTemplate(decorationName, customFolder)
+	-- customFolder (optional): nested path like "RewardSets/CandyBlocks" that
+	-- overrides the default Decorations folder. Used by reward-set decorations
+	-- (e.g. CandyCaneSapling) which live alongside their themed pack rather
+	-- than in the global Decorations folder.
+	local sourceFolder = DecorationsFolder
+	if customFolder then
+		local folder = ReplicatedStorage
+		for _, folderName in ipairs(string.split(customFolder, "/")) do
+			folder = folder:FindFirstChild(folderName)
+			if not folder then break end
+		end
+		if folder then
+			sourceFolder = folder
+		else
+			warn("[Server] Decoration custom folder not found: " .. tostring(customFolder))
+		end
+	end
+	
+	if not sourceFolder then
 		warn("[Server] Decorations folder not found!")
 		return nil
 	end
 	
-	local template = DecorationsFolder:FindFirstChild(decorationName)
+	local template = sourceFolder:FindFirstChild(decorationName)
 	if not template then
-		warn("[Server] Decoration template not found: " .. tostring(decorationName))
+		warn("[Server] Decoration template not found: " .. tostring(decorationName)
+			.. " (folder: " .. (customFolder or "Decorations") .. ")")
 		return nil
 	end
 	
@@ -1141,27 +1405,46 @@ end
 if PlaceBlock then
 PlaceBlock.OnServerEvent:Connect(function(player, data)
 	if type(data) ~= "table" then return end
-	if not data.BlockType or not data.Position then return end
+	if not data.BlockType or not data.Position then
+		DebugTrace.reject(player, "entry", "data missing BlockType or Position")
+		return
+	end
+	DebugTrace.begin(player, "PLACE", { type = data.BlockType, pos = data.Position, rot = data.Rotation })
 	print(string.format("[BB-NET] SERVER <- PlaceBlock from=%s type=%s pos=(%.1f,%.1f,%.1f)", player.Name, tostring(data.BlockType), data.Position.X, data.Position.Y, data.Position.Z))
 	
-	if not BlockPresets then return end
+	if not BlockPresets then
+		DebugTrace.reject(player, "presets", "BlockPresets module not loaded")
+		return
+	end
 	
 	local preset = BlockPresets.GetPreset(data.BlockType)
-	if not preset then return end
+	if not preset then
+		DebugTrace.reject(player, "preset-lookup", "No preset registered for this BlockType", { type = data.BlockType })
+		return
+	end
 	
 	local shapeData = BlockPresets.GetShape(preset.Shape)
-	if not shapeData then return end
+	if not shapeData then
+		DebugTrace.reject(player, "shape-lookup", "No shape data for preset.Shape", { shape = preset.Shape })
+		return
+	end
+	DebugTrace.step(player, "preset", "resolved preset+shape", { id = preset.Id, shape = preset.Shape })
 	
 	local position = data.Position
-	if typeof(position) ~= "Vector3" then return end
+	if typeof(position) ~= "Vector3" then
+		DebugTrace.reject(player, "position", "Position is not a Vector3", { got = typeof(position) })
+		return
+	end
 	
 	-- Check if player can build at this position (own plot OR shared access)
 	local canBuild, buildArea = canPlayerBuildAtPosition(player, position)
 	if not canBuild or not buildArea then
+		DebugTrace.reject(player, "permission", "Cannot build here (not your plot / no shared access / outside any plot)", { pos = position })
 		-- Notify client to undo any prediction it made
 		BuildRejected:FireClient(player, "place", position)
 		return
 	end
+	DebugTrace.step(player, "permission", "build permission OK", { plot = buildArea.Name })
 	
 	local blocksFolder = buildArea:FindFirstChild("Blocks")
 	if not blocksFolder then
@@ -1175,7 +1458,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		local decoName = data.DecorationData.DecorationName
 		local decoOffset = data.DecorationData.Offset or Vector3.new(0, 0, 0)
 		
-		local decoration = createDecorationFromTemplate(decoName)
+		local decoration = createDecorationFromTemplate(decoName, preset.BlockModelFolder)
 		if not decoration then return end
 		
 		-- Calculate final position with offset
@@ -1209,6 +1492,13 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			end
 		end
 		
+		-- Decorations that stack vertically on themselves (e.g. sugar cane). A same-type
+		-- decoration directly below counts as a valid base. There is intentionally NO
+		-- manual-placement height cap: players can hand-stack as tall as they like; the
+		-- 9-block cap in SugarCaneHandler only limits NATURAL growth.
+		local STACKABLE_DECORATIONS = { ["SugarCane"] = true }
+		local isStackable = STACKABLE_DECORATIONS[preset.Id]
+
 		-- Check placement restrictions (grass/flowers only on dirt/grass, sugar cane on dirt/grass/sand, etc.)
 		-- Skip restrictions when placing inside a snow layer (snow acts as valid ground)
 		if not insideSnowLayer then
@@ -1217,7 +1507,10 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 				-- Find the block below to check its type (O(1) spatial lookup)
 				local spatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
 				local blockBelow = spatialIndex:GetBlockAt(parentBlockPos)
-				
+				-- For stackable decorations, a same-type decoration directly below is also
+				-- a valid base (GetBlockAt skips decorations, so check separately).
+				local decoBelow = isStackable and spatialIndex:GetDecorationAt(parentBlockPos) or nil
+
 				if blockBelow then
 					local blockTypeBelow = blockBelow:GetAttribute("BlockType")
 					if blockTypeBelow and not BlockPresets.CanPlaceDecorationOn(preset.Id, blockTypeBelow) then
@@ -1226,6 +1519,8 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 						decoration:Destroy()
 						return
 					end
+				elseif decoBelow and decoBelow:GetAttribute("BlockType") == preset.Id then
+					-- Stacking on top of a same-type decoration: allowed, no height limit.
 				else
 					-- No block below at all - decoration needs a valid block beneath it
 					print(string.format("[Decoration] BLOCKED - %s requires a block beneath it (one of: %s)",
@@ -1263,7 +1558,8 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			end
 		end
 		
-		-- Cactus skips the 45-degree rotation (stacks vertically)
+		-- Cactus skips the 45-degree rotation (stacks vertically). Sugar cane keeps the
+		-- 45-degree turn (every segment gets the same rotation, so columns still align).
 		local noRotationDecorations = {
 			["Cactus"] = true,
 		}
@@ -1397,11 +1693,18 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	local isColumn = ColumnPlacement.IsColumn(data.BlockType)
 	local isArchitrave = BlockPresets.IsArchitrave and BlockPresets.IsArchitrave(data.BlockType)
 	local isChest = BlockPresets.IsChest and BlockPresets.IsChest(data.BlockType)
+	local isPaintCan = BlockPresets.IsPaintCan and BlockPresets.IsPaintCan(data.BlockType)
 	local isBed = BlockPresets.IsBed and BlockPresets.IsBed(data.BlockType)
 	local isCraftingTable = BlockPresets.IsCraftingTable and BlockPresets.IsCraftingTable(data.BlockType)
 	local isFurnace = BlockPresets.IsFurnace and BlockPresets.IsFurnace(data.BlockType)
+	local isPaintMixer = (data.BlockType == "PaintMixer")
 	local isTextBlock = BlockPresets.IsTextBlock and BlockPresets.IsTextBlock(data.BlockType)
 	local isArch = StairPlacement.IsArchType(data.BlockType)
+	DebugTrace.step(player, "classify", "resolved block class", {
+		stair = isStair, slab = isSlab, door = isDoor, surface = isSurfaceBlock,
+		wallpaperFrame = isWallpaperFrame, fence = isFence, glass = isGlass,
+		carpet = isCarpet, vine = isVine, column = isColumn, frameBlock = (preset and preset.IsFrameBlock) or false,
+	})
 	local upsideDown = false
 	local direction = nil
 	local logAxis = "Y" -- Default to vertical for logs/pistons
@@ -1675,9 +1978,14 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	end
 	
 	-- Process vine-specific data
+	local vineIsHalf = false
 	if isVine and data.VineData then
 		vineFace = data.VineData.Face or "North"
 		vineRotation = data.VineData.Rotation or 0
+		-- Auto-select the half-height variant when the host face is only filled in its
+		-- bottom half (a bottom slab, or the open front of a stair) — there is no top
+		-- half of the host for the vine to grab onto.
+		vineIsHalf = VinePlacement.ResolveVineType(position, vineFace, blocksFolder) == "VineHalf"
 	end
 	
 	-- Check if this is a torch
@@ -1851,6 +2159,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 				data.BlockType, position.X, position.Y, position.Z, collisionReason or "overlap"))
 		end
 		-- Always log the reason (even without DEBUG_COLLISION) so players can see WHY a placement failed.
+		DebugTrace.reject(player, "collision", collisionReason or "overlap", { type = data.BlockType, pos = position, slabOrient = slabOrientation })
 		print(string.format("[BB-NET] BLOCKED place of %s at (%.1f, %.1f, %.1f): %s",
 			data.BlockType, position.X, position.Y, position.Z, collisionReason or "overlap"))
 		-- Also print what's at that cell so we can diagnose unexpected collisions (e.g., stale bed registrations)
@@ -1863,6 +2172,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 				local bx = b:GetAttribute("BlockPosX") or -9999
 				local by = b:GetAttribute("BlockPosY") or -9999
 				local bz = b:GetAttribute("BlockPosZ") or -9999
+				DebugTrace.step(player, "collision.cell", "cell occupied", { by = bType, bed = (b:GetAttribute("IsBed") and true or false), at = Vector3.new(bx, by, bz) })
 				print(string.format("[BB-NET]   Cell occupied by %s%s (primary=(%.1f,%.1f,%.1f))", bType, isBed, bx, by, bz))
 			end
 		end
@@ -1875,14 +2185,24 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			data.BlockType, position.X, position.Y, position.Z))
 	end
 	
-	-- Remove any water blocks at the placement position (water is displaced by solid blocks)
+	-- Remove any water or fire blocks at the placement position. Water is
+	-- displaced by the new block; fire is snuffed out (placing into a burning
+	-- cell is the player's way of putting it out). Both are flagged passable in
+	-- BlockCollision, so the cell already "looked" empty -- we just have to
+	-- physically remove the leftover instance here so it doesn't keep ticking.
 	local placeSpatialIndex = BlockSpatialIndex.GetOrCreate(blocksFolder)
 	if placeSpatialIndex then
 		local waterBlocksToRemove = {}
+		local lavaBlocksToRemove = {}
+		local fireBlocksToRemove = {}
 		local blocksAtPlacePos = placeSpatialIndex:GetBlocksAt(position)
 		for _, existingBlock in ipairs(blocksAtPlacePos) do
 			if existingBlock:GetAttribute("IsWater") then
 				table.insert(waterBlocksToRemove, existingBlock)
+			elseif existingBlock:GetAttribute("IsLava") then
+				table.insert(lavaBlocksToRemove, existingBlock)
+			elseif existingBlock:GetAttribute("IsFire") then
+				table.insert(fireBlocksToRemove, existingBlock)
 			end
 		end
 		-- Also check upper cell for doors (they occupy 2 cells)
@@ -1892,8 +2212,18 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			for _, existingBlock in ipairs(blocksAtUpperPos) do
 				if existingBlock:GetAttribute("IsWater") then
 					table.insert(waterBlocksToRemove, existingBlock)
+				elseif existingBlock:GetAttribute("IsLava") then
+					table.insert(lavaBlocksToRemove, existingBlock)
+				elseif existingBlock:GetAttribute("IsFire") then
+					table.insert(fireBlocksToRemove, existingBlock)
 				end
 			end
+		end
+		if #fireBlocksToRemove > 0 then
+			for _, fireBlock in ipairs(fireBlocksToRemove) do
+				fireBlock:Destroy()
+			end
+			print(string.format("[BB-FIRE] Snuffed %d fire(s) at placement position", #fireBlocksToRemove))
 		end
 		if #waterBlocksToRemove > 0 then
 			for _, waterBlock in ipairs(waterBlocksToRemove) do
@@ -1904,6 +2234,18 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			task.defer(function()
 				if _G.WaterHandler then
 					_G.WaterHandler.OnBlockChanged(position, buildArea)
+				end
+			end)
+		end
+		if #lavaBlocksToRemove > 0 then
+			for _, lavaBlock in ipairs(lavaBlocksToRemove) do
+				lavaBlock:Destroy()
+			end
+			print(string.format("[BlockHandler] Removed %d lava block(s) at placement position", #lavaBlocksToRemove))
+			-- Trigger lava flow recalculation (mirror of water above)
+			task.defer(function()
+				if _G.LavaHandler then
+					_G.LavaHandler.OnBlockChanged(position, buildArea)
 				end
 			end)
 		end
@@ -1943,6 +2285,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		end
 		
 		if not supportFound then
+			DebugTrace.reject(player, "snow.support", "No support block below snow layer", { pos = position })
 			print(string.format("[SnowLayer] BLOCKED - no support below (%.1f, %.1f, %.1f)", position.X, position.Y, position.Z))
 			BuildRejected:FireClient(player, "place", position)
 			return
@@ -1966,6 +2309,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		end
 		
 		if not supportFound then
+			DebugTrace.reject(player, "carpet.support", "No valid support below carpet (needs block/stair/fence)", { pos = position })
 			print(string.format("[Carpet] BLOCKED - no valid support below (%.1f, %.1f, %.1f)", position.X, position.Y, position.Z))
 			BuildRejected:FireClient(player, "place", position)
 			return
@@ -1979,11 +2323,21 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	local useBlockModelFolder = (not isFence and not isGlass and not isArchitrave) and preset.BlockModelFolder or nil
 	local useBlockModelName = (not isFence and not isGlass and not isArchitrave) and preset.BlockModelName or nil
 	local useBlockId = (not isFence and not isGlass and not isArchitrave) and preset.Id or nil
+
+	-- Vine placed on a bottom-half-only host: clone the VineHalf model instead of Vine.
+	if isVine and vineIsHalf then
+		useBlockModelFolder = "Decorations"
+		useBlockModelName = "VineHalf"
+	end
 	
-	-- For glass, look in Decorations/Glass folder
+	-- For glass, resolve the model folder + name from the glass-type registry.
+	-- Standard glass -> Decorations/Glass; CandyLattice -> RewardSets/CandyBlocks; etc.
+	-- templateName here is the generic shape name (Glass_0 / Glass_Corner / ...);
+	-- ResolveTemplate translates it to the real model name for this block's type.
 	if isGlass then
-		useBlockModelFolder = "Decorations/Glass"
-		useBlockModelName = templateName -- e.g. "Glass_2" or "Glass_3"
+		local glassFolderPath, glassModelName = GlassPlacement.ResolveTemplate(data.BlockType, templateName)
+		useBlockModelFolder = glassFolderPath
+		useBlockModelName = glassModelName
 	end
 	
 	-- For torches, look in Decorations folder and use the correct model (TorchStraight or TorchAngled)
@@ -2093,9 +2447,14 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		preset.DefaultColor,
 		preset.CustomVariantChild, -- For custom Union stair/slab models
 		preset.Material,
-		preset.MaterialVariant
+		preset.MaterialVariant,
+		preset.StripeColorMode  -- "Texture" tints Texture descendants instead of the Part
 	)
-	if not block then return end
+	if not block then
+		DebugTrace.reject(player, "template", "createBlockFromTemplate returned nil (template missing/failed)", { id = preset.Id })
+		return
+	end
+	DebugTrace.step(player, "template", "block instance created", { name = block.Name })
 	
 	-- For fences and glass, set the name to the block type (since we passed nil for blockId)
 	if isFence then
@@ -2153,8 +2512,10 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		-- Use ladder-specific CFrame with face-based rotation
 		cframe = LadderPlacement.GetLadderCFrame(position, ladderFace)
 	elseif isVine then
-		-- Use vine-specific CFrame with face-based rotation
-		cframe = VinePlacement.GetVineCFrame(position, vineFace)
+		-- Use vine-specific CFrame with face-based rotation (lowered into the bottom
+		-- half of the cell for the half variant).
+		cframe = vineIsHalf and VinePlacement.GetVineHalfCFrame(position, vineFace)
+			or VinePlacement.GetVineCFrame(position, vineFace)
 	elseif isTorch then
 		-- Use torch-specific CFrame with face-based rotation
 		cframe = TorchPlacement.GetTorchCFrame(position, torchFace)
@@ -2274,8 +2635,8 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		else
 			cframe = CFrame.new(position) * CFrame.Angles(0, math.rad(rotation), 0)
 		end
-	elseif isFurnace then
-		-- Furnaces face toward the player (snap to nearest 90°), no Y offset.
+	elseif isFurnace or isPaintMixer then
+		-- Furnaces / the paint mixer face toward the player (snap to nearest 90°), no Y offset.
 		-- Same pattern as crafting tables / chests / beds.
 		local character = player.Character
 		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
@@ -2324,8 +2685,12 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		))
 	end
 	
-	-- Apply color/material for template blocks, or block models with ApplyColor set
-	if not usedBlockModel or preset.ApplyColor then
+	-- Apply color/material for template blocks, or block models with ApplyColor set.
+	-- BUT skip this entirely for Texture-mode blocks (candy canes etc.): their
+	-- coloring was already done correctly inside createBlockFromTemplate, which
+	-- tints only Texture descendants + the Core part ΓÇö NOT the white Bark.
+	-- applyColorToBlock would naively tint every part, undoing that work.
+	if (not usedBlockModel or preset.ApplyColor) and preset.StripeColorMode ~= "Texture" then
 		local material = preset.Material
 		if data.MaterialName and type(data.MaterialName) == "string" then
 			local success, result = pcall(function()
@@ -2577,6 +2942,33 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			footPosition.X, footPosition.Y, footPosition.Z, finalRotation or 0))
 	end
 	
+	if isPaintCan then
+		-- Paint Mod: stamp the can so it survives save/load and the brush can identify it.
+		-- Color lives on the PaintColor union only (body keeps its modeled look).
+		block:SetAttribute("IsPaintCan", true)
+		block:SetAttribute("BlockPosX", position.X)
+		block:SetAttribute("BlockPosY", position.Y)
+		block:SetAttribute("BlockPosZ", position.Z)
+		block:SetAttribute("Rotation", finalRotation)
+		if preset.IsEmptyCan then
+			block:SetAttribute("IsEmptyCan", true)
+			PaintCanVisual.ApplyCan(block, nil, true)
+		else
+			-- Mixer (and any custom-colored) cans carry an explicit slot Color; palette cans
+			-- fall back to their preset default.
+			local canColor = (typeof(data.Color) == "Color3") and data.Color or preset.DefaultColor
+			-- Persist the exact shade; the save-manager can-load hook restores it from cr/cg/cb.
+			block:SetAttribute("CustomColorR", math.round(canColor.R * 255))
+			block:SetAttribute("CustomColorG", math.round(canColor.G * 255))
+			block:SetAttribute("CustomColorB", math.round(canColor.B * 255))
+			-- Type + mode so right-clicking the can loads the brush correctly. Defaults are
+			-- regular + blend, so only stamp the non-default cases (false/blend are implied).
+			if preset.IsPrimerCan then block:SetAttribute("PaintIsPrimer", true) end
+			if preset.PaintMode == "match" then block:SetAttribute("PaintMode", "match") end
+			PaintCanVisual.ApplyCan(block, canColor, false)
+		end
+	end
+
 	if isChest then
 		block:SetAttribute("IsChest", true)
 		block:SetAttribute("IsOpen", false)
@@ -2831,6 +3223,10 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		block:SetAttribute("BlockPosX", position.X)
 		block:SetAttribute("BlockPosY", position.Y)
 		block:SetAttribute("BlockPosZ", position.Z)
+		if vineIsHalf then
+			block:SetAttribute("BlockType", "VineHalf")
+			block:SetAttribute("IsVineHalf", true)
+		end
 		-- Make vine non-collidable
 		if block:IsA("BasePart") then
 			block.CanCollide = false
@@ -3219,10 +3615,11 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			local hitbox = block:FindFirstChild("Hitbox")
 			if hitbox then
 				local VINE_HITBOX_THICKNESS = 1.0 -- Thin but still easy to click
+				local vineHeight = vineIsHalf and (BLOCK_SIZE / 2) or BLOCK_SIZE
 				if vineFace == "North" or vineFace == "South" then
-					hitbox.Size = Vector3.new(BLOCK_SIZE, BLOCK_SIZE, VINE_HITBOX_THICKNESS)
+					hitbox.Size = Vector3.new(BLOCK_SIZE, vineHeight, VINE_HITBOX_THICKNESS)
 				elseif vineFace == "East" or vineFace == "West" then
-					hitbox.Size = Vector3.new(VINE_HITBOX_THICKNESS, BLOCK_SIZE, BLOCK_SIZE)
+					hitbox.Size = Vector3.new(VINE_HITBOX_THICKNESS, vineHeight, BLOCK_SIZE)
 				end
 				-- Position flush against the wall the vine is on
 				if cframe then
@@ -3240,7 +3637,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 			climbSensor.CanTouch = true
 			climbSensor.CastShadow = false
 			climbSensor.Transparency = 1
-			climbSensor.Size = Vector3.new(BLOCK_SIZE, BLOCK_SIZE, 1.0)
+			climbSensor.Size = Vector3.new(BLOCK_SIZE, vineIsHalf and (BLOCK_SIZE / 2) or BLOCK_SIZE, 1.0)
 			climbSensor.CFrame = cframe
 			climbSensor:AddTag("VineClimbSensor")
 			climbSensor.Parent = block
@@ -3250,40 +3647,37 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	-- Increment lifetime blocks placed counter (for beta tester qualification)
 	local lifetimeBlocks = buildArea:GetAttribute("LifetimeBlocksPlaced") or 0
 	buildArea:SetAttribute("LifetimeBlocksPlaced", lifetimeBlocks + 1)
+	DebugTrace.allow(player, "committed", { id = preset.Id, lifetime = lifetimeBlocks + 1 })
+	fireMilestone(player, "first_block")
 	
 	-- Apply random color variation to leaves for a more natural look
-	-- Also apply biome and season tinting
-	local isLeaves = preset.Id == "Leaves"
+	-- Also apply biome and season tinting (leaf type from the placed block id)
+	local isLeaves = string.find(preset.Id, "Leaves") ~= nil
 	if isLeaves then
+		local leafType = (string.find(preset.Id, "Birch") and "Birch")
+			or (string.find(preset.Id, "Spruce") and "Spruce") or "Oak"
 		-- Get biome and season from build area for proper tinting
 		local currentBiome = buildArea:GetAttribute("CurrentBiome")
 		local currentSeason = buildArea:GetAttribute("CurrentSeason") or "Summer"
 		local leafColor
 		
 		if currentBiome then
-			-- Use biome-tinted color with season (defaults to Oak leaf type for player-placed)
-			leafColor = BiomeConfig.GetRandomizedTintedLeafColor("Oak", currentBiome, currentSeason)
+			leafColor = BiomeConfig.GetRandomizedTintedLeafColor(leafType, currentBiome, currentSeason)
 		else
-			-- No biome, use default Oak color with season
-			leafColor = BiomeConfig.GetRandomizedTintedLeafColor("Oak", "Plains", currentSeason)
+			leafColor = BiomeConfig.GetRandomizedTintedLeafColor(leafType, "Plains", currentSeason)
 		end
 		
 		if leafColor then
-			if block:IsA("BasePart") then
-				block.Color = leafColor
-			elseif block:IsA("Model") then
-				for _, part in ipairs(block:GetDescendants()) do
-					if part:IsA("BasePart") then
-						part.Color = leafColor
-					end
-				end
-			end
+			-- Tint the leaf faces only; the "Branches" parts keep their own greyscale-
+			-- texture tint (Shears strip the leaves to reveal them).
+			BiomeConfig.TintLeaves(block, leafColor)
 			
-			-- Store biome and season for save/load
+			-- Store biome/season/type for save/load
 			if currentBiome then
 				block:SetAttribute("Biome", currentBiome)
 			end
 			block:SetAttribute("Season", currentSeason)
+			block:SetAttribute("TreeType", leafType)
 		end
 	end
 	
@@ -3523,9 +3917,7 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 		
 		-- Also update adjacent glass panes (they may need to become / un-become L-corners)
 		local function createGlassBlockForSolid(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then return nil end
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then return nil end
 
 			local newGlass = template:Clone()
@@ -3739,16 +4131,9 @@ PlaceBlock.OnServerEvent:Connect(function(player, data)
 	if isGlass then
 		-- Create a function to create glass blocks for the update
 		local function createGlassBlock(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			-- Look for template in Decorations/Glass folder
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then
-				warn("[Glass] Glass folder not found in Decorations!")
-				return nil
-			end
-			
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			-- Resolve template from the glass-type registry (Decorations/Glass, RewardSets, etc.)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then
-				warn("[Glass] Template not found: " .. tostring(glassTemplateName))
 				return nil
 			end
 			
@@ -3954,7 +4339,25 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 	local blocksFolder = buildArea:FindFirstChild("Blocks")
 	if not blocksFolder then return end
 	
-	if block.Parent ~= blocksFolder then return end
+	-- Normally a breakable block must be a direct child of Blocks. On the free-build
+	-- place, streamed terrain instead lives in buildArea.StreamTerrain.Chunk_<key>
+	-- (per-chunk folders, so they can unload as one isolated Destroy). Accept those
+	-- too, and PIN their chunk so the streaming manager won't unload that folder out
+	-- from under the edit the player is making. Main game is unaffected (its terrain
+	-- is always in Blocks, so the original direct-child rule still holds there).
+	local parentOk = (block.Parent == blocksFolder)
+	if not parentOk and BetaConfig.IsFreeBuildPlace() then
+		local streamFolder = buildArea:FindFirstChild("StreamTerrain")
+		if streamFolder and block.Parent and block.Parent.Parent == streamFolder then
+			parentOk = true
+			if ChunkStreamManager and ChunkStreamManager.MarkModified and blockPos then
+				pcall(function()
+					ChunkStreamManager.MarkModified(buildArea, blockPos.X, blockPos.Z)
+				end)
+			end
+		end
+	end
+	if not parentOk then return end
 	
 	-- FIRE: extinguished by a single break. It's a standalone block sitting on
 	-- top of another - no attached items, not terrain, no lazy-load needed. Just
@@ -4124,7 +4527,18 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 							local py = item:GetAttribute("ParentBlockY")
 							local pz = item:GetAttribute("ParentBlockZ")
 							if px and py and pz then
-								if (Vector3.new(px, py, pz) - hostCell).Magnitude < 1 then
+								-- Snap the stored ParentBlock to the grid the SAME way hostCell
+								-- is snapped before comparing. ParentBlockX/Y/Z were stored as
+								-- math.round(worldPos) at placement, which on an off-grid plot
+								-- doesn't equal the multiple-of-BLOCK_SIZE hostCell. Snapping both
+								-- sides puts them in the same space so saplings/decorations on
+								-- off-grid blocks (e.g. candy cane saplings) still get cleaned up.
+								local snappedParent = Vector3.new(
+									math.round(px / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(py / BLOCK_SIZE) * BLOCK_SIZE,
+									math.round(pz / BLOCK_SIZE) * BLOCK_SIZE
+								)
+								if (snappedParent - hostCell).Magnitude < 1 then
 									seenItems[item] = true
 									table.insert(itemsToDestroy, item)
 								end
@@ -4211,8 +4625,22 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 					local px = item:GetAttribute("ParentBlockX")
 					local py = item:GetAttribute("ParentBlockY")
 					local pz = item:GetAttribute("ParentBlockZ")
-					if px and py and pz and (Vector3.new(px, py, pz) - blockPos).Magnitude < 1 then
-						table.insert(itemsToDestroy, item)
+					if px and py and pz then
+						-- Grid-snap both sides before comparing (see note in the spatial-index
+						-- path above) so decorations on off-grid blocks still match.
+						local snappedParent = Vector3.new(
+							math.round(px / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(py / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(pz / BLOCK_SIZE) * BLOCK_SIZE
+						)
+						local snappedBlock = Vector3.new(
+							math.round(blockPos.X / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(blockPos.Y / BLOCK_SIZE) * BLOCK_SIZE,
+							math.round(blockPos.Z / BLOCK_SIZE) * BLOCK_SIZE
+						)
+						if (snappedParent - snappedBlock).Magnitude < 1 then
+							table.insert(itemsToDestroy, item)
+						end
 					end
 				elseif item:GetAttribute("IsTorch") or item:GetAttribute("IsLantern") or item:GetAttribute("IsSignStanding") or item:GetAttribute("IsWallSign") or item:GetAttribute("IsFire") then
 					local hx = item:GetAttribute("HostBlockX")
@@ -4236,6 +4664,7 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 		end
 		
 		for _, item in ipairs(itemsToDestroy) do
+			fireBreakFX(item)
 			item:Destroy()
 		end
 	end
@@ -4512,8 +4941,33 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 	local wasVine = block:GetAttribute("IsVine")
 	local cascadeVineFace = wasVine and block:GetAttribute("VineFace") or nil
 	
+	-- Sugar cane: collect any sugar cane stacked ABOVE this one BEFORE destroying, so
+	-- breaking a cane mid-column drops everything above it (it loses its support).
+	-- Collected up-front while the spatial index is still accurate; destroyed below.
+	local sugarCaneAbove = {}
+	do
+		local bt = block:GetAttribute("BlockType")
+		if (bt == "SugarCane" or bt == "SugarCaneTrimmed") and blockPos then
+			local idx = BlockSpatialIndex.GetOrCreate(blocksFolder)
+			if idx then
+				local p = blockPos + Vector3.new(0, BLOCK_SIZE, 0)
+				for _ = 1, 12 do
+					local d = idx:GetDecorationAt(p)
+					local dt = d and d:GetAttribute("BlockType")
+					if d and (dt == "SugarCane" or dt == "SugarCaneTrimmed") then
+						table.insert(sugarCaneAbove, d)
+						p = p + Vector3.new(0, BLOCK_SIZE, 0)
+					else
+						break
+					end
+				end
+			end
+		end
+	end
+	
 	-- Destroy the block
 	print(string.format("[BB-NET] SERVER => RemoveBlock SUCCESS type=%s pos=(%.1f,%.1f,%.1f) player=%s", tostring(blockType), blockPos.X, blockPos.Y, blockPos.Z, player.Name))
+	fireBreakFX(block)
 	block:Destroy()
 
 	-- If the broken block was part of a portal frame (obsidian) or a portal block
@@ -4550,6 +5004,7 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 			
 			-- Free-hanging: destroy and continue down the chain
 			if vineBelow.instance and vineBelow.instance.Parent then
+				fireBreakFX(vineBelow.instance)
 				vineBelow.instance:Destroy()
 				breakCount = breakCount + 1
 			end
@@ -4560,6 +5015,15 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 			print(string.format("[Vine] Cascade-broke %d free-hanging vine(s) below (%.1f,%.1f,%.1f) face=%s",
 				breakCount, blockPos.X, blockPos.Y, blockPos.Z, cascadeVineFace))
 		end
+	end
+	
+	-- Cascade-break sugar cane stacked above the broken cane (it lost its support).
+	if #sugarCaneAbove > 0 then
+		for _, d in ipairs(sugarCaneAbove) do
+			if d and d.Parent then fireBreakFX(d); d:Destroy() end
+		end
+		print(string.format("[SugarCane] Cascade-broke %d cane(s) above (%.1f,%.1f,%.1f)",
+			#sugarCaneAbove, blockPos.X, blockPos.Y, blockPos.Z))
 	end
 	
 	-- If solid block was broken, update adjacent fences
@@ -4624,9 +5088,7 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 
 		-- Also update adjacent glass panes (corner anchors may have been removed)
 		local function createGlassBlockForSolid(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then return nil end
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then return nil end
 
 			local newGlass = template:Clone()
@@ -4739,16 +5201,9 @@ RemoveBlock.OnServerEvent:Connect(function(player, block, hitPosition)
 	-- If glass was broken, update adjacent glass
 	if isGlass and blockPos then
 		local function createGlassBlock(glassTemplateName, glassType, glassPos, glassRotationCF, placedBy, connectionType, primaryDir, secondaryDir, orientation)
-			-- Look for template in Decorations/Glass folder
-			local glassFolder = DecorationsFolder and DecorationsFolder:FindFirstChild("Glass")
-			if not glassFolder then
-				warn("[Glass] Glass folder not found in Decorations!")
-				return nil
-			end
-			
-			local template = glassFolder:FindFirstChild(glassTemplateName)
+			-- Resolve template from the glass-type registry (Decorations/Glass, RewardSets, etc.)
+			local template = resolveGlassTemplate(glassType, glassTemplateName)
 			if not template then
-				warn("[Glass] Template not found: " .. tostring(glassTemplateName))
 				return nil
 			end
 			
@@ -4918,6 +5373,7 @@ RemoveBlockAtPosition.OnServerEvent:Connect(function(player, position)
 	-- Destroy the real block if it exists
 	if foundBlock then
 		print(string.format("[BB-NET] SERVER => RemoveBlockAtPosition SUCCESS found+destroyed real block at (%.1f,%.1f,%.1f) player=%s", gridPos.X, gridPos.Y, gridPos.Z, player.Name))
+		fireBreakFX(foundBlock)
 		foundBlock:Destroy()
 	else
 		print(string.format("[BB-NET] SERVER => RemoveBlockAtPosition OK no real block at (%.1f,%.1f,%.1f) (prediction only) player=%s", gridPos.X, gridPos.Y, gridPos.Z, player.Name))
@@ -5171,18 +5627,57 @@ FillFrameBlock.OnServerEvent:Connect(function(player, targetBlock, fillBlockId)
 	local fillColor = fillPreset.DefaultColor or Color3.fromRGB(128, 128, 128)
 	local fillMaterial = fillPreset.Material or Enum.Material.Plastic
 	local fillMaterialVariant = fillPreset.MaterialVariant or ""
+
+	-- Reward-set / block-model fills (candy bricks, chocolate, etc.) deliberately leave
+	-- Material/MaterialVariant off the preset so the authored Studio look is preserved
+	-- on the template (see the RewardBlocks manifests). The normal placement path keeps
+	-- that, but this fill path paints from the preset only, so without this it falls back
+	-- to Plastic with no variant. Sample the look straight off the block model instead
+	-- (same idea as the Log branch below). Color still follows the preset tint when the
+	-- block uses ApplyColor; non-tinted blocks take the template's authored color too.
+	if fillPreset.UseBlockModel and (fillPreset.Material == nil or fillPreset.MaterialVariant == nil) then
+		local folder = ReplicatedStorage
+		for _, folderName in ipairs(string.split(fillPreset.BlockModelFolder or "", "/")) do
+			folder = folder and folder:FindFirstChild(folderName)
+		end
+		local model = folder and folder:FindFirstChild(fillPreset.BlockModelName or fillBlockId)
+		if model then
+			local best, bestVol
+			if model:IsA("BasePart") then
+				best = model
+			else
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("BasePart") and d.Name ~= "Hitbox" and d.Name ~= "ClimbSensor" and d.Transparency < 1 then
+						local v = d.Size.X * d.Size.Y * d.Size.Z
+						if not bestVol or v > bestVol then bestVol, best = v, d end
+					end
+				end
+			end
+			if best then
+				if fillPreset.Material == nil then fillMaterial = best.Material end
+				if fillPreset.MaterialVariant == nil then fillMaterialVariant = best.MaterialVariant or "" end
+				-- ApplyColor blocks (e.g. chocolate variants) keep the preset tint; blocks
+				-- that don't tint (e.g. candy bricks) take the template's authored color.
+				if fillPreset.ApplyColor == false then fillColor = best.Color end
+			end
+		end
+	end
 	
-	-- Check if filling with Leaves - apply biome/season/random coloring
-	local isLeavesFill = (fillBlockId == "Leaves")
+	-- Check if filling with Leaves - apply biome/season/random coloring just like a
+	-- placed leaf block, so filled leaf frames get the same per-block colour variation.
+	-- Leaf type is taken from the fill id (OakLeaves/BirchLeaves/SpruceLeaves).
+	local isLeavesFill = string.find(fillBlockId, "Leaves") ~= nil
 	if isLeavesFill then
+		local leafType = (string.find(fillBlockId, "Birch") and "Birch")
+			or (string.find(fillBlockId, "Spruce") and "Spruce") or "Oak"
 		local currentBiome = buildArea:GetAttribute("CurrentBiome")
 		local currentSeason = buildArea:GetAttribute("CurrentSeason") or "Summer"
 		local leafColor
 		
 		if currentBiome then
-			leafColor = BiomeConfig.GetRandomizedTintedLeafColor("Oak", currentBiome, currentSeason)
+			leafColor = BiomeConfig.GetRandomizedTintedLeafColor(leafType, currentBiome, currentSeason)
 		else
-			leafColor = BiomeConfig.GetRandomizedTintedLeafColor("Oak", "Plains", currentSeason)
+			leafColor = BiomeConfig.GetRandomizedTintedLeafColor(leafType, "Plains", currentSeason)
 		end
 		
 		if leafColor then
@@ -5249,6 +5744,110 @@ FillFrameBlock.OnServerEvent:Connect(function(player, targetBlock, fillBlockId)
 				part.Color = fillColor
 				part.Material = fillMaterial
 				part.MaterialVariant = fillMaterialVariant ~= "" and fillMaterialVariant or ""
+			end
+		end
+	end
+
+	-- Texture-mode fill (candy canes, etc.): the stripe pattern lives in Texture/Decal
+	-- objects on the source model, not a MaterialVariant, so the color/material set
+	-- above produces a flat block with no stripes. Copy the source's stripe textures
+	-- onto the filled block and tint them to the fill color; keep the part white so
+	-- the stripe background matches a real candy cane.
+	if fillPreset.StripeColorMode == "Texture" then
+		local srcFolder = ReplicatedStorage
+		for _, n in ipairs(string.split(fillPreset.BlockModelFolder or "", "/")) do
+			srcFolder = srcFolder and srcFolder:FindFirstChild(n)
+		end
+		local srcModel = srcFolder and srcFolder:FindFirstChild(fillPreset.BlockModelName or fillBlockId)
+		if srcModel then
+			local stripes = {}
+			local srcMaterial, srcMatVariant
+			local scanRoot = srcModel:IsA("BasePart") and srcModel:GetChildren() or srcModel:GetDescendants()
+			for _, c in ipairs(scanRoot) do
+				if c:IsA("Texture") or c:IsA("Decal") then table.insert(stripes, c) end
+			end
+			-- Filled candy frames always use the PixelCandyCaneAlt material variant.
+			-- Look it up in MaterialService so we set the matching BaseMaterial — a
+			-- MaterialVariant only renders when part.Material == its BaseMaterial.
+			-- Fall back to the source block's authored material if the variant is missing.
+			local altMV = game:GetService("MaterialService"):FindFirstChild("PixelCandyCaneAlt", true)
+			if altMV and altMV:IsA("MaterialVariant") then
+				srcMaterial = altMV.BaseMaterial
+				srcMatVariant = "PixelCandyCaneAlt"
+			elseif srcModel:IsA("BasePart") then
+				srcMaterial = srcModel.Material
+				srcMatVariant = srcModel.MaterialVariant
+			else
+				local body = srcModel.PrimaryPart or srcModel:FindFirstChild("Bark") or srcModel:FindFirstChildWhichIsA("BasePart")
+				if body then
+					srcMaterial = body.Material
+					srcMatVariant = body.MaterialVariant
+				end
+			end
+			local function applyStripes(part)
+				part.Color = Color3.new(1, 1, 1)
+				if srcMaterial then
+					part.Material = srcMaterial
+					part.MaterialVariant = srcMatVariant or ""
+				end
+				for _, tex in ipairs(stripes) do
+					local copy = tex:Clone()
+					copy.Color3 = fillColor
+					copy.Parent = part
+				end
+			end
+			if newBlock:IsA("BasePart") then
+				applyStripes(newBlock)
+			else
+				for _, part in ipairs(newBlock:GetDescendants()) do
+					if part:IsA("BasePart") then applyStripes(part) end
+				end
+			end
+		end
+	end
+	
+	-- Leaf-mode fill: the leaf blocks (OakLeaves/BirchLeaves/SpruceLeaves) show their
+	-- colour on the Part (fillColor, randomized + biome-tinted above) with a face
+	-- Texture on top for the leaf detail. The plain color/material pass leaves a flat
+	-- opaque cube, so copy the leaf Part's transparency/material + face textures and
+	-- keep the randomized leaf colour, exactly like a placed leaf block.
+	if string.find(fillBlockId, "Leaves") then
+		local blocksFolder = ReplicatedStorage:FindFirstChild("Blocks")
+		local leafModel = blocksFolder and blocksFolder:FindFirstChild(fillBlockId)
+		local leafPart = leafModel and (leafModel:IsA("BasePart") and leafModel or leafModel:FindFirstChildWhichIsA("BasePart"))
+		if leafPart then
+			local faces = {}
+			for _, c in ipairs(leafPart:GetChildren()) do
+				if c:IsA("Texture") or c:IsA("Decal") or c:IsA("SurfaceAppearance") then
+					table.insert(faces, c)
+				end
+			end
+			local function applyLeaf(part)
+				part.Transparency = leafPart.Transparency
+				part.Material = leafPart.Material
+				part.MaterialVariant = leafPart.MaterialVariant or ""
+				part.Color = fillColor
+				for _, ex in ipairs(part:GetChildren()) do
+					if ex:IsA("Texture") or ex:IsA("Decal") or ex:IsA("SurfaceAppearance") then
+						ex:Destroy()
+					end
+				end
+				for _, f in ipairs(faces) do
+					local c = f:Clone()
+					-- Leaves show their colour on the texture (see visibleBlockColor), not the
+					-- part, so tint each copied face or every filled frame is the same shade.
+					if (c:IsA("Texture") or c:IsA("Decal")) and c.Name ~= "Branches" then
+						c.Color3 = fillColor
+					end
+					c.Parent = part
+				end
+			end
+			if newBlock:IsA("BasePart") then
+				applyLeaf(newBlock)
+			else
+				for _, part in ipairs(newBlock:GetDescendants()) do
+					if part:IsA("BasePart") then applyLeaf(part) end
+				end
 			end
 		end
 	end
@@ -5731,46 +6330,4 @@ FillFrameBlock.OnServerEvent:Connect(function(player, targetBlock, fillBlockId)
 					local fencePreset = BlockPresets and BlockPresets.GetPreset(fenceType)
 					local finalColor = oldColor or (fencePreset and fencePreset.DefaultColor)
 					local finalMaterial = oldMaterial or (fencePreset and fencePreset.Material)
-					local finalMaterialVariant = (oldMaterialVariant and oldMaterialVariant ~= "") and oldMaterialVariant or (fencePreset and fencePreset.MaterialVariant or "")
-					
-					if not isFrameFence and finalColor and finalMaterial and newFence:IsA("BasePart") then
-						newFence.Color = finalColor
-						newFence.Material = finalMaterial
-						if finalMaterialVariant and finalMaterialVariant ~= "" then
-							newFence.MaterialVariant = finalMaterialVariant
-						end
-					end
-					
-					newFence:SetAttribute("BlockType", fenceType)
-					newFence:SetAttribute("PlacedBy", placedBy)
-					newFence:SetAttribute("Rotation", fenceRotation)
-					newFence:SetAttribute("IsFence", true)
-					newFence:SetAttribute("FenceConnectionType", connectionType)
-					-- Store grid position for spatial index (fence unions have offset geometric centers)
-					newFence:SetAttribute("BlockPosX", fencePos.X)
-					newFence:SetAttribute("BlockPosY", fencePos.Y)
-					newFence:SetAttribute("BlockPosZ", fencePos.Z)
-					if isFrameFence then
-						newFence:SetAttribute("IsFrameBlock", true)
-					end
-					
-					newFence.Parent = parentFolder
-					addBlockHitbox(newFence, fencePos)
-					return newFence
-				end
-				return nil
-			end
-			
-			-- Update adjacent fences (fence was removed from fence graph)
-			local updated1 = FencePlacement.UpdateAdjacentFences(fillGridPos, parentFolder, BlockTemplates, createFenceBlockForFill)
-			-- Also update as solid block (new solid appeared)
-			local updated2 = FencePlacement.UpdateFencesNearSolidBlock(fillGridPos, parentFolder, BlockTemplates, createFenceBlockForFill)
-			local totalUpdated = #updated1 + #updated2
-			if totalUpdated > 0 then
-				print(string.format("[FrameFill] Updated %d adjacent fences after fill", totalUpdated))
-			end
-		end)
-	end
-end)
-
--- print("BlockHandler initialized (Lazy terrain + Decorations)")
+					local finalMaterialVariant = (oldMaterialVariant and oldMaterialVariant ~= "") and oldMaterialVariant or (fencePreset and fencePr

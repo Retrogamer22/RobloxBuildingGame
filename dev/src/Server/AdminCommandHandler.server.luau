@@ -5,7 +5,7 @@
 	
 	Message format from Worker (JSON-stringified):
 	{
-	  "command": "ping" | "softupdate" | "urgentupdate" | "broadcast" | "kick" | "ban",
+	  "command": "ping" | "softupdate" | "urgentupdate" | "broadcast" | "kick" | "ban" | "giveset" | "givesetall",
 	  "payload": { ... },
 	  "timestamp": <ms>
 	}
@@ -19,12 +19,26 @@ local MessagingService = game:GetService("MessagingService")
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
 
 local TOPIC = "AdminCommands"
 local SHUTDOWN_TOPIC = "UrgentGameShutdown"   -- mirrors BetaAdminCommands.server.luau
 
 local LOG = "[BB-ADMIN]"
 local jobId = (game.JobId ~= "" and game.JobId:sub(1, 8)) or "studio"
+
+-- Lazy CoinManager require (used by giveset / givesetall). Lazy so we don't
+-- block this script's startup if ServerScriptService.Modules isn't ready yet.
+local CoinManager = nil
+task.spawn(function()
+	local modulesFolder = ServerScriptService:WaitForChild("Modules", 10)
+	if modulesFolder then
+		local coinModule = modulesFolder:WaitForChild("CoinManager", 10)
+		if coinModule then
+			CoinManager = require(coinModule)
+		end
+	end
+end)
 
 ----------------------------------------------------------------
 -- Style presets for the shutdown UI
@@ -218,6 +232,95 @@ commands.ban = function(payload)
 		warn(string.format("%s ban failed: %s", LOG, tostring(err)))
 	else
 		print(string.format("%s ban applied | userId=%d", LOG, userId))
+	end
+end
+
+-- giveset: grant one or more reward sets to a specific user. The Worker broadcasts
+-- to every server; only the server holding the target's PlayerData will actually
+-- grant (CoinManager.GrantRewardSet returns false otherwise). All other servers
+-- silently no-op so we don't spam warnings for the expected case.
+-- Payload: { userId = 123, setNames = { "RainbowBlocks", ... }, initiatedBy = "..." }
+commands.giveset = function(payload)
+	if type(payload) ~= "table" then
+		warn(string.format("%s giveset missing payload", LOG))
+		return
+	end
+	local userId = payload.userId
+	local setNames = payload.setNames
+	local initiatedBy = payload.initiatedBy or "AdminPanel"
+	
+	if type(userId) ~= "number" then
+		warn(string.format("%s giveset: invalid or missing userId", LOG))
+		return
+	end
+	if type(setNames) ~= "table" or #setNames == 0 then
+		warn(string.format("%s giveset: setNames must be a non-empty array", LOG))
+		return
+	end
+	
+	-- Only the server that has this player processes the gift.
+	local target = Players:GetPlayerByUserId(userId)
+	if not target then
+		return
+	end
+	
+	if not CoinManager then
+		warn(string.format("%s giveset: CoinManager not loaded yet on server=%s", LOG, jobId))
+		return
+	end
+	
+	print(string.format("%s giveset | server=%s | target=%s (userId=%d) | sets=[%s] | by=%s",
+		LOG, jobId, target.Name, userId, table.concat(setNames, ", "), initiatedBy))
+	
+	for _, setName in ipairs(setNames) do
+		if type(setName) == "string" and setName ~= "" then
+			local ok, msg = CoinManager.GrantRewardSet(userId, setName)
+			if ok then
+				print(string.format("%s   - %s: %s", LOG, setName, msg))
+			else
+				warn(string.format("%s   - %s FAILED: %s", LOG, setName, tostring(msg)))
+			end
+		end
+	end
+end
+
+-- givesetall: grant one or more reward sets to EVERY player currently on this
+-- server. Each server iterates its own player list, so collectively the
+-- broadcast covers every online player across the experience.
+-- Payload: { setNames = { "RainbowBlocks", ... }, initiatedBy = "..." }
+commands.givesetall = function(payload)
+	if type(payload) ~= "table" then
+		warn(string.format("%s givesetall missing payload", LOG))
+		return
+	end
+	local setNames = payload.setNames
+	local initiatedBy = payload.initiatedBy or "AdminPanel"
+	
+	if type(setNames) ~= "table" or #setNames == 0 then
+		warn(string.format("%s givesetall: setNames must be a non-empty array", LOG))
+		return
+	end
+	
+	if not CoinManager then
+		warn(string.format("%s givesetall: CoinManager not loaded yet on server=%s", LOG, jobId))
+		return
+	end
+	
+	local targets = Players:GetPlayers()
+	print(string.format("%s givesetall | server=%s | targets=%d | sets=[%s] | by=%s",
+		LOG, jobId, #targets, table.concat(setNames, ", "), initiatedBy))
+	
+	for _, p in ipairs(targets) do
+		for _, setName in ipairs(setNames) do
+			if type(setName) == "string" and setName ~= "" then
+				local ok, msg = CoinManager.GrantRewardSet(p.UserId, setName)
+				if ok then
+					print(string.format("%s   - %s/%s: %s", LOG, p.Name, setName, msg))
+				else
+					print(string.format("%s   - %s/%s FAILED: %s", LOG, p.Name, setName, tostring(msg)))
+				end
+			end
+		end
 	end
 end
 

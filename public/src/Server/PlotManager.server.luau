@@ -9,6 +9,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("GridConfig"))
+local BetaConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BetaConfig"))
 
 -- Helper to check if MegaPlot mode is active
 local function isMegaPlotMode()
@@ -21,6 +22,8 @@ local TerrainGenerator = nil
 local GrassSpreadManager = nil
 local SnowyGrassManager = nil
 local WeatherManager = nil
+local ChunkTerrainManager = nil -- SECOND-PLACE chunk world generator (gated by isChunkPlace)
+local ChunkStreamManager = nil -- SECOND-PLACE streaming chunk loader (gated by isChunkPlace)
 do
 	local modulesFolder = script.Parent:WaitForChild("Modules", 10)
 	if modulesFolder then
@@ -47,8 +50,43 @@ do
 		if weatherModule then
 			WeatherManager = require(weatherModule)
 		end
+
+		-- SECOND-PLACE chunk world generator. Required everywhere but only invoked
+		-- on chunk places (gated by isChunkPlace below). Init injects TerrainGenerator.
+		local chunkModule = modulesFolder:FindFirstChild("ChunkTerrainManager")
+		if chunkModule then
+			ChunkTerrainManager = require(chunkModule)
+			if ChunkTerrainManager and TerrainGenerator then
+				ChunkTerrainManager.Init(TerrainGenerator)
+			end
+		end
+
+		-- SECOND-PLACE streaming loader. Reuses TerrainGenerator like the static
+		-- manager, but loads/unloads small 10-block chunks around the player so the
+		-- free-build world streams instead of generating a fixed grid. Only started
+		-- on chunk places (see PlayerAdded), after the center chunk + spawn teleport.
+		local streamModule = modulesFolder:FindFirstChild("ChunkStreamManager")
+		if streamModule then
+			ChunkStreamManager = require(streamModule)
+			if ChunkStreamManager and TerrainGenerator then
+				ChunkStreamManager.Init(TerrainGenerator)
+			end
+		end
 	end
 end
+
+-- ============================================
+-- CHUNK PLACE GATING (second place only)
+-- ============================================
+-- The free-build place ID lives in BetaConfig (single source of truth, shared
+-- with SaveManager's persistence gate). isChunkPlace() just delegates to it.
+local function isChunkPlace()
+	return BetaConfig.IsFreeBuildPlace()
+end
+
+-- TEMP diagnostic: confirm gate + module wiring at boot. Remove once verified.
+print(string.format("[BB-CHUNK] startup: PlaceId=%d isChunkPlace=%s ChunkTerrainManager=%s",
+	game.PlaceId, tostring(isChunkPlace()), tostring(ChunkTerrainManager ~= nil)))
 
 -- Create Remotes folder at runtime
 local Remotes = Instance.new("Folder")
@@ -112,6 +150,11 @@ local function assignPlot(player, plotNumber)
 	PlayerPlots[player] = plotNumber
 	
 	local buildArea = getBuildArea(plotNumber)
+	-- SECOND-PLACE ONLY: no pre-placed BuildArea models exist here. Fabricate one
+	-- at the world origin so the chunk generator has a container + anchor.
+	if not buildArea and isChunkPlace() and ChunkTerrainManager and ChunkTerrainManager.EnsureCenterBuildArea then
+		buildArea = ChunkTerrainManager.EnsureCenterBuildArea(plotNumber)
+	end
 	if buildArea then
 		-- Create blocks folder if it doesn't exist
 		local blocksFolder = buildArea:FindFirstChild("Blocks")
@@ -133,18 +176,26 @@ local function assignPlot(player, plotNumber)
 		
 		-- Generate terrain on-demand (only when a player claims the plot)
 		if not PlotTerrainReady[plotNumber] and TerrainGenerator then
-			local BiomeConfig = nil
-			pcall(function()
-				BiomeConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BiomeConfig"))
-			end)
-			local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
-			local defaultTerrainStyle = "Flat"
-			
-			TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
-			
-			buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
-			buildArea:SetAttribute("CurrentBiome", defaultBiome)
-			PlotTerrainReady[plotNumber] = true
+			if isChunkPlace() and ChunkTerrainManager then
+				-- SECOND-PLACE: generate the CENTER chunk synchronously on the join
+				-- thread. The surrounding ring is deferred until after the spawn
+				-- teleport (see PlayerAdded) so it can't race the BasePlate* attrs.
+				ChunkTerrainManager.GenerateCenterChunk(buildArea, plotNumber)
+				PlotTerrainReady[plotNumber] = true
+			else
+				local BiomeConfig = nil
+				pcall(function()
+					BiomeConfig = require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("BiomeConfig"))
+				end)
+				local defaultBiome = BiomeConfig and BiomeConfig.DefaultBiome or "Plains"
+				local defaultTerrainStyle = "Flat"
+				
+				TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, plotNumber, defaultBiome, defaultTerrainStyle)
+				
+				buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
+				buildArea:SetAttribute("CurrentBiome", defaultBiome)
+				PlotTerrainReady[plotNumber] = true
+			end
 		end
 	end
 	
@@ -220,6 +271,11 @@ local function releasePlot(player)
 		buildArea:SetAttribute("CurrentWeather", nil)
 		buildArea:SetAttribute("WeatherIntensity", nil)
 		
+		-- Free-build chunk world: the terrain is shared, procedural, and never saved.
+		-- Do not tear it down on player-leave. It is not a per-player plot, and destroying
+		-- the entire terrain synchronously here is what freezes the server at shutdown
+		-- (the silent hang right after Disconnect). Real plot worlds still clear normally.
+		if not isChunkPlace() then
 		-- Use TerrainGenerator's optimized clear function to avoid listener cascade
 		if TerrainGenerator then
 			TerrainGenerator.ClearAllBlocks(buildArea, plotNumber)
@@ -237,6 +293,7 @@ local function releasePlot(player)
 				newFolder.Name = "Blocks"
 				newFolder.Parent = buildArea
 			end
+		end
 		end
 		
 		buildArea:SetAttribute("OwnerUserId", nil)
@@ -412,6 +469,13 @@ Players.PlayerAdded:Connect(function(player)
 				hrp.Anchored = true
 				task.wait(0.1)  -- Minimal delay
 				teleportToPlot(player)
+				-- SECOND-PLACE: player is on the center chunk now; start streaming the
+				-- world around them (replaces the old fixed ring). StartStreaming is
+				-- idempotent, so a respawn just no-ops.
+				if isChunkPlace() and ChunkStreamManager then
+					local ba = getBuildArea(plotNumber)
+					if ba then ChunkStreamManager.StartStreaming(ba, plotNumber) end
+				end
 			end
 		end)
 		
@@ -423,6 +487,12 @@ Players.PlayerAdded:Connect(function(player)
 				end
 				task.wait(0.1)
 				teleportToPlot(player)
+				-- SECOND-PLACE: player is on the center chunk now; start streaming the
+				-- world around them (replaces the old fixed ring).
+				if isChunkPlace() and ChunkStreamManager then
+					local ba = getBuildArea(plotNumber)
+					if ba then ChunkStreamManager.StartStreaming(ba, plotNumber) end
+				end
 			end
 		end
 	else
@@ -560,7 +630,10 @@ local function startBackgroundTerrainGen()
 			-- Skip plots that already have terrain (claimed by a player)
 			if not PlotTerrainReady[i] then
 				local buildArea = getBuildArea(i)
-				if buildArea and TerrainGenerator then
+				if isChunkPlace() then
+					-- SECOND-PLACE: chunk worlds are created on claim; nothing to pre-fill.
+					PlotTerrainReady[i] = true
+				elseif buildArea and TerrainGenerator then
 					TerrainGenerator.GenerateFlatTerrainWithBiome(buildArea, i, defaultBiome, defaultTerrainStyle)
 					buildArea:SetAttribute("TerrainStyle", defaultTerrainStyle)
 					buildArea:SetAttribute("CurrentBiome", defaultBiome)

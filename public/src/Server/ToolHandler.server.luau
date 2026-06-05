@@ -10,7 +10,9 @@ local Players = game:GetService("Players")
 local BlockPresets = require(ReplicatedStorage:WaitForChild("BlockPresets", 10))
 local GridConfig = require(ReplicatedStorage:WaitForChild("Config", 10):WaitForChild("GridConfig", 10))
 local VinePlacement = require(ReplicatedStorage:WaitForChild("VinePlacement", 10))
+local BlockSpatialIndex = require(ReplicatedStorage:WaitForChild("BlockSpatialIndex", 10))
 local BlocksFolder = ReplicatedStorage:WaitForChild("Blocks", 10)
+local BreakFX = require(ReplicatedStorage:WaitForChild("BreakFX", 10)) -- [BB-BREAK-FX] shear particles
 
 -- Load TerrainGenerator for lazy loading walls when making paths
 local TerrainGenerator = nil
@@ -328,6 +330,7 @@ local function cascadeDestroyVinesBelow(startPos, face, blocksFolder)
 		local vineInfo = VinePlacement.GetVineAtPosition(currentPos, blocksFolder)
 		if not vineInfo then break end
 		if vineInfo.face ~= face then break end
+		BreakFX.Fire(vineInfo.instance)
 		vineInfo.instance:Destroy()
 		count = count + 1
 		currentPos = currentPos - Vector3.new(0, BLOCK_SIZE, 0)
@@ -335,9 +338,179 @@ local function cascadeDestroyVinesBelow(startPos, face, blocksFolder)
 	return count
 end
 
+-- Convert a sugar cane into SugarCaneTrimmed (Shears). The trimmed cane keeps its
+-- exact position + parent cell so it saves/loads in place, and the SugarCaneHandler
+-- growth system skips it (caps the column at that height). Works at any height.
+local function trimSugarCane(player, targetBlock)
+	local buildArea = getPlayerBuildArea(player)
+	if not buildArea then return false, "No build area" end
+	local blocksFolder = buildArea:FindFirstChild("Blocks")
+	if not blocksFolder then return false, "No blocks folder" end
+	if targetBlock.Parent ~= blocksFolder then
+		return false, "Sugar cane not in your plot"
+	end
+
+	-- Preserve the cane's exact transform.
+	local cframe
+	if targetBlock:IsA("Model") then
+		cframe = targetBlock:GetPivot()
+	elseif targetBlock:IsA("BasePart") then
+		cframe = targetBlock.CFrame
+	else
+		return false, "Unsupported sugar cane instance"
+	end
+
+	local newCane = cloneVineTemplate("SugarCaneTrimmed") -- generic clone+anchor helper
+	if not newCane then return false, "Template not found: SugarCaneTrimmed" end
+	-- The SugarCaneTrimmed model renders half a block high relative to its pivot
+	-- (its geometry sits BLOCK_SIZE/2 above the pivot), so lower it to line up with
+	-- the regular sugar cane. The load path applies the same correction.
+	newCane:PivotTo(cframe * CFrame.new(0, -BLOCK_SIZE / 2, 0))
+
+	newCane:SetAttribute("BlockType", "SugarCaneTrimmed")
+	newCane:SetAttribute("IsDecoration", true)
+	newCane:SetAttribute("IsSugarCaneTrimmed", true)
+	-- Copy the parent-block cell (decorations save relative to it). Derive if missing.
+	local px = targetBlock:GetAttribute("ParentBlockX")
+	local py = targetBlock:GetAttribute("ParentBlockY")
+	local pz = targetBlock:GetAttribute("ParentBlockZ")
+	if not (px and py and pz) then
+		local base = cframe.Position - Vector3.new(0, BLOCK_SIZE / 2, 0)
+		px, py, pz = base.X, base.Y, base.Z
+	end
+	newCane:SetAttribute("ParentBlockX", px)
+	newCane:SetAttribute("ParentBlockY", py)
+	newCane:SetAttribute("ParentBlockZ", pz)
+	-- PlacedBy must be set or PlotSerializer treats this as terrain and skips saving.
+	newCane:SetAttribute("PlacedBy", targetBlock:GetAttribute("PlacedBy") or 0)
+
+	-- Collect any sugar cane stacked ABOVE this one BEFORE destroying anything, so a
+	-- mid-column trim drops everything above it (trimming caps the column here).
+	-- The cane occupies the cell at parent + BLOCK_SIZE; walk up from there.
+	local caneCell = Vector3.new(px, py, pz) + Vector3.new(0, BLOCK_SIZE, 0)
+	local sugarCaneAbove = {}
+	local idx = BlockSpatialIndex.GetOrCreate(blocksFolder)
+	if idx then
+		local p = caneCell + Vector3.new(0, BLOCK_SIZE, 0)
+		for _ = 1, 12 do
+			local d = idx:GetDecorationAt(p)
+			local dt = d and d:GetAttribute("BlockType")
+			if d and (dt == "SugarCane" or dt == "SugarCaneTrimmed") then
+				table.insert(sugarCaneAbove, d)
+				p = p + Vector3.new(0, BLOCK_SIZE, 0)
+			else
+				break
+			end
+		end
+	end
+
+	BreakFX.Fire(targetBlock)
+	targetBlock:Destroy()
+	newCane.Parent = blocksFolder
+
+	-- Break everything that was above the trimmed cane (each pops particles).
+	for _, d in ipairs(sugarCaneAbove) do
+		if d and d.Parent then BreakFX.Fire(d); d:Destroy() end
+	end
+
+	print(string.format("[Shears] Trimmed sugar cane at parent (%.1f, %.1f, %.1f)%s", px, py, pz,
+		#sugarCaneAbove > 0 and string.format(" (broke %d above)", #sugarCaneAbove) or ""))
+	return true, "Trimmed"
+end
+
+-- ============================================
+-- SHEARS: Strip leaves into a Branch Block.
+-- ============================================
+-- Right-clicking a leaf block (OakLeaves / BirchLeaves / SpruceLeaves, or the
+-- legacy "Leaves") with Shears converts it in place into a BranchBlock and pops
+-- the same break-particle burst vines produce when sheared. The branch is a
+-- normal placed block (BlockPresets auto-generates its preset from the Blocks
+-- folder), so it saves/loads through the generic block path.
+local BRANCH_BLOCK_NAME = "BranchBlock"
+
+local function shearLeaves(player, targetBlock)
+	local buildArea = getPlayerBuildArea(player)
+	if not buildArea then return false, "No build area" end
+	local blocksFolder = buildArea:FindFirstChild("Blocks")
+	if not blocksFolder then return false, "No blocks folder" end
+	if targetBlock.Parent ~= blocksFolder then
+		return false, "Leaves not in your plot"
+	end
+
+	-- Resolve the cell centre. Leaf blocks are single Parts placed at the centre;
+	-- prefer the stored grid attributes, fall back to the instance transform.
+	local gridPosition
+	local bx = targetBlock:GetAttribute("BlockPosX")
+	local by = targetBlock:GetAttribute("BlockPosY")
+	local bz = targetBlock:GetAttribute("BlockPosZ")
+	if bx and by and bz then
+		gridPosition = Vector3.new(bx, by, bz)
+	elseif targetBlock:IsA("BasePart") then
+		gridPosition = targetBlock.Position
+	elseif targetBlock:IsA("Model") then
+		gridPosition = targetBlock:GetPivot().Position + Vector3.new(0, BLOCK_SIZE / 2, 0)
+	else
+		return false, "Unsupported leaf instance"
+	end
+
+	local placedBy = targetBlock:GetAttribute("PlacedBy")
+	local isTerrainBlock = targetBlock:GetAttribute("IsTerrainBlock")
+
+	-- Build the replacement branch block.
+	local branch = cloneBlockModel(BRANCH_BLOCK_NAME)
+	if not branch then
+		return false, "Failed to create branch block"
+	end
+
+	-- Position at the same cell centre. Parts sit at the centre; models use the
+	-- standard bottom-centre pivot offset (same convention as other block models).
+	if branch:IsA("BasePart") then
+		branch.Position = gridPosition
+	elseif branch:IsA("Model") then
+		branch:PivotTo(CFrame.new(gridPosition - Vector3.new(0, BLOCK_SIZE / 2, 0)))
+	end
+
+	branch:SetAttribute("BlockType", BRANCH_BLOCK_NAME)
+	branch:SetAttribute("PlacedBy", placedBy or player.UserId)
+	branch:SetAttribute("BlockPosX", gridPosition.X)
+	branch:SetAttribute("BlockPosY", gridPosition.Y)
+	branch:SetAttribute("BlockPosZ", gridPosition.Z)
+	-- Mark LazyLoaded so a sheared TERRAIN leaf (tree foliage) persists through
+	-- save/load -- mirrors how the shovel marks converted path blocks.
+	branch:SetAttribute("IsLazyLoaded", true)
+	if isTerrainBlock then
+		branch:SetAttribute("IsTerrainBlock", true)
+	end
+
+	-- Pop the break particles at the leaf (same burst vines use), then swap it out.
+	BreakFX.Fire(targetBlock)
+	targetBlock:Destroy()
+	branch.Parent = blocksFolder
+
+	print(string.format("[Shears] Sheared leaves into BranchBlock at (%.1f, %.1f, %.1f)",
+		gridPosition.X, gridPosition.Y, gridPosition.Z))
+	return true, "Sheared into branch"
+end
+
 local function useShears(player, targetBlock, _targetPosition)
+	-- Leaves: Shears strip a leaf block into a BranchBlock (+particle burst).
+	-- Matches any per-type leaf (OakLeaves/BirchLeaves/SpruceLeaves) plus the
+	-- legacy "Leaves" name, via substring -- same test LeafDecayManager uses.
+	do
+		local bt = targetBlock and targetBlock:GetAttribute("BlockType")
+		if bt and string.find(bt, "Leaves") then
+			return shearLeaves(player, targetBlock)
+		end
+	end
+
+	-- Sugar cane: Shears convert the targeted cane into SugarCaneTrimmed, stopping
+	-- its growth at the current height. Handled before the vine path.
+	if targetBlock and targetBlock:GetAttribute("BlockType") == "SugarCane" then
+		return trimSugarCane(player, targetBlock)
+	end
+
 	if not targetBlock or not targetBlock:GetAttribute("IsVine") then
-		return false, "Shears only work on vines"
+		return false, "Shears only work on vines or sugar cane"
 	end
 	
 	-- Already trimmed? Nothing to do.
@@ -473,7 +646,8 @@ local function useShears(player, targetBlock, _targetPosition)
 	climbSensor:AddTag("VineClimbSensor")
 	climbSensor.Parent = newVine
 	
-	-- Destroy the old vine and parent the new one.
+	-- Destroy the old vine and parent the new one (pops particles at the cut).
+	BreakFX.Fire(targetBlock)
 	targetBlock:Destroy()
 	newVine.Parent = blocksFolder
 	

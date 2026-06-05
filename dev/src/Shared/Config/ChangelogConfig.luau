@@ -6,10 +6,10 @@
 
 local ChangelogConfig = {
 	-- Current version (increment this with each update)
-	VERSION = 22,
+	VERSION = 23,
 	
 	-- Version display name (shown to players)
-	VERSION_NAME = "v1.7.2",
+	VERSION_NAME = "v1.8",
 	
 	-- Developer Notes (optional) - shown in a highlighted box above changes
 	-- Set to nil or empty string to hide the notes section
@@ -25,7 +25,7 @@ local ChangelogConfig = {
 	IMAGES = {
 		-- Example:
 		{ imageId = "rbxassetid://139684623132536", caption = "Added more parity blocks!" },
-		{ imageId = "rbxassetid://72629514451612", caption = "Added vines and an arch frame variant" },
+		{ imageId = "rbxaspsetid://72629514451612", caption = "Added vines and an arch frame variant" },
 	},
 	
 	-- Changelog entries for the current version
@@ -39,6 +39,8 @@ local ChangelogConfig = {
 		{ icon = "", text = "Revamped all textures with PBR maps to add more depth and detail to the game" },
 		{ icon = "", text = "Tweaked campfire smoke and lighting system" },
 		{ icon = "", text = "Tweaked saving/loading system to be more robust" },
+		{ icon = "", text = "Fixed terrain around the edge of the plot" },
+		{ icon = "", text = "Fixed weird grass bug" },
 		{ icon = "", text = "Fixed more bugs and issues as usual!" },
 	},
 	

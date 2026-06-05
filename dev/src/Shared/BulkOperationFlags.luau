@@ -150,4 +150,29 @@ function BulkOperationFlags.ForceEndAll()
 	return cleared
 end
 
+-- ============================================================================
+-- SERVER SHUTDOWN GUARD
+-- ============================================================================
+-- On server stop the engine tears down the DataModel directly (not via our
+-- managed ClearAllBlocks), firing ChildRemoved for every block at once. The
+-- per-block handlers (Lighting/FallingBlock/PressurePlate/Water) would each do
+-- O(n) work per removal, freezing the main thread and spamming script-timeout
+-- warnings. BindToClose fires before that teardown, so we flip this flag there
+-- and those handlers skip their block listeners while it's set.
+local shuttingDown = false
+
+function BulkOperationFlags.IsShuttingDown()
+	return shuttingDown
+end
+
+function BulkOperationFlags.SetShuttingDown()
+	shuttingDown = true
+end
+
+if game:GetService("RunService"):IsServer() then
+	game:BindToClose(function()
+		shuttingDown = true
+	end)
+end
+
 return BulkOperationFlags

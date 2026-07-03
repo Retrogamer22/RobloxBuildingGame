@@ -1,0 +1,3063 @@
+// BuildBlox Admin Command Relay + Web UI + Analytics
+//
+// Endpoints:
+//   GET  /                     -> service health JSON (dashboard is now a native app)
+//   POST /                     -> admin command relay (X-Admin-Token)
+//   POST /events               -> Roblox servers POST join/leave + plus funnel events (X-Ingest-Token)
+//   POST /heartbeat            -> Roblox servers POST live heartbeat snapshots (X-Ingest-Token)
+//   POST /blocks/top           -> Roblox servers POST top-block snapshots (X-Ingest-Token)
+//   POST /leaderboards         -> Roblox servers POST leaderboard snapshots (X-Ingest-Token)
+//   GET  /stats/live           -> aggregated live snapshot across servers
+//   GET  /stats/daily          -> daily DAU split by new/returning
+//   GET  /stats/concurrency    -> peak concurrency over time
+//   GET  /stats/retention      -> day-N retention by cohort
+//   GET  /stats/session-length -> average completed session length
+//   GET  /stats/plus           -> Roblox Plus funnel: taps -> purchases -> conversion
+//   GET  /blocks/top           -> latest top-block snapshot
+//   GET  /leaderboards         -> latest leaderboard snapshot
+
+const UNIVERSES = {
+  prod: "9590764351",
+  dev: "9675756310",
+};
+
+// Root PLACE IDs for deep links — the number in roblox.com/games/<PLACE_ID>/...
+// NOT the universe IDs above (different value). Required for the live-list "Join"
+// button. Fill these in with each game's real place ID.
+const PLACES = {
+  prod: "88286023804686", // BuildBlox public
+  dev: "0000000000",      // TODO: dev place ID
+};
+
+const DEFAULT_TARGET = "prod";
+const TOPIC = "AdminCommands";
+const HEARTBEAT_FRESHNESS_SECONDS = 60;
+
+// A session whose `leave` event never arrived (left_at IS NULL) would otherwise be
+// counted as "online" forever, inflating concurrency/peak on recent days. Cap how
+// long an un-closed session is counted; sessions open longer than this are treated
+// as having ended at joined_at + this. Bump if real play sessions routinely exceed it.
+const MAX_OPEN_SESSION_SECONDS = 6 * 3600;
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token, X-Ingest-Token",
+};
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const { method } = request;
+    const { pathname: path } = url;
+
+    if (method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    if (method === "GET" && path === "/") {
+      // Data-only API. The dashboard is now a native app that calls the JSON
+      // endpoints below directly. Root just reports the service is alive.
+      return json({ ok: true, service: "buildblox-api", ts: Date.now() });
+    }
+
+    // Roblox -> Worker ingestion routes use X-Ingest-Token.
+    if (method === "POST" && path === "/events") {
+      return handleIngestEvent(request, env);
+    }
+    if (method === "POST" && path === "/heartbeat") {
+      return handleHeartbeat(request, env);
+    }
+    if (method === "POST" && path === "/blocks/top") {
+      return handleTopBlocksIngest(request, env);
+    }
+    if (method === "POST" && path === "/leaderboards") {
+      return handleLeaderboardsIngest(request, env);
+    }
+    if (method === "POST" && path === "/chat") {
+      return handleChatIngest(request, env);
+    }
+    if (method === "POST" && path === "/chat/help") {
+      return handleChatHelp(request, env);
+    }
+    if (method === "POST" && path === "/help/guide") {
+      return handleHelpGuideSync(request, env);
+    }
+
+    // Admin routes below require X-Admin-Token.
+    const token = request.headers.get("X-Admin-Token");
+    if (!token || token !== env.ADMIN_TOKEN) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    if (method === "GET" && path === "/stats/live") {
+      return handleStatsLive(request, env, url);
+    }
+    if (method === "GET" && path === "/thumbnails") {
+      return handleThumbnails(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/daily") {
+      return handleStatsDaily(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/concurrency") {
+      return handleStatsConcurrency(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/daily-peak") {
+      return handleStatsDailyPeak(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/retention") {
+      return handleStatsRetention(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/session-length") {
+      return handleStatsSessionLength(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/economy") {
+      return handleStatsEconomy(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/active") {
+      return handleStatsActive(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/shop") {
+      return handleStatsShop(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/daily-claims") {
+      return handleStatsDailyClaims(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/onboarding") {
+      return handleStatsOnboarding(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/slots") {
+      return handleStatsSlots(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/plus") {
+      return handleStatsPlus(request, env, url);
+    }
+    if (method === "GET" && path === "/feedback") {
+      return handleFeedbackRead(request, env, url);
+    }
+    if (method === "POST" && path === "/feedback/reply") {
+      return handleFeedbackReplySend(request, env, url);
+    }
+    if (method === "GET" && path === "/blocks/top") {
+      return handleTopBlocksRead(request, env, url);
+    }
+    if (method === "GET" && path === "/leaderboards") {
+      return handleLeaderboardsRead(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/playerbase") {
+      return handleStatsPlayerbase(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/heatmap") {
+      return handleStatsHeatmap(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/session-split") {
+      return handleStatsSessionSplit(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/milestones") {
+      return handleStatsMilestones(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/servers") {
+      return handleStatsServers(request, env, url);
+    }
+    if (method === "GET" && path === "/admin/servers") {
+      return handleAdminServersList(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/coinflow") {
+      return handleStatsCoinflow(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/shop-detail") {
+      return handleStatsShopDetail(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/streaks") {
+      return handleStatsStreaks(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/plus-quality") {
+      return handleStatsPlusQuality(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/block-trends") {
+      return handleStatsBlockTrends(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/engagement-trends") {
+      return handleStatsEngagementTrends(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/slots-trends") {
+      return handleStatsSlotsTrends(request, env, url);
+    }
+    if (method === "GET" && path === "/stats/chat") {
+      return handleStatsChat(request, env, url);
+    }
+    if (method === "POST" && path === "/chat/classify") {
+      return handleChatClassify(request, env, url);
+    }
+
+    if (method === "POST" && path === "/api/lookup-user") {
+      return handleLookupUser(request, env, url);
+    }
+
+    if (method === "POST" && path === "/") {
+      return handleAdminCommand(request, env);
+    }
+
+    if (method === "GET" && path === "/discord/playercount/refresh") {
+      return handleDiscordPlayerCountRefresh(request, env);
+    }
+
+    return json({ error: "Not found" }, 404);
+  },
+
+  // --------------------------------------------------------------------------
+  // Cron: keep a Discord voice-channel name in sync with the live player count.
+  // Reads the same heartbeat data as /stats/live (D1 live_servers) and renames
+  // the channel via the Discord REST API. No-op until the DISCORD_* env vars are
+  // set. Add a cron trigger (recommended "*/5 * * * *") in wrangler/dashboard.
+  // --------------------------------------------------------------------------
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(updateDiscordPlayerCountChannel(env));
+  },
+};
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+function nowUnix() {
+  return Math.floor(Date.now() / 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Analytics timezone. Every day/hour/weekday bucket below is shifted by this
+// offset so the dashboard reads in local time instead of UTC.
+// Illinois = US Central:  -300 = CDT (summer)  |  -360 = CST (winter).
+// Flip this one constant at the DST changeover. (The client-side "today" marker
+// in the dashboard script mirrors it — search TZ_OFFSET_MIN there too.)
+// ---------------------------------------------------------------------------
+const TZ_OFFSET_MIN = -300;
+const TZ_SQL = (TZ_OFFSET_MIN >= 0 ? "+" : "-") + Math.abs(TZ_OFFSET_MIN) + " minutes";
+function localDateStr(unixSeconds) {
+  const t = (unixSeconds != null ? unixSeconds : nowUnix()) + TZ_OFFSET_MIN * 60;
+  return new Date(t * 1000).toISOString().slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Workers AI helper. One place to pick the model + handle its request/response
+// shape, so every caller is a single line. Google Gemini Flash Lite follows
+// instructions (and JSON) far more reliably than the small Llama, is cheap, and
+// is zero-data-retention. Returns the model's text, or null if AI is missing /
+// errored (callers fall back gracefully).
+// ---------------------------------------------------------------------------
+const AI_MODEL = "google/gemini-3.1-flash-lite";
+
+function aiExtractText(resp) {
+  if (!resp) return "";
+  if (typeof resp === "string") return resp;
+  if (resp.candidates && resp.candidates[0] && resp.candidates[0].content) {
+    const parts = resp.candidates[0].content.parts || [];
+    return parts.map((p) => (p && p.text) || "").join("");
+  }
+  if (resp.choices && resp.choices[0] && resp.choices[0].message) {
+    return resp.choices[0].message.content || "";
+  }
+  return resp.response || resp.result || resp.text || "";
+}
+
+async function aiComplete(env, systemText, userText, _maxTokens) {
+  if (!env.AI) return null;
+  const prompt = String(systemText || "") + "\n\n" + String(userText || "");
+  try {
+    const resp = await env.AI.run(AI_MODEL, { contents: [{ parts: [{ text: prompt }] }] });
+    return aiExtractText(resp);
+  } catch (err) {
+    return null;
+  }
+}
+
+function parseDays(url, fallback = 30) {
+  const raw = Number.parseInt(url.searchParams.get("days") || "", 10);
+  if (Number.isNaN(raw)) return fallback;
+  return Math.max(1, Math.min(90, raw));
+}
+
+function parseTarget(value, fallback = DEFAULT_TARGET) {
+  return String(value || fallback).toLowerCase();
+}
+
+// ============================================================================
+// Discord live player-count channel
+// Keeps a Discord voice-channel name in sync with the current concurrent player
+// count, read from the same heartbeat data as /stats/live (D1 live_servers).
+// Driven by the scheduled() cron above. Config via env:
+//   DISCORD_BOT_TOKEN                     (secret) bot token, needs Manage Channels
+//   DISCORD_PLAYERCOUNT_CHANNEL_ID        voice channel id to rename
+//   DISCORD_PLAYERCOUNT_TARGET            which target to count (default "prod")
+//   DISCORD_PLAYERCOUNT_TEMPLATE          online label (default "\u{1F7E2} {count} playing")
+//   DISCORD_PLAYERCOUNT_TEMPLATE_OFFLINE  no-live-servers label (default "\u26AB {count} playing")
+// Placeholders: {count}/{players}, {servers}, {playerWord}, {serverWord}.
+// Only renames when the name actually changes (last name cached in D1), keeping
+// us under Discord's ~2-renames-per-10-min limit.
+// ============================================================================
+
+function formatPlayerCountChannelName(template, players, servers) {
+  const playerWord = players === 1 ? "player" : "players";
+  const serverWord = servers === 1 ? "server" : "servers";
+  let name = String(template || "\u{1F7E2} {count} playing")
+    .replace(/\{count\}/g, String(players))
+    .replace(/\{players\}/g, String(players))
+    .replace(/\{playerWord\}/gi, playerWord)
+    .replace(/\{servers\}/g, String(servers))
+    .replace(/\{serverWord\}/gi, serverWord);
+  if (name.length > 100) name = name.slice(0, 100); // Discord channel-name cap
+  return name;
+}
+
+async function updateDiscordPlayerCountChannel(env) {
+  const token = env.DISCORD_BOT_TOKEN;
+  const channelId = env.DISCORD_PLAYERCOUNT_CHANNEL_ID;
+  // Not configured yet — no-op so this can ship before the Discord side exists.
+  if (!token || !channelId) {
+    return { skipped: "not_configured" };
+  }
+
+  const targetKey = parseTarget(env.DISCORD_PLAYERCOUNT_TARGET);
+  const onlineTpl = env.DISCORD_PLAYERCOUNT_TEMPLATE || "\u{1F7E2} {count} playing";
+  const offlineTpl = env.DISCORD_PLAYERCOUNT_TEMPLATE_OFFLINE || "\u26AB {count} playing";
+
+  let players = 0;
+  let servers = 0;
+  try {
+    const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+    const totals = await env.DB.prepare(
+      "SELECT COUNT(*) AS servers, COALESCE(SUM(player_count), 0) AS players FROM live_servers WHERE target = ? AND last_heartbeat >= ?"
+    )
+      .bind(targetKey, freshAfter)
+      .first();
+    players = (totals && totals.players) || 0;
+    servers = (totals && totals.servers) || 0;
+  } catch (err) {
+    // A transient D1 read failure should not crash the cron; show offline/zero.
+    players = 0;
+    servers = 0;
+  }
+
+  const name = formatPlayerCountChannelName(servers === 0 ? offlineTpl : onlineTpl, players, servers);
+
+  // Skip the rename when nothing changed (cheap on Discord's rate limit). Cache
+  // the last name in a tiny self-contained D1 table.
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS discord_channel_state (channel_id TEXT PRIMARY KEY, last_name TEXT)"
+    ).run();
+    const prev = await env.DB.prepare(
+      "SELECT last_name FROM discord_channel_state WHERE channel_id = ?"
+    )
+      .bind(channelId)
+      .first();
+    if (prev && prev.last_name === name) {
+      return { players, servers, name, changed: false };
+    }
+  } catch (err) {
+    // If the state read fails, fall through and just attempt the rename.
+  }
+
+  let status = 0;
+  try {
+    const resp = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bot ${token}`,
+        "Content-Type": "application/json",
+        "User-Agent": "BuildBlox-PlayerCount (Cloudflare Worker)",
+      },
+      body: JSON.stringify({ name }),
+    });
+    status = resp.status;
+    // Persist the new name only on success so failures (incl. 429) retry next tick.
+    if (resp.ok) {
+      await env.DB.prepare(
+        "INSERT INTO discord_channel_state (channel_id, last_name) VALUES (?, ?) ON CONFLICT(channel_id) DO UPDATE SET last_name = excluded.last_name"
+      )
+        .bind(channelId, name)
+        .run();
+    }
+  } catch (err) {
+    return { players, servers, name, changed: false, error: String(err) };
+  }
+
+  return { players, servers, name, changed: status >= 200 && status < 300, status };
+}
+
+async function handleDiscordPlayerCountRefresh(request, env) {
+  // TEMP (debugging): auth removed so the live status is readable with no token.
+  // Harmless — worst case it sets the channel name to the current count. Re-add a
+  // token check here once the counter works.
+  const result = await updateDiscordPlayerCountChannel(env);
+  return json({ ok: true, result });
+}
+
+// ============================================================================
+// /events — Roblox server posts player_join / player_leave / plus funnel events
+// ============================================================================
+
+async function handleIngestEvent(request, env) {
+  const ingest = request.headers.get("X-Ingest-Token");
+  if (!ingest || ingest !== env.INGEST_TOKEN) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const { type, userId, username, serverId, target } = body;
+  const ts = Number.parseInt(body.timestamp, 10) || nowUnix();
+
+  if (!type || !userId || !username || !serverId) {
+    return json({ error: "Missing required fields" }, 400);
+  }
+
+  if (type === "feedback" || type === "feedback_reply") {
+    return handleFeedbackEvent(type, body, ts, env);
+  }
+
+  if (type === "plus_tap" || type === "plus_purchase") {
+    return handlePlusEvent(type, body, ts, env);
+  }
+
+  if (type === "coin_earn" || type === "coin_spend") {
+    return handleCoinEvent(type, body, ts, env);
+  }
+
+  if (type === "shop_open" || type === "shop_purchase") {
+    return handleShopEvent(type, body, ts, env);
+  }
+
+  if (type === "daily_claim") {
+    return handleDailyClaim(body, ts, env);
+  }
+
+  if (type === "milestone") {
+    return handleMilestone(body, ts, env);
+  }
+
+  if (type === "plot_slots") {
+    return handleSlotCount(body, ts, env);
+  }
+
+  if (type !== "join" && type !== "leave") {
+    return json({ error: "Invalid event type" }, 400);
+  }
+
+  const targetKey = parseTarget(target);
+
+  if (type === "join") {
+    // Fold the new/returning check into the upsert via RETURNING — total_sessions == 1
+    // means this is a first-ever join. Saves a separate SELECT on the hottest write path.
+    const upsert = await env.DB.prepare(`
+      INSERT INTO users (user_id, username, first_joined, last_joined, total_sessions)
+      VALUES (?, ?, ?, ?, 1)
+      ON CONFLICT(user_id) DO UPDATE SET
+        username = excluded.username,
+        last_joined = excluded.last_joined,
+        total_sessions = total_sessions + 1
+      RETURNING total_sessions
+    `)
+      .bind(userId, username, ts, ts)
+      .first();
+
+    const isNew = upsert && upsert.total_sessions === 1 ? 1 : 0;
+
+    await env.DB.prepare(`
+      INSERT INTO sessions (user_id, username, server_id, target, is_new, joined_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `)
+      .bind(userId, username, serverId, targetKey, isNew, ts)
+      .run();
+
+    return json({ ok: true, isNew: isNew === 1 });
+  }
+
+  await env.DB.prepare(`
+    UPDATE sessions
+    SET left_at = ?, duration_s = ? - joined_at
+    WHERE id = (
+      SELECT id FROM sessions
+      WHERE user_id = ? AND server_id = ? AND left_at IS NULL
+      ORDER BY joined_at DESC LIMIT 1
+    )
+  `)
+    .bind(ts, ts, userId, serverId)
+    .run();
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// Plus funnel ingestion
+// ============================================================================
+
+async function handlePlusEvent(type, body, ts, env) {
+  const targetKey = parseTarget(body.target);
+  const event = type === "plus_tap" ? "tap" : "purchase";
+
+  await env.DB.prepare(`
+    INSERT INTO plus_events
+      (event, user_id, username, server_id, target, source, already_plus, origin, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      event,
+      body.userId,
+      String(body.username || "").slice(0, 64),
+      body.serverId,
+      targetKey,
+      body.source ? String(body.source).slice(0, 32) : null,
+      body.alreadyPlus ? 1 : 0,
+      body.originExperience ? 1 : 0,
+      ts,
+    )
+    .run();
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// Feedback ingestion — mirror in-game feedback + dev replies into D1 so they
+// can be read from the admin panel anywhere. "feedback" upserts the player's
+// message; "feedback_reply" attaches the dev's reply to the same row.
+//
+// One row per (target, feedback_id). Wrapped in try/catch so a missing
+// `feedback` table (pre-migration) can never break event ingestion.
+//
+// Migration (run once in D1):
+//   CREATE TABLE IF NOT EXISTS feedback (
+//     target TEXT NOT NULL,
+//     feedback_id TEXT NOT NULL,
+//     user_id INTEGER,
+//     username TEXT,
+//     display_name TEXT,
+//     text TEXT,
+//     spam INTEGER DEFAULT 0,
+//     place_version INTEGER,
+//     reply TEXT,
+//     replied_at INTEGER,
+//     created_at INTEGER,
+//     PRIMARY KEY (target, feedback_id)
+//   );
+// ============================================================================
+
+async function handleFeedbackEvent(type, body, ts, env) {
+  const targetKey = parseTarget(body.target);
+  const feedbackId = body.feedbackId ? String(body.feedbackId).slice(0, 64) : null;
+  if (!feedbackId) return json({ error: "Missing feedbackId" }, 400);
+
+  try {
+    if (type === "feedback_reply") {
+      // Attach the dev's reply to the existing row (row should already exist,
+      // but UPSERT so a reply that arrives first still creates a stub).
+      await env.DB.prepare(`
+        INSERT INTO feedback (target, feedback_id, user_id, username, reply, replied_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target, feedback_id) DO UPDATE SET
+          reply = excluded.reply,
+          replied_at = excluded.replied_at
+      `)
+        .bind(
+          targetKey,
+          feedbackId,
+          body.userId || null,
+          String(body.username || "").slice(0, 64),
+          String(body.text || "").slice(0, 500),
+          ts,
+          ts,
+        )
+        .run();
+      return json({ ok: true });
+    }
+
+    // type === "feedback"
+    await env.DB.prepare(`
+      INSERT INTO feedback
+        (target, feedback_id, user_id, username, display_name, text, spam, place_version, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(target, feedback_id) DO UPDATE SET
+        text = excluded.text,
+        spam = excluded.spam
+    `)
+      .bind(
+        targetKey,
+        feedbackId,
+        body.userId || null,
+        String(body.username || "").slice(0, 64),
+        String(body.displayName || "").slice(0, 64),
+        String(body.text || "").slice(0, 500),
+        body.spam ? 1 : 0,
+        Number.parseInt(body.placeVersion, 10) || 0,
+        ts,
+      )
+      .run();
+    return json({ ok: true });
+  } catch (err) {
+    // feedback table not migrated yet — don't fail the whole ingest pipe.
+    return json({ ok: true, warning: "feedback table unavailable" });
+  }
+}
+
+// ============================================================================
+// Coin economy ingestion — faucet (earn) vs sink (spend)
+// ============================================================================
+
+async function handleCoinEvent(type, body, ts, env) {
+  const targetKey = parseTarget(body.target);
+  const direction = type === "coin_earn" ? "earn" : "spend";
+  const amount = Math.abs(Number.parseInt(body.amount, 10) || 0);
+  if (amount <= 0) {
+    return json({ error: "amount must be a positive integer" }, 400);
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO coin_events
+      (direction, amount, source, user_id, username, server_id, target, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      direction,
+      amount,
+      body.source ? String(body.source).slice(0, 32) : null,
+      body.userId,
+      String(body.username || "").slice(0, 64),
+      body.serverId,
+      targetKey,
+      ts,
+    )
+    .run();
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// Shop ingestion — funnel opens + completed purchases (per item)
+// ============================================================================
+
+async function handleShopEvent(type, body, ts, env) {
+  const targetKey = parseTarget(body.target);
+  const event = type === "shop_open" ? "open" : "purchase";
+  const price = Math.max(0, Number.parseInt(body.price, 10) || 0);
+
+  await env.DB.prepare(`
+    INSERT INTO shop_events
+      (event, item_id, item_kind, currency, price, user_id, username, server_id, target, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      event,
+      body.itemId ? String(body.itemId).slice(0, 48) : null,
+      body.itemKind ? String(body.itemKind).slice(0, 32) : null,
+      body.currency ? String(body.currency).slice(0, 16) : null,
+      price,
+      body.userId,
+      String(body.username || "").slice(0, 64),
+      body.serverId,
+      targetKey,
+      ts,
+    )
+    .run();
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// Daily-reward claim ingestion — one row per claim (streak, type, set, coins)
+// ============================================================================
+
+async function handleDailyClaim(body, ts, env) {
+  const targetKey = parseTarget(body.target);
+  const rewardType = body.rewardType === "block_set" ? "block_set" : "coins";
+
+  await env.DB.prepare(`
+    INSERT INTO daily_claims
+      (user_id, username, streak, reward_type, set_name, coin_amount, server_id, target, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      body.userId,
+      String(body.username || "").slice(0, 64),
+      Number.parseInt(body.streak, 10) || 0,
+      rewardType,
+      body.setName ? String(body.setName).slice(0, 48) : null,
+      Math.max(0, Number.parseInt(body.coinAmount, 10) || 0),
+      body.serverId,
+      targetKey,
+      ts,
+    )
+    .run();
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// Milestone ingestion — onboarding funnel. One row per (user, milestone) ever;
+// the UNIQUE index dedupes so the client/server can fire freely.
+// ============================================================================
+
+async function handleMilestone(body, ts, env) {
+  const targetKey = parseTarget(body.target);
+  const milestone = String(body.milestone || "").slice(0, 32);
+  if (!milestone) return json({ error: "Missing milestone" }, 400);
+
+  await env.DB.prepare(`
+    INSERT INTO milestones (target, user_id, milestone, username, reached_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(target, user_id, milestone) DO NOTHING
+  `)
+    .bind(
+      targetKey,
+      body.userId,
+      milestone,
+      String(body.username || "").slice(0, 64),
+      ts,
+    )
+    .run();
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// Plot-slot count snapshot — one row per player, latest count of filled save
+// slots. Upserted on each manual save so the distribution stays current.
+// ============================================================================
+
+async function handleSlotCount(body, ts, env) {
+  const targetKey = parseTarget(body.target);
+  const slotCount = Math.max(0, Number.parseInt(body.slotCount, 10) || 0);
+
+  await env.DB.prepare(`
+    INSERT INTO player_slots (target, user_id, username, slot_count, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(target, user_id) DO UPDATE SET
+      username = excluded.username,
+      slot_count = excluded.slot_count,
+      updated_at = excluded.updated_at
+  `)
+    .bind(
+      targetKey,
+      body.userId,
+      String(body.username || "").slice(0, 64),
+      slotCount,
+      ts,
+    )
+    .run();
+
+  // Snapshot the current saves-per-player distribution into slots_history for
+  // today — best-effort so a missing table can't break ingestion.
+  try {
+    const today = localDateStr();
+    const agg = await env.DB.prepare(
+      "SELECT COUNT(*) AS total, AVG(slot_count) AS avg_slots, AVG(CASE WHEN slot_count > 1 THEN 1.0 ELSE 0.0 END) * 100 AS multi_rate FROM player_slots WHERE target = ?",
+    ).bind(targetKey).first();
+    if (agg && agg.total > 0) {
+      await env.DB.prepare(`
+        INSERT INTO slots_history (target, date, total_players, avg_slots, multi_slot_rate, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target, date) DO UPDATE SET
+          total_players = excluded.total_players,
+          avg_slots = excluded.avg_slots,
+          multi_slot_rate = excluded.multi_slot_rate,
+          updated_at = excluded.updated_at
+      `).bind(
+        targetKey, today, agg.total,
+        Math.round((agg.avg_slots || 0) * 100) / 100,
+        Math.round((agg.multi_rate || 0) * 10) / 10,
+        ts,
+      ).run();
+    }
+  } catch (err) {
+    // slots_history not migrated yet — ingest still OK.
+  }
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// /heartbeat — Roblox servers post their current player snapshot every ~30s
+// ============================================================================
+
+async function handleHeartbeat(request, env) {
+  const ingest = request.headers.get("X-Ingest-Token");
+  if (!ingest || ingest !== env.INGEST_TOKEN) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const { serverId, target, uptimeSeconds, players } = body;
+  if (!serverId || !target || !Array.isArray(players)) {
+    return json({ error: "Missing serverId/target/players" }, 400);
+  }
+
+  const playersJson = JSON.stringify(players);
+  if (playersJson.length > 64000) {
+    return json({ error: "Player list too large" }, 400);
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO live_servers (server_id, target, player_count, players_json, uptime_seconds, last_heartbeat)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(server_id) DO UPDATE SET
+      target = excluded.target,
+      player_count = excluded.player_count,
+      players_json = excluded.players_json,
+      uptime_seconds = excluded.uptime_seconds,
+      last_heartbeat = excluded.last_heartbeat
+  `)
+    .bind(
+      serverId,
+      String(target).toLowerCase(),
+      players.length,
+      playersJson,
+      uptimeSeconds || 0,
+      nowUnix(),
+    )
+    .run();
+
+  // Track today's live-player high-water mark straight from real heartbeats.
+  // Sum the current player count across all fresh servers for this target and
+  // keep the per-day max. Wrapped so a missing daily_peaks table (pre-migration)
+  // can never break heartbeat ingestion.
+  try {
+    const targetKey = String(target).toLowerCase();
+    const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+    const totals = await env.DB.prepare(
+      "SELECT COUNT(*) AS servers, COALESCE(SUM(player_count), 0) AS players FROM live_servers WHERE target = ? AND last_heartbeat >= ?",
+    )
+      .bind(targetKey, freshAfter)
+      .first();
+
+    const livePlayers = (totals && totals.players) || 0;
+    const liveServers = (totals && totals.servers) || 0;
+    const today = localDateStr();
+
+    await env.DB.prepare(`
+      INSERT INTO daily_peaks (target, date, peak, servers, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(target, date) DO UPDATE SET
+        servers = CASE WHEN excluded.peak >= peak THEN excluded.servers ELSE servers END,
+        peak = MAX(peak, excluded.peak),
+        updated_at = excluded.updated_at
+    `)
+      .bind(targetKey, today, livePlayers, liveServers, nowUnix())
+      .run();
+  } catch (err) {
+    // daily_peaks not migrated yet — analytics is best-effort, heartbeat still OK.
+  }
+
+  // Sample the current cross-server engagement (avg coins/likes/playtime/streak)
+  // into engagement_history. Throttled like the live GC so it costs little, and
+  // best-effort so a missing table can't break heartbeats.
+  try {
+    if (Math.random() < 0.1) {
+      const targetKey = String(target).toLowerCase();
+      const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+      const snap = await env.DB.prepare(
+        "SELECT players_json FROM live_servers WHERE target = ? AND last_heartbeat >= ?",
+      ).bind(targetKey, freshAfter).all();
+      let n = 0, coins = 0, likes = 0, pt = 0, streak = 0, maxC = 0, maxS = 0;
+      for (const row of (snap.results || [])) {
+        let ps = [];
+        try { ps = JSON.parse(row.players_json || "[]"); } catch { ps = []; }
+        for (const p of ps) {
+          n++;
+          coins += p.coins || 0;
+          likes += p.likes || 0;
+          pt += p.playTime || 0;
+          streak += p.streak || 0;
+          if ((p.coins || 0) > maxC) maxC = p.coins || 0;
+          if ((p.streak || 0) > maxS) maxS = p.streak || 0;
+        }
+      }
+      if (n > 0) {
+        const today = localDateStr();
+        await env.DB.prepare(`
+          INSERT INTO engagement_history
+            (target, date, players, avg_coins, avg_likes, avg_playtime, avg_streak, max_coins, max_streak, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(target, date) DO UPDATE SET
+            players = excluded.players,
+            avg_coins = excluded.avg_coins,
+            avg_likes = excluded.avg_likes,
+            avg_playtime = excluded.avg_playtime,
+            avg_streak = excluded.avg_streak,
+            max_coins = MAX(max_coins, excluded.max_coins),
+            max_streak = MAX(max_streak, excluded.max_streak),
+            updated_at = excluded.updated_at
+        `).bind(
+          targetKey, today, n,
+          Math.round((coins / n) * 100) / 100,
+          Math.round((likes / n) * 100) / 100,
+          Math.round((pt / n) * 100) / 100,
+          Math.round((streak / n) * 100) / 100,
+          maxC, maxS, nowUnix(),
+        ).run();
+      }
+    }
+  } catch (err) {
+    // engagement_history not migrated yet — heartbeat still OK.
+  }
+
+  return json({ ok: true });
+}
+
+// ============================================================================
+// /stats/live — read fresh heartbeats and aggregate
+// ============================================================================
+
+async function handleStatsLive(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+  const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+
+  // The freshness filter below already hides stale servers from the result, so the
+  // GC delete is pure housekeeping. Run it occasionally instead of on every poll.
+  if (Math.random() < 0.05) {
+    await env.DB.prepare("DELETE FROM live_servers WHERE last_heartbeat < ?")
+      .bind(nowUnix() - 300)
+      .run();
+  }
+
+  const result = await env.DB.prepare(`
+    SELECT server_id, player_count, players_json, uptime_seconds, last_heartbeat
+    FROM live_servers
+    WHERE target = ? AND last_heartbeat >= ?
+    ORDER BY last_heartbeat DESC
+  `)
+    .bind(target, freshAfter)
+    .all();
+
+  const rows = result.results || [];
+  let totalPlayers = 0;
+  const allPlayers = [];
+  const servers = [];
+
+  for (const r of rows) {
+    let players = [];
+    try {
+      players = JSON.parse(r.players_json || "[]");
+    } catch {
+      players = [];
+    }
+
+    totalPlayers += players.length;
+
+    for (const p of players) {
+      allPlayers.push({
+        userId: p.userId,
+        username: p.username,
+        isNew: !!p.isNew,
+        playTime: p.playTime || 0,
+        likes: p.likes || 0,
+        coins: p.coins || 0,
+        streak: p.streak || 0,
+        serverId: r.server_id,
+      });
+    }
+
+    servers.push({
+      serverId: r.server_id,
+      playerCount: r.player_count,
+      uptimeSeconds: r.uptime_seconds,
+      ageSeconds: nowUnix() - r.last_heartbeat,
+    });
+  }
+
+  return json({
+    target,
+    placeId: PLACES[target] || null,
+    serverCount: rows.length,
+    playerCount: totalPlayers,
+    players: allPlayers,
+    servers,
+  });
+}
+
+// ============================================================================
+// /thumbnails — proxy Roblox avatar headshots (browser can't hit Roblox directly
+// due to CORS). Returns a { userId: imageUrl } map. Admin-token protected.
+// ============================================================================
+
+async function handleThumbnails(_request, env, url) {
+  const ids = (url.searchParams.get("userIds") || "")
+    .split(",").map((s) => s.trim()).filter(Boolean).slice(0, 100);
+  if (!ids.length) return json({ thumbnails: {} });
+
+  const api = "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds="
+    + ids.join(",") + "&size=150x150&format=Png&isCircular=false";
+  try {
+    const res = await fetch(api, { headers: { Accept: "application/json" } });
+    if (!res.ok) return json({ thumbnails: {}, error: "roblox " + res.status });
+    const data = await res.json();
+    const out = {};
+    for (const d of (data.data || [])) {
+      if (d.state === "Completed" && d.imageUrl) out[String(d.targetId)] = d.imageUrl;
+    }
+    return json({ thumbnails: out });
+  } catch (err) {
+    return json({ thumbnails: {}, error: err.message });
+  }
+}
+
+// ============================================================================
+// /stats/daily — daily session counts split new/returning
+// ============================================================================
+
+async function handleStatsDaily(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const result = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', joined_at, 'unixepoch', '${TZ_SQL}') AS date,
+      SUM(CASE WHEN is_new = 1 THEN 1 ELSE 0 END) AS new_count,
+      SUM(CASE WHEN is_new = 0 THEN 1 ELSE 0 END) AS returning_count,
+      COUNT(DISTINCT user_id) AS unique_users
+    FROM sessions
+    WHERE joined_at >= ? AND target = ?
+    GROUP BY date
+    ORDER BY date ASC
+  `)
+    .bind(cutoff, target)
+    .all();
+
+  return json({ target, days, rows: result.results || [] });
+}
+
+// ============================================================================
+// /stats/concurrency — peak concurrency per UTC hour
+// ============================================================================
+
+async function handleStatsConcurrency(_request, env, url) {
+  const days = parseDays(url, 7);
+  const target = parseTarget(url.searchParams.get("target"));
+  const nowS = nowUnix();
+  const startS = nowS - days * 86400;
+
+  // Pull just the sessions overlapping the window in one indexed range scan, then
+  // bucket them in JS with a difference array. This replaces the old recursive-CTE
+  // approach that ran one correlated COUNT(*) per hour (~720 scans at 30d, 2160 at 90d).
+  const result = await env.DB.prepare(`
+    SELECT joined_at, left_at
+    FROM sessions
+    WHERE target = ?
+      AND joined_at < ?
+      AND (left_at IS NULL OR left_at >= ?)
+  `)
+    .bind(target, nowS, startS)
+    .all();
+
+  const sessions = result.results || [];
+  const bucketCount = Math.ceil((nowS - startS) / 3600);
+  const diff = new Array(bucketCount + 1).fill(0);
+
+  for (const s of sessions) {
+    // Bucket h covers [startS + h*3600, startS + (h+1)*3600). A session counts in h if
+    // joined_at <= hourStart+3600 AND (effective end >= hourStart). Never-closed
+    // sessions are capped so a dropped `leave` doesn't keep counting indefinitely.
+    const effEnd = s.left_at == null ? (s.joined_at + MAX_OPEN_SESSION_SECONDS) : s.left_at;
+    let hLo = Math.ceil((s.joined_at - 3600 - startS) / 3600);
+    if (hLo < 0) hLo = 0;
+    let hHi = Math.floor((effEnd - startS) / 3600);
+    if (hHi > bucketCount - 1) hHi = bucketCount - 1;
+    if (hHi < hLo) continue;
+    diff[hLo] += 1;
+    diff[hHi + 1] -= 1;
+  }
+
+  const rows = [];
+  let running = 0;
+  for (let h = 0; h < bucketCount; h++) {
+    running += diff[h];
+    const hourStart = startS + h * 3600;
+    rows.push({
+      hour: new Date(hourStart * 1000).toISOString().slice(0, 13) + ":00:00Z",
+      concurrent: running,
+    });
+  }
+
+  return json({ target, days, rows });
+}
+
+// ============================================================================
+// /stats/daily-peak — highest concurrent players reached each UTC day
+// ============================================================================
+
+async function handleStatsDailyPeak(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const nowS = nowUnix();
+  const startS = nowS - days * 86400;
+  const dayKey = (t) => localDateStr(t);
+
+  // Accurate source: live high-water marks recorded directly from heartbeats.
+  const trackedByDate = new Map();
+  try {
+    const tracked = await env.DB.prepare(
+      "SELECT date, peak, servers FROM daily_peaks WHERE target = ? AND date >= ?",
+    )
+      .bind(target, dayKey(startS))
+      .all();
+    for (const r of (tracked.results || [])) trackedByDate.set(r.date, r);
+  } catch (err) {
+    // daily_peaks not migrated yet — fall back entirely to the session estimate.
+  }
+
+  // Fallback for days that predate live tracking: estimate from sessions, capping
+  // never-closed sessions so dropped 'leave' events don't inflate the count.
+  const result = await env.DB.prepare(`
+    SELECT joined_at, left_at
+    FROM sessions
+    WHERE target = ?
+      AND joined_at < ?
+      AND (left_at IS NULL OR left_at >= ?)
+  `)
+    .bind(target, nowS, startS)
+    .all();
+
+  const sessions = result.results || [];
+  const events = [];
+  for (const s of sessions) {
+    const arrive = Math.max(s.joined_at, startS);
+    const depart = Math.min(s.left_at == null ? (s.joined_at + MAX_OPEN_SESSION_SECONDS) : s.left_at, nowS);
+    if (depart <= arrive) continue;
+    events.push([arrive, 1]);
+    events.push([depart, -1]);
+  }
+  events.sort((a, b) => (a[0] - b[0]) || (b[1] - a[1]));
+
+  const estByDate = new Map();
+  let current = 0;
+  let prevT = startS;
+  const recordSpan = (t0, t1, count) => {
+    if (count <= 0 || t1 <= t0) return;
+    for (let dayStart = Math.floor(t0 / 86400) * 86400; dayStart < t1; dayStart += 86400) {
+      const k = dayKey(dayStart);
+      if (count > (estByDate.get(k) || 0)) estByDate.set(k, count);
+    }
+  };
+  for (const [t, delta] of events) {
+    recordSpan(prevT, t, current);
+    current += delta;
+    prevT = t;
+  }
+  recordSpan(prevT, nowS, current);
+
+  // One row per day: use the measured high-water mark when we have it, otherwise
+  // the session-based estimate. `tracked` lets the UI flag estimated days.
+  const rows = [];
+  const firstDay = Math.floor(startS / 86400) * 86400;
+  for (let d = firstDay; d < nowS; d += 86400) {
+    const k = dayKey(d);
+    const t = trackedByDate.get(k);
+    rows.push(t
+      ? { date: k, peak: t.peak, servers: t.servers, tracked: true }
+      : { date: k, peak: estByDate.get(k) || 0, tracked: false });
+  }
+
+  return json({ target, days, rows });
+}
+
+// ============================================================================
+// /stats/retention — day-N retention by daily cohort
+// ============================================================================
+
+async function handleStatsRetention(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const result = await env.DB.prepare(`
+    WITH cohorts AS (
+      SELECT
+        strftime('%Y-%m-%d', first_joined, 'unixepoch', '${TZ_SQL}') AS cohort_date,
+        user_id,
+        first_joined
+      FROM users
+      WHERE first_joined >= ?
+    )
+    SELECT
+      c.cohort_date,
+      COUNT(DISTINCT c.user_id) AS cohort_size,
+      COUNT(DISTINCT CASE WHEN s1.user_id IS NOT NULL THEN c.user_id END) AS d1,
+      COUNT(DISTINCT CASE WHEN s7.user_id IS NOT NULL THEN c.user_id END) AS d7,
+      COUNT(DISTINCT CASE WHEN s30.user_id IS NOT NULL THEN c.user_id END) AS d30
+    FROM cohorts c
+    LEFT JOIN sessions s1
+      ON s1.user_id = c.user_id
+     AND s1.target = ?
+     AND s1.joined_at >= c.first_joined + 86400
+     AND s1.joined_at <  c.first_joined + 172800
+    LEFT JOIN sessions s7
+      ON s7.user_id = c.user_id
+     AND s7.target = ?
+     AND s7.joined_at >= c.first_joined + 604800
+     AND s7.joined_at <  c.first_joined + 691200
+    LEFT JOIN sessions s30
+      ON s30.user_id = c.user_id
+     AND s30.target = ?
+     AND s30.joined_at >= c.first_joined + 2592000
+     AND s30.joined_at <  c.first_joined + 2678400
+    GROUP BY c.cohort_date
+    ORDER BY c.cohort_date ASC
+  `)
+    .bind(cutoff, target, target, target)
+    .all();
+
+  return json({ target, days, rows: result.results || [] });
+}
+
+// ============================================================================
+// /feedback — read mirrored feedback (admin-token protected). Returns newest
+// first, split-friendly: each row carries a `spam` flag and optional `reply`.
+//   ?filter=inbox (default) | spam | all
+// ============================================================================
+
+async function handleFeedbackRead(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+  const filter = String(url.searchParams.get("filter") || "inbox").toLowerCase();
+
+  let where = "target = ?";
+  if (filter === "inbox") where += " AND spam = 0";
+  else if (filter === "spam") where += " AND spam = 1";
+
+  try {
+    const result = await env.DB.prepare(`
+      SELECT feedback_id, user_id, username, display_name, text, spam,
+             place_version, reply, replied_at, created_at
+      FROM feedback
+      WHERE ${where}
+      ORDER BY created_at DESC
+      LIMIT 200
+    `)
+      .bind(target)
+      .all();
+
+    return json({ target, filter, rows: result.results || [] });
+  } catch (err) {
+    return json({ target, filter, rows: [], error: "feedback table unavailable" });
+  }
+}
+
+// ============================================================================
+// /feedback/reply — send a reply to a player's feedback FROM the admin panel
+// (admin-token protected, POST). This:
+//   1. writes reply + replied_at onto the D1 feedback row, and
+//   2. publishes a `feedbackreply` message on the AdminCommands topic so the
+//      live game persists the reply to the player's DataStore and notifies them
+//      instantly if they're online.
+// Body: { feedbackId: string, text: string }   (target via ?target= or body)
+// ============================================================================
+
+async function handleFeedbackReplySend(request, env, url) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const targetKey = parseTarget(url.searchParams.get("target") || body.target);
+  const feedbackId = body.feedbackId ? String(body.feedbackId).slice(0, 64) : "";
+  let text = String(body.text == null ? "" : body.text).trim().slice(0, 500);
+
+  if (!feedbackId) return json({ error: "Missing feedbackId" }, 400);
+  if (!text) return json({ error: "Reply text is empty" }, 400);
+
+  // Look up the row so we know who to deliver to.
+  let row;
+  try {
+    row = await env.DB.prepare(`
+      SELECT user_id, username FROM feedback
+      WHERE target = ? AND feedback_id = ?
+    `)
+      .bind(targetKey, feedbackId)
+      .first();
+  } catch (err) {
+    return json({ error: "feedback table unavailable" }, 500);
+  }
+  if (!row) return json({ error: "Feedback not found" }, 404);
+
+  const repliedAt = nowUnix();
+
+  // 1. Persist the reply onto the mirrored row.
+  try {
+    await env.DB.prepare(`
+      UPDATE feedback SET reply = ?, replied_at = ?
+      WHERE target = ? AND feedback_id = ?
+    `)
+      .bind(text, repliedAt, targetKey, feedbackId)
+      .run();
+  } catch (err) {
+    return json({ error: "Failed to save reply" }, 500);
+  }
+
+  // 2. Push to the live game so it reaches the player.
+  const universeId = UNIVERSES[targetKey];
+  if (!universeId) {
+    return json({ error: `Unknown target '${targetKey}'`, valid: Object.keys(UNIVERSES) }, 400);
+  }
+
+  const message = JSON.stringify({
+    command: "feedbackreply",
+    payload: {
+      feedbackId,
+      userId: row.user_id || null,
+      text,
+      repliedAt,
+    },
+    timestamp: Date.now(),
+  });
+
+  if (message.length > 1024) {
+    return json({ error: "Reply too long to deliver" }, 400);
+  }
+
+  let delivered = false;
+  let deliverError = null;
+  try {
+    const robloxRes = await fetch(
+      `https://apis.roblox.com/messaging-service/v1/universes/${universeId}/topics/${TOPIC}`,
+      {
+        method: "POST",
+        headers: {
+          "x-api-key": env.ROBLOX_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ message }),
+      },
+    );
+    delivered = robloxRes.ok;
+    if (!robloxRes.ok) deliverError = `Roblox API ${robloxRes.status}`;
+  } catch (err) {
+    deliverError = String(err);
+  }
+
+  // The reply is saved either way; `delivered` just notes whether the live
+  // push went out (offline players still get it next time they open feedback).
+  return json({ success: true, target: targetKey, feedbackId, repliedAt, delivered, deliverError });
+}
+
+// ============================================================================
+// /stats/plus — Roblox Plus funnel summary
+// ============================================================================
+
+async function handleStatsPlus(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const totals = await env.DB.prepare(`
+    SELECT
+      SUM(CASE WHEN event = 'tap' THEN 1 ELSE 0 END)                      AS taps,
+      COUNT(DISTINCT CASE WHEN event = 'tap' THEN user_id END)            AS unique_tappers,
+      SUM(CASE WHEN event = 'tap' AND already_plus = 0 THEN 1 ELSE 0 END) AS prospect_taps,
+      SUM(CASE WHEN event = 'purchase' THEN 1 ELSE 0 END)                 AS purchases,
+      SUM(CASE WHEN event = 'purchase' AND origin = 1 THEN 1 ELSE 0 END)  AS origin_purchases
+    FROM plus_events
+    WHERE target = ? AND created_at >= ?
+  `)
+    .bind(target, cutoff)
+    .first();
+
+  const taps = (totals && totals.taps) || 0;
+  const purchases = (totals && totals.purchases) || 0;
+  const originPurchases = (totals && totals.origin_purchases) || 0;
+  const conversionRate = taps > 0 ? Math.round((originPurchases / taps) * 10000) / 100 : 0;
+
+  const daily = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', created_at, 'unixepoch', '${TZ_SQL}') AS date,
+      SUM(CASE WHEN event = 'tap' THEN 1 ELSE 0 END) AS taps,
+      SUM(CASE WHEN event = 'purchase' AND origin = 1 THEN 1 ELSE 0 END) AS purchases
+    FROM plus_events
+    WHERE target = ? AND created_at >= ?
+    GROUP BY date
+    ORDER BY date ASC
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  const sources = await env.DB.prepare(`
+    SELECT COALESCE(source, 'unknown') AS source, COUNT(*) AS count
+    FROM plus_events
+    WHERE target = ? AND created_at >= ? AND event = 'tap'
+    GROUP BY source
+    ORDER BY count DESC
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  return json({
+    target,
+    days,
+    taps,
+    uniqueTappers: (totals && totals.unique_tappers) || 0,
+    prospectTaps: (totals && totals.prospect_taps) || 0,
+    purchases,
+    originPurchases,
+    conversionRate,
+    rows: daily.results || [],
+    sources: sources.results || [],
+  });
+}
+
+// ============================================================================
+// /stats/economy — coin faucet vs sink
+// ============================================================================
+
+async function handleStatsEconomy(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const daily = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', created_at, 'unixepoch', '${TZ_SQL}') AS date,
+      SUM(CASE WHEN direction = 'earn'  THEN amount ELSE 0 END) AS earned,
+      SUM(CASE WHEN direction = 'spend' THEN amount ELSE 0 END) AS spent
+    FROM coin_events
+    WHERE target = ? AND created_at >= ?
+    GROUP BY date
+    ORDER BY date ASC
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  const totals = await env.DB.prepare(`
+    SELECT
+      SUM(CASE WHEN direction = 'earn'  THEN amount ELSE 0 END) AS earned,
+      SUM(CASE WHEN direction = 'spend' THEN amount ELSE 0 END) AS spent
+    FROM coin_events
+    WHERE target = ? AND created_at >= ?
+  `)
+    .bind(target, cutoff)
+    .first();
+
+  // Collapse per-player like payouts ("vote_from_<username>") into a single
+  // "LIKES" bucket so the breakdown shows one summed Likes row instead of
+  // hundreds of per-voter rows. Existing "likes" sources fold in too.
+  const sources = await env.DB.prepare(`
+    SELECT
+      direction,
+      CASE
+        WHEN LOWER(COALESCE(source, '')) LIKE 'vote_from%' THEN 'LIKES'
+        WHEN LOWER(COALESCE(source, '')) = 'likes' THEN 'LIKES'
+        ELSE COALESCE(source, 'unknown')
+      END AS source,
+      SUM(amount) AS total
+    FROM coin_events
+    WHERE target = ? AND created_at >= ?
+    GROUP BY direction, source
+    ORDER BY total DESC
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  const earned = (totals && totals.earned) || 0;
+  const spent = (totals && totals.spent) || 0;
+
+  return json({
+    target,
+    days,
+    earned,
+    spent,
+    net: earned - spent,
+    rows: daily.results || [],
+    sources: sources.results || [],
+  });
+}
+
+// ============================================================================
+// /stats/active — DAU / WAU / MAU (rolling unique users) + stickiness
+// ============================================================================
+
+async function handleStatsActive(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const nowS = nowUnix();
+  const dayKey = (t) => localDateStr(t);
+
+  // Display window starts at a UTC midnight; pull 29 extra days so the rolling
+  // 30-day MAU is correct even on the earliest displayed day.
+  const displayStart = Math.floor((nowS - days * 86400) / 86400) * 86400;
+  const fetchStart = displayStart - 29 * 86400;
+
+  const result = await env.DB.prepare(`
+    SELECT DISTINCT user_id, strftime('%Y-%m-%d', joined_at, 'unixepoch', '${TZ_SQL}') AS day
+    FROM sessions
+    WHERE target = ? AND joined_at >= ?
+  `)
+    .bind(target, fetchStart)
+    .all();
+
+  // day -> Set(user_id)
+  const byDay = new Map();
+  for (const r of (result.results || [])) {
+    if (!byDay.has(r.day)) byDay.set(r.day, new Set());
+    byDay.get(r.day).add(r.user_id);
+  }
+
+  const rows = [];
+  for (let d = displayStart; d < nowS; d += 86400) {
+    const dau = (byDay.get(dayKey(d)) || new Set()).size;
+    const wau = new Set();
+    const mau = new Set();
+    for (let k = 0; k < 30; k++) {
+      const s = byDay.get(dayKey(d - k * 86400));
+      if (!s) continue;
+      if (k < 7) for (const u of s) wau.add(u);
+      for (const u of s) mau.add(u);
+    }
+    const stickiness = mau.size > 0 ? Math.round((dau / mau.size) * 100) : 0;
+    rows.push({ date: dayKey(d), dau, wau: wau.size, mau: mau.size, stickiness });
+  }
+
+  const current = rows.length ? rows[rows.length - 1] : { dau: 0, wau: 0, mau: 0, stickiness: 0 };
+  return json({ target, days, current, rows });
+}
+
+// ============================================================================
+// /stats/shop — shop funnel (opens -> purchases) + per-item sales
+// ============================================================================
+
+async function handleStatsShop(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const totals = await env.DB.prepare(`
+    SELECT
+      SUM(CASE WHEN event = 'open' THEN 1 ELSE 0 END)               AS opens,
+      COUNT(DISTINCT CASE WHEN event = 'open' THEN user_id END)     AS unique_openers,
+      SUM(CASE WHEN event = 'purchase' THEN 1 ELSE 0 END)           AS purchases,
+      COUNT(DISTINCT CASE WHEN event = 'purchase' THEN user_id END) AS unique_buyers,
+      SUM(CASE WHEN event = 'purchase' THEN price ELSE 0 END)       AS revenue
+    FROM shop_events
+    WHERE target = ? AND created_at >= ?
+  `)
+    .bind(target, cutoff)
+    .first();
+
+  const items = await env.DB.prepare(`
+    SELECT
+      COALESCE(item_id, 'unknown') AS item_id,
+      COALESCE(item_kind, 'unknown') AS item_kind,
+      COALESCE(currency, 'unknown') AS currency,
+      COUNT(*) AS purchases,
+      SUM(price) AS revenue
+    FROM shop_events
+    WHERE target = ? AND created_at >= ? AND event = 'purchase'
+    GROUP BY item_id
+    ORDER BY purchases DESC
+    LIMIT 50
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  const daily = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', created_at, 'unixepoch', '${TZ_SQL}') AS date,
+      SUM(CASE WHEN event = 'open' THEN 1 ELSE 0 END) AS opens,
+      SUM(CASE WHEN event = 'purchase' THEN 1 ELSE 0 END) AS purchases
+    FROM shop_events
+    WHERE target = ? AND created_at >= ?
+    GROUP BY date
+    ORDER BY date ASC
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  const opens = (totals && totals.opens) || 0;
+  const purchases = (totals && totals.purchases) || 0;
+  const conversionRate = opens > 0 ? Math.round((purchases / opens) * 10000) / 100 : 0;
+
+  return json({
+    target,
+    days,
+    opens,
+    uniqueOpeners: (totals && totals.unique_openers) || 0,
+    purchases,
+    uniqueBuyers: (totals && totals.unique_buyers) || 0,
+    revenue: (totals && totals.revenue) || 0,
+    conversionRate,
+    items: items.results || [],
+    rows: daily.results || [],
+  });
+}
+
+// ============================================================================
+// /stats/daily-claims — daily-reward claim detail (type split, sets, streaks)
+// ============================================================================
+
+async function handleStatsDailyClaims(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const totals = await env.DB.prepare(`
+    SELECT
+      COUNT(*)                                                    AS claims,
+      COUNT(DISTINCT user_id)                                     AS unique_claimers,
+      SUM(CASE WHEN reward_type = 'block_set' THEN 1 ELSE 0 END)  AS block_drops,
+      SUM(coin_amount)                                            AS coins
+    FROM daily_claims
+    WHERE target = ? AND created_at >= ?
+  `)
+    .bind(target, cutoff)
+    .first();
+
+  const daily = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', created_at, 'unixepoch', '${TZ_SQL}') AS date,
+      SUM(CASE WHEN reward_type = 'coins' THEN 1 ELSE 0 END)     AS coin_claims,
+      SUM(CASE WHEN reward_type = 'block_set' THEN 1 ELSE 0 END) AS block_claims
+    FROM daily_claims
+    WHERE target = ? AND created_at >= ?
+    GROUP BY date
+    ORDER BY date ASC
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  const sets = await env.DB.prepare(`
+    SELECT set_name, COUNT(*) AS drops
+    FROM daily_claims
+    WHERE target = ? AND created_at >= ? AND reward_type = 'block_set' AND set_name IS NOT NULL
+    GROUP BY set_name
+    ORDER BY drops DESC
+    LIMIT 20
+  `)
+    .bind(target, cutoff)
+    .all();
+
+  const claims = (totals && totals.claims) || 0;
+  const blockDrops = (totals && totals.block_drops) || 0;
+
+  return json({
+    target,
+    days,
+    claims,
+    uniqueClaimers: (totals && totals.unique_claimers) || 0,
+    blockDrops,
+    blockRate: claims > 0 ? Math.round((blockDrops / claims) * 10000) / 100 : 0,
+    coins: (totals && totals.coins) || 0,
+    rows: daily.results || [],
+    sets: sets.results || [],
+  });
+}
+
+// ============================================================================
+// /stats/onboarding — new-player activation funnel: join -> first block -> save
+// ============================================================================
+
+async function handleStatsOnboarding(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const joins = await env.DB.prepare(
+    "SELECT COUNT(DISTINCT user_id) AS c FROM sessions WHERE target = ? AND is_new = 1 AND joined_at >= ?",
+  ).bind(target, cutoff).first();
+
+  const fb = await env.DB.prepare(
+    "SELECT COUNT(DISTINCT user_id) AS c FROM milestones WHERE target = ? AND milestone = 'first_block' AND reached_at >= ?",
+  ).bind(target, cutoff).first();
+
+  const fs = await env.DB.prepare(
+    "SELECT COUNT(DISTINCT user_id) AS c FROM milestones WHERE target = ? AND milestone = 'first_save' AND reached_at >= ?",
+  ).bind(target, cutoff).first();
+
+  const joined = (joins && joins.c) || 0;
+  const firstBlock = (fb && fb.c) || 0;
+  const firstSave = (fs && fs.c) || 0;
+
+  return json({
+    target,
+    days,
+    joined,
+    firstBlock,
+    firstSave,
+    blockRate: joined > 0 ? Math.round((firstBlock / joined) * 10000) / 100 : 0,
+    saveRate: joined > 0 ? Math.round((firstSave / joined) * 10000) / 100 : 0,
+  });
+}
+
+// ============================================================================
+// /stats/slots — distribution of how many save slots each player has filled
+// ============================================================================
+
+async function handleStatsSlots(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+
+  const result = await env.DB.prepare(`
+    SELECT slot_count, COUNT(*) AS players
+    FROM player_slots
+    WHERE target = ? AND slot_count >= 1
+    GROUP BY slot_count
+    ORDER BY slot_count ASC
+  `)
+    .bind(target)
+    .all();
+
+  const dist = result.results || [];
+  let totalPlayers = 0;
+  let totalSlots = 0;
+  let multiSlot = 0;
+  let maxSlot = 0;
+  for (const r of dist) {
+    totalPlayers += r.players;
+    totalSlots += r.slot_count * r.players;
+    if (r.slot_count >= 2) multiSlot += r.players;
+    if (r.slot_count > maxSlot) maxSlot = r.slot_count;
+  }
+
+  return json({
+    target,
+    totalPlayers,
+    maxSlot,
+    avgSlots: totalPlayers > 0 ? Math.round((totalSlots / totalPlayers) * 100) / 100 : 0,
+    multiSlotRate: totalPlayers > 0 ? Math.round((multiSlot / totalPlayers) * 10000) / 100 : 0,
+    rows: dist,
+  });
+}
+
+// ============================================================================
+// /blocks/top — Roblox posts the top globally-placed blocks
+// ============================================================================
+
+async function handleTopBlocksIngest(request, env) {
+  const ingest = request.headers.get("X-Ingest-Token");
+  if (!ingest || ingest !== env.INGEST_TOKEN) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const { target, blocks } = body;
+  if (!target || !Array.isArray(blocks)) {
+    return json({ error: "Missing target/blocks" }, 400);
+  }
+  if (blocks.length > 50) {
+    return json({ error: "Too many blocks (max 50)" }, 400);
+  }
+
+  const targetKey = String(target).toLowerCase();
+  const ts = nowUnix();
+
+  const statements = blocks.map((b) => env.DB.prepare(`
+    INSERT INTO top_blocks (target, block_name, count, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(target, block_name) DO UPDATE SET
+      count = excluded.count,
+      updated_at = excluded.updated_at
+  `)
+    .bind(
+      targetKey,
+      String(b.name || "").slice(0, 64),
+      Number.parseInt(b.count, 10) || 0,
+      ts,
+    ));
+
+  if (statements.length > 0) {
+    await env.DB.batch(statements);
+  }
+
+  // Daily history rollup — best-effort; a missing block_history table must never
+  // break top-block ingestion. Keeps the day's max count per block.
+  try {
+    const today = localDateStr();
+    const hist = blocks.map((b) => env.DB.prepare(`
+      INSERT INTO block_history (target, date, block_name, count, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(target, date, block_name) DO UPDATE SET
+        count = MAX(count, excluded.count),
+        updated_at = excluded.updated_at
+    `).bind(targetKey, today, String(b.name || "").slice(0, 64), Number.parseInt(b.count, 10) || 0, ts));
+    if (hist.length > 0) await env.DB.batch(hist);
+  } catch (err) {
+    // block_history not migrated yet — ingest still OK.
+  }
+
+  return json({ ok: true, count: blocks.length });
+}
+
+async function handleTopBlocksRead(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+  const rawLimit = Number.parseInt(url.searchParams.get("limit") || "10", 10);
+  const limit = Math.max(1, Math.min(50, Number.isNaN(rawLimit) ? 10 : rawLimit));
+
+  const result = await env.DB.prepare(`
+    SELECT block_name, count, updated_at
+    FROM top_blocks
+    WHERE target = ?
+    ORDER BY count DESC
+    LIMIT ?
+  `)
+    .bind(target, limit)
+    .all();
+
+  const rows = result.results || [];
+  const ageSeconds = rows.length > 0 ? nowUnix() - rows[0].updated_at : null;
+
+  return json({ target, rows, ageSeconds });
+}
+
+// ============================================================================
+// /stats/session-length — average completed session duration per UTC day
+// ============================================================================
+
+async function handleStatsSessionLength(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const result = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', joined_at, 'unixepoch', '${TZ_SQL}') AS date,
+      AVG(duration_s) AS avg_seconds,
+      COUNT(*) AS session_count
+    FROM sessions
+    WHERE joined_at >= ?
+      AND target = ?
+      AND left_at IS NOT NULL
+      AND duration_s > 0
+    GROUP BY date
+    ORDER BY date ASC
+  `)
+    .bind(cutoff, target)
+    .all();
+
+  return json({ target, days, rows: result.results || [] });
+}
+
+// ============================================================================
+// /leaderboards — Roblox posts top entries by streak/likes/playtime
+// ============================================================================
+
+async function handleLeaderboardsIngest(request, env) {
+  const ingest = request.headers.get("X-Ingest-Token");
+  if (!ingest || ingest !== env.INGEST_TOKEN) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const target = String(body.target || "").toLowerCase();
+  if (!target) return json({ error: "Missing target" }, 400);
+
+  const ts = nowUnix();
+  const kinds = ["streak", "likes", "playtime"];
+  const statements = [];
+
+  for (const kind of kinds) {
+    const list = body[kind];
+    if (!Array.isArray(list)) continue;
+
+    statements.push(
+      env.DB.prepare("DELETE FROM leaderboards WHERE target = ? AND kind = ?")
+        .bind(target, kind),
+    );
+
+    list.slice(0, 50).forEach((entry, idx) => {
+      statements.push(env.DB.prepare(`
+        INSERT INTO leaderboards (target, kind, rank, user_id, username, value, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+        .bind(
+          target,
+          kind,
+          idx + 1,
+          Number.parseInt(entry.userId, 10) || 0,
+          String(entry.username || "").slice(0, 64),
+          Number.parseInt(entry.value, 10) || 0,
+          ts,
+        ));
+    });
+  }
+
+  if (statements.length > 0) {
+    await env.DB.batch(statements);
+  }
+
+  return json({ ok: true });
+}
+
+async function handleLeaderboardsRead(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+
+  const result = await env.DB.prepare(`
+    SELECT kind, rank, user_id, username, value, updated_at
+    FROM leaderboards
+    WHERE target = ?
+    ORDER BY kind, rank
+  `)
+    .bind(target)
+    .all();
+
+  const rows = result.results || [];
+  const grouped = { streak: [], likes: [], playtime: [] };
+  let maxUpdatedAt = 0;
+
+  for (const r of rows) {
+    if (grouped[r.kind]) {
+      grouped[r.kind].push({
+        rank: r.rank,
+        userId: r.user_id,
+        username: r.username,
+        value: r.value,
+      });
+    }
+    if (r.updated_at > maxUpdatedAt) maxUpdatedAt = r.updated_at;
+  }
+
+  return json({
+    target,
+    streak: grouped.streak,
+    likes: grouped.likes,
+    playtime: grouped.playtime,
+    ageSeconds: maxUpdatedAt > 0 ? nowUnix() - maxUpdatedAt : null,
+  });
+}
+
+// ============================================================================
+// /api/lookup-user — resolve a username or user ID into { userId, displayName,
+// headshotUrl, isOnline }. Proxies the Roblox APIs so the browser can avoid CORS
+// and gathers live-online status from D1 for the gifting UI.
+// ============================================================================
+// Resolve a username via the Roblox usernames endpoint. Tries twice with a
+// short backoff because the endpoint occasionally returns a transient error
+// even though the username is valid (most-common reason the gift lookup fails
+// the first time and works on retry). Returns the numeric userId on success
+// or null on failure.
+async function resolveUsernameViaRoblox(username) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch("https://users.roblox.com/v1/usernames/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ usernames: [username], excludeBannedUsers: false }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const found = (data.data || [])[0];
+        if (found && found.id) return found.id;
+        return null; // valid response, just no match — don't retry
+      }
+      // Transient 5xx or rate-limit: wait briefly and retry once.
+      if (attempt === 1 && (res.status >= 500 || res.status === 429)) {
+        await new Promise(r => setTimeout(r, 350));
+        continue;
+      }
+      return null;
+    } catch (err) {
+      if (attempt === 1) {
+        await new Promise(r => setTimeout(r, 350));
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+// Like fetch() but retries once on transient failure (5xx, 429, network error).
+// Roblox's users / thumbnails endpoints are both flaky enough that one retry
+// noticeably reduces the rate of "User info unavailable" errors in the panel.
+// Returns the final Response (which may still be non-OK) or null on total failure.
+async function fetchWithRetry(url, init) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(url, init);
+      if (res.ok) return res;
+      if (attempt === 1 && (res.status >= 500 || res.status === 429)) {
+        await new Promise(r => setTimeout(r, 300));
+        continue;
+      }
+      return res; // non-OK but not retryable — caller decides what to do
+    } catch (err) {
+      if (attempt === 1) {
+        await new Promise(r => setTimeout(r, 300));
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+// Fallback: if Roblox's username API failed, see if the player is currently
+// online — every live-server heartbeat stores its players' (userId, username)
+// pairs in players_json, so an online player can be resolved without Roblox.
+// Case-insensitive username match. Returns userId or null.
+async function resolveUsernameFromLiveData(env, username) {
+  try {
+    const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+    const result = await env.DB.prepare(
+      "SELECT players_json FROM live_servers WHERE last_heartbeat >= ?",
+    ).bind(freshAfter).all();
+    const lower = username.toLowerCase();
+    for (const row of (result.results || [])) {
+      try {
+        const players = JSON.parse(row.players_json || "[]");
+        for (const p of players) {
+          if (String(p.username || "").toLowerCase() === lower) {
+            return Number(p.userId) || null;
+          }
+        }
+      } catch {
+        // ignore malformed row
+      }
+    }
+  } catch {
+    // D1 unavailable — give up
+  }
+  return null;
+}
+// Reverse of resolveUsernameFromLiveData: given a userId, find that player's
+// username in any live heartbeat. Used as a fallback when Roblox's user-info
+// endpoint (users.roblox.com/v1/users/{id}) is down. Returns username or null.
+async function findUsernameInLiveData(env, userId) {
+  try {
+    const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+    const result = await env.DB.prepare(
+      "SELECT players_json FROM live_servers WHERE last_heartbeat >= ?",
+    ).bind(freshAfter).all();
+    const targetId = Number(userId);
+    for (const row of (result.results || [])) {
+      try {
+        const players = JSON.parse(row.players_json || "[]");
+        for (const p of players) {
+          if (Number(p.userId) === targetId && p.username) {
+            return String(p.username);
+          }
+        }
+      } catch {
+        // ignore malformed row
+      }
+    }
+  } catch {
+    // D1 unavailable — give up
+  }
+  return null;
+}
+async function handleLookupUser(request, env, url) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+  // Accept either {userId: number} (skips Roblox username resolution — used by
+  // the picker since it already has the id) or {query: string} (typed input).
+  // userId path is preferred because the Roblox usernames API is occasionally
+  // flaky and the failure rate hurts the gifting UX.
+  let userId;
+  const directUserId = Number.parseInt(body.userId, 10);
+  if (directUserId && directUserId > 0) {
+    userId = directUserId;
+  } else {
+    const rawQuery = String(body.query || "").trim();
+    if (!rawQuery) return json({ error: "Missing query" }, 400);
+    if (rawQuery.length > 64) return json({ error: "Query too long" }, 400);
+    if (/^\d+$/.test(rawQuery)) {
+      userId = Number.parseInt(rawQuery, 10);
+      if (!userId || userId <= 0) return json({ error: "Invalid userId" }, 400);
+    } else {
+      // Try Roblox usernames endpoint with one retry on transient failure
+      // (5xx / network), since the endpoint is occasionally unreliable.
+      userId = await resolveUsernameViaRoblox(rawQuery);
+      // Last-resort fallback: scan our live_servers data for a username match.
+      // If the player is online right now we already know their userId, even
+      // if Roblox's username API just timed out on us.
+      if (!userId) {
+        userId = await resolveUsernameFromLiveData(env, rawQuery);
+      }
+      if (!userId) {
+        return json({ error: "User not found (Roblox API may be down — try the picker if they're online)" }, 404);
+      }
+    }
+  }
+  // Fetch user info + headshot in parallel. Both endpoints retry once on
+  // transient failure (5xx / network) because they're occasionally flaky.
+  // The headshot endpoint is also best-effort — a missing avatar is fine.
+  let name = null;
+  let displayName = null;
+  let headshotUrl = null;
+  try {
+    const [infoRes, thumbRes] = await Promise.all([
+      fetchWithRetry("https://users.roblox.com/v1/users/" + userId),
+      fetchWithRetry("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" + userId + "&size=150x150&format=Png&isCircular=false"),
+    ]);
+    if (infoRes && infoRes.ok) {
+      const info = await infoRes.json();
+      name = info.name || null;
+      displayName = info.displayName || info.name || null;
+    }
+    if (thumbRes && thumbRes.ok) {
+      const thumb = await thumbRes.json();
+      const first = (thumb.data || [])[0];
+      headshotUrl = (first && first.imageUrl) || null;
+    }
+  } catch (err) {
+    // best-effort; partial data is acceptable
+  }
+  // Fallback 1: if Roblox's user-info endpoint is down, try to find the
+  // username from our own live heartbeat data — if they're online right now
+  // we already have their name + userId pair stored.
+  if (!name) {
+    const liveName = await findUsernameInLiveData(env, userId);
+    if (liveName) {
+      name = liveName;
+      displayName = liveName;
+    }
+  }
+  // Fallback 2: client (picker) can hand us a username hint. The picker knows
+  // every online player's name, so even with Roblox + D1 both unhelpful we can
+  // still resolve a click on someone the panel just saw in the list.
+  if (!name && body.usernameHint) {
+    const hint = String(body.usernameHint).slice(0, 64).trim();
+    if (hint) {
+      name = hint;
+      displayName = hint;
+    }
+  }
+  if (!name) return json({ error: "User info unavailable for userId=" + userId + " (Roblox API may be down)" }, 404);
+  // 3. Check live online status for the requested target. We scan the
+  //    players_json of every fresh server because the per-player ids live there.
+  const target = parseTarget(url.searchParams.get("target"));
+  const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+  let isOnline = false;
+  let serverId = null;
+  try {
+    const live = await env.DB.prepare(`
+      SELECT server_id, players_json FROM live_servers
+      WHERE target = ? AND last_heartbeat >= ?
+    `).bind(target, freshAfter).all();
+    for (const row of (live.results || [])) {
+      try {
+        const players = JSON.parse(row.players_json || "[]");
+        if (players.some((p) => Number(p.userId) === Number(userId))) {
+          isOnline = true;
+          serverId = row.server_id;
+          break;
+        }
+      } catch {
+        // ignore malformed players_json on a single row
+      }
+    }
+  } catch {
+    // live_servers unavailable — return offline rather than erroring out
+  }
+  return json({
+    userId,
+    name,
+    displayName,
+    headshotUrl,
+    isOnline,
+    serverId,
+    target,
+  });
+}
+// ============================================================================
+// Admin command relay
+// ============================================================================
+
+// ============================================================================
+// /stats/playerbase — acquisition + churn + lifetime, all from sessions so it
+// stays target-scoped (the users table is global).
+// ============================================================================
+async function handleStatsPlayerbase(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const now = nowUnix();
+  const cutoff = now - days * 86400;
+  const d1 = now - 86400, d7 = now - 7 * 86400, d14 = now - 14 * 86400, d30 = now - 30 * 86400;
+
+  const acquisition = await env.DB.prepare(`
+    SELECT strftime('%Y-%m-%d', joined_at, 'unixepoch', '${TZ_SQL}') AS date, COUNT(*) AS count
+    FROM sessions
+    WHERE target = ? AND is_new = 1 AND joined_at >= ?
+    GROUP BY date
+    ORDER BY date ASC
+  `).bind(target, cutoff).all();
+
+  const churn = await env.DB.prepare(`
+    WITH seen AS (
+      SELECT user_id, MAX(joined_at) AS last_seen, MIN(joined_at) AS first_seen, COUNT(*) AS n
+      FROM sessions WHERE target = ? GROUP BY user_id
+    )
+    SELECT
+      SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END)                  AS active1,
+      SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END)                  AS active7,
+      SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END)                  AS active14,
+      SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END)                  AS active30,
+      SUM(CASE WHEN last_seen < ? AND last_seen >= ? THEN 1 ELSE 0 END) AS lapsed_7_14,
+      SUM(CASE WHEN last_seen < ? AND last_seen >= ? THEN 1 ELSE 0 END) AS lapsed_14_30,
+      SUM(CASE WHEN last_seen < ? THEN 1 ELSE 0 END)                   AS lapsed_30p,
+      COUNT(*)                                                         AS total_players,
+      AVG((last_seen - first_seen) / 86400.0)                         AS avg_lifetime_days,
+      AVG(n)                                                           AS avg_sessions,
+      SUM(CASE WHEN n >= 10 THEN 1 ELSE 0 END)                        AS power_users
+    FROM seen
+  `).bind(target, d1, d7, d14, d30, d7, d14, d14, d30, d30).first();
+
+  // Lapsed-then-returned in the last 7d: a session in the last 7d, a session older
+  // than 30d, and nothing in the 30d->7d gap.
+  const reactivated = await env.DB.prepare(`
+    SELECT COUNT(DISTINCT user_id) AS n FROM sessions s
+    WHERE target = ? AND joined_at >= ?
+      AND user_id IN (SELECT user_id FROM sessions WHERE target = ? AND joined_at < ?)
+      AND user_id NOT IN (SELECT user_id FROM sessions WHERE target = ? AND joined_at >= ? AND joined_at < ?)
+  `).bind(target, d7, target, d30, target, d30, d7).first();
+
+  const buckets = await env.DB.prepare(`
+    WITH seen AS (SELECT user_id, COUNT(*) AS n FROM sessions WHERE target = ? GROUP BY user_id)
+    SELECT
+      CASE WHEN n = 1 THEN '1' WHEN n <= 4 THEN '2-4' WHEN n <= 9 THEN '5-9'
+           WHEN n <= 24 THEN '10-24' ELSE '25+' END AS bucket,
+      COUNT(*) AS count
+    FROM seen GROUP BY bucket
+  `).bind(target).all();
+
+  return json({
+    target, days,
+    acquisition: acquisition.results || [],
+    churn: {
+      active1: (churn && churn.active1) || 0,
+      active7: (churn && churn.active7) || 0,
+      active14: (churn && churn.active14) || 0,
+      active30: (churn && churn.active30) || 0,
+      lapsed_7_14: (churn && churn.lapsed_7_14) || 0,
+      lapsed_14_30: (churn && churn.lapsed_14_30) || 0,
+      lapsed_30p: (churn && churn.lapsed_30p) || 0,
+      reactivated7: (reactivated && reactivated.n) || 0,
+    },
+    lifetime: {
+      total: (churn && churn.total_players) || 0,
+      avgDays: Math.round(((churn && churn.avg_lifetime_days) || 0) * 10) / 10,
+      avgSessions: Math.round(((churn && churn.avg_sessions) || 0) * 10) / 10,
+      powerUsers: (churn && churn.power_users) || 0,
+    },
+    sessionBuckets: buckets.results || [],
+  });
+}
+
+// ============================================================================
+// /stats/heatmap — sessions by UTC weekday x hour, to find the best play times.
+// ============================================================================
+async function handleStatsHeatmap(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const result = await env.DB.prepare(`
+    SELECT
+      CAST(strftime('%w', joined_at, 'unixepoch', '${TZ_SQL}') AS INTEGER) AS dow,
+      CAST(strftime('%H', joined_at, 'unixepoch', '${TZ_SQL}') AS INTEGER) AS hour,
+      COUNT(*) AS count
+    FROM sessions
+    WHERE target = ? AND joined_at >= ?
+    GROUP BY dow, hour
+  `).bind(target, cutoff).all();
+
+  return json({ target, days, cells: result.results || [] });
+}
+
+// ============================================================================
+// /stats/session-split — new vs returning session length over time, plus a
+// session-length histogram.
+// ============================================================================
+async function handleStatsSessionSplit(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const daily = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', joined_at, 'unixepoch', '${TZ_SQL}') AS date,
+      AVG(CASE WHEN is_new = 1 THEN duration_s END) / 60.0 AS new_avg,
+      AVG(CASE WHEN is_new = 0 THEN duration_s END) / 60.0 AS ret_avg
+    FROM sessions
+    WHERE target = ? AND joined_at >= ? AND duration_s IS NOT NULL
+    GROUP BY date
+    ORDER BY date ASC
+  `).bind(target, cutoff).all();
+
+  const hist = await env.DB.prepare(`
+    SELECT
+      CASE WHEN duration_s < 60 THEN '<1m' WHEN duration_s < 300 THEN '1-5m'
+           WHEN duration_s < 600 THEN '5-10m' WHEN duration_s < 1800 THEN '10-30m'
+           WHEN duration_s < 3600 THEN '30-60m' ELSE '60m+' END AS bucket,
+      COUNT(*) AS count
+    FROM sessions
+    WHERE target = ? AND joined_at >= ? AND duration_s IS NOT NULL
+    GROUP BY bucket
+  `).bind(target, cutoff).all();
+
+  return json({ target, days, rows: daily.results || [], histogram: hist.results || [] });
+}
+
+// ============================================================================
+// /stats/milestones — onboarding/progression funnel: distinct players who ever
+// reached each milestone, against the new-player baseline.
+// ============================================================================
+async function handleStatsMilestones(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+
+  const rows = await env.DB.prepare(`
+    SELECT milestone, COUNT(DISTINCT user_id) AS users
+    FROM milestones WHERE target = ?
+    GROUP BY milestone ORDER BY users DESC
+  `).bind(target).all();
+
+  const base = await env.DB.prepare(
+    "SELECT COUNT(DISTINCT user_id) AS joined FROM sessions WHERE target = ? AND is_new = 1",
+  ).bind(target).first();
+
+  return json({ target, joined: (base && base.joined) || 0, rows: rows.results || [] });
+}
+
+// ============================================================================
+// /stats/servers — health of servers reporting fresh heartbeats right now.
+// ============================================================================
+// ============================================================================
+// /admin/servers — live servers (with player names) for the command-targeting
+// dropdown. Admin-token protected. Like /stats/servers but includes names.
+// ============================================================================
+async function handleAdminServersList(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+  const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+  const result = await env.DB.prepare(`
+    SELECT server_id, player_count, players_json, last_heartbeat
+    FROM live_servers
+    WHERE target = ? AND last_heartbeat >= ?
+    ORDER BY player_count DESC
+  `).bind(target, freshAfter).all();
+  const servers = (result.results || []).map((r) => {
+    let players = [];
+    try {
+      const arr = JSON.parse(r.players_json || "[]");
+      players = arr.map((pp) => (pp && (pp.username || pp.name)) || null).filter(Boolean);
+    } catch (e) {}
+    return { serverId: r.server_id, players, count: r.player_count || players.length };
+  });
+  return json({ target, servers });
+}
+
+async function handleStatsServers(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+  const freshAfter = nowUnix() - HEARTBEAT_FRESHNESS_SECONDS;
+
+  const result = await env.DB.prepare(`
+    SELECT server_id, player_count, uptime_seconds, last_heartbeat
+    FROM live_servers
+    WHERE target = ? AND last_heartbeat >= ?
+    ORDER BY player_count DESC
+  `).bind(target, freshAfter).all();
+
+  const servers = (result.results || []).map((r) => ({
+    serverId: r.server_id,
+    players: r.player_count || 0,
+    uptimeSeconds: r.uptime_seconds || 0,
+  }));
+  const totalPlayers = servers.reduce((a, s) => a + s.players, 0);
+
+  return json({
+    target,
+    serverCount: servers.length,
+    totalPlayers,
+    avgPlayers: servers.length ? Math.round((totalPlayers / servers.length) * 10) / 10 : 0,
+    servers,
+  });
+}
+
+// ============================================================================
+// /stats/coinflow — cumulative coin balance (faucet minus sink) plus who is
+// spending: spender rate, average spend per spender, and the top spenders.
+// ============================================================================
+async function handleStatsCoinflow(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const daily = await env.DB.prepare(`
+    SELECT
+      strftime('%Y-%m-%d', created_at, 'unixepoch', '${TZ_SQL}') AS date,
+      SUM(CASE WHEN direction = 'earn' THEN amount ELSE 0 END)  AS earned,
+      SUM(CASE WHEN direction = 'spend' THEN amount ELSE 0 END) AS spent
+    FROM coin_events
+    WHERE target = ? AND created_at >= ?
+    GROUP BY date ORDER BY date ASC
+  `).bind(target, cutoff).all();
+
+  const totals = await env.DB.prepare(`
+    SELECT
+      COUNT(DISTINCT CASE WHEN direction = 'spend' THEN user_id END) AS spenders,
+      COUNT(DISTINCT user_id)                                        AS participants,
+      SUM(CASE WHEN direction = 'spend' THEN amount ELSE 0 END)      AS total_spent
+    FROM coin_events
+    WHERE target = ? AND created_at >= ?
+  `).bind(target, cutoff).first();
+
+  const whales = await env.DB.prepare(`
+    SELECT user_id, username, SUM(amount) AS spent
+    FROM coin_events
+    WHERE target = ? AND created_at >= ? AND direction = 'spend'
+    GROUP BY user_id ORDER BY spent DESC LIMIT 15
+  `).bind(target, cutoff).all();
+
+  const spenders = (totals && totals.spenders) || 0;
+  const participants = (totals && totals.participants) || 0;
+  const totalSpent = (totals && totals.total_spent) || 0;
+
+  return json({
+    target, days,
+    rows: daily.results || [],
+    spenders, participants,
+    spenderRate: participants > 0 ? Math.round((spenders / participants) * 1000) / 10 : 0,
+    avgSpendPerSpender: spenders > 0 ? Math.round(totalSpent / spenders) : 0,
+    whales: whales.results || [],
+  });
+}
+
+// ============================================================================
+// /stats/shop-detail — revenue split by currency and item kind, repeat-purchase
+// rate, and average time from first join to first purchase.
+// ============================================================================
+async function handleStatsShopDetail(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const byCurrency = await env.DB.prepare(`
+    SELECT COALESCE(currency, 'unknown') AS currency, COUNT(*) AS purchases, SUM(price) AS revenue
+    FROM shop_events
+    WHERE target = ? AND created_at >= ? AND event = 'purchase'
+    GROUP BY currency ORDER BY purchases DESC
+  `).bind(target, cutoff).all();
+
+  const byKind = await env.DB.prepare(`
+    SELECT COALESCE(item_kind, 'unknown') AS kind, COUNT(*) AS purchases, SUM(price) AS revenue
+    FROM shop_events
+    WHERE target = ? AND created_at >= ? AND event = 'purchase'
+    GROUP BY kind ORDER BY purchases DESC
+  `).bind(target, cutoff).all();
+
+  const repeat = await env.DB.prepare(`
+    SELECT COUNT(*) AS buyers, SUM(CASE WHEN c > 1 THEN 1 ELSE 0 END) AS repeat_buyers
+    FROM (
+      SELECT user_id, COUNT(*) AS c FROM shop_events
+      WHERE target = ? AND created_at >= ? AND event = 'purchase'
+      GROUP BY user_id
+    )
+  `).bind(target, cutoff).first();
+
+  const ttf = await env.DB.prepare(`
+    SELECT AVG((fp.first_purchase - s.first_join) / 86400.0) AS avg_days
+    FROM (SELECT user_id, MIN(created_at) AS first_purchase FROM shop_events
+          WHERE target = ? AND event = 'purchase' GROUP BY user_id) fp
+    JOIN (SELECT user_id, MIN(joined_at) AS first_join FROM sessions
+          WHERE target = ? GROUP BY user_id) s ON s.user_id = fp.user_id
+    WHERE fp.first_purchase >= s.first_join
+  `).bind(target, target).first();
+
+  const buyers = (repeat && repeat.buyers) || 0;
+  const repeatBuyers = (repeat && repeat.repeat_buyers) || 0;
+
+  return json({
+    target, days,
+    byCurrency: byCurrency.results || [],
+    byKind: byKind.results || [],
+    buyers, repeatBuyers,
+    repeatRate: buyers > 0 ? Math.round((repeatBuyers / buyers) * 1000) / 10 : 0,
+    avgDaysToFirstPurchase: Math.round(((ttf && ttf.avg_days) || 0) * 10) / 10,
+  });
+}
+
+// ============================================================================
+// /stats/streaks — distribution of each player's best daily-claim streak, plus
+// which reward sets actually drop.
+// ============================================================================
+async function handleStatsStreaks(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+
+  const buckets = await env.DB.prepare(`
+    WITH mx AS (SELECT user_id, MAX(streak) AS s FROM daily_claims WHERE target = ? GROUP BY user_id)
+    SELECT
+      CASE WHEN s <= 1 THEN '1' WHEN s <= 3 THEN '2-3' WHEN s <= 6 THEN '4-6'
+           WHEN s <= 13 THEN '7-13' WHEN s <= 29 THEN '14-29' ELSE '30+' END AS bucket,
+      COUNT(*) AS count
+    FROM mx GROUP BY bucket
+  `).bind(target).all();
+
+  const sets = await env.DB.prepare(`
+    SELECT COALESCE(set_name, 'unknown') AS set_name, COUNT(*) AS drops, COUNT(DISTINCT user_id) AS players
+    FROM daily_claims
+    WHERE target = ? AND reward_type = 'block_set'
+    GROUP BY set_name ORDER BY drops DESC
+  `).bind(target).all();
+
+  return json({ target, buckets: buckets.results || [], sets: sets.results || [] });
+}
+
+// ============================================================================
+// /stats/plus-quality — how many Plus taps are "wasted" on already-subscribed
+// players, split by where the tap came from.
+// ============================================================================
+async function handleStatsPlusQuality(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+
+  const totals = await env.DB.prepare(`
+    SELECT
+      SUM(CASE WHEN event = 'tap' THEN 1 ELSE 0 END)                      AS taps,
+      SUM(CASE WHEN event = 'tap' AND already_plus = 1 THEN 1 ELSE 0 END) AS wasted,
+      SUM(CASE WHEN event = 'tap' AND already_plus = 0 THEN 1 ELSE 0 END) AS prospects,
+      SUM(CASE WHEN event = 'purchase' THEN 1 ELSE 0 END)                AS purchases
+    FROM plus_events WHERE target = ? AND created_at >= ?
+  `).bind(target, cutoff).first();
+
+  const sources = await env.DB.prepare(`
+    SELECT
+      COALESCE(source, 'unknown') AS source,
+      SUM(CASE WHEN event = 'tap' THEN 1 ELSE 0 END)                      AS taps,
+      SUM(CASE WHEN event = 'tap' AND already_plus = 1 THEN 1 ELSE 0 END) AS wasted,
+      SUM(CASE WHEN event = 'purchase' THEN 1 ELSE 0 END)                AS purchases
+    FROM plus_events WHERE target = ? AND created_at >= ?
+    GROUP BY source ORDER BY taps DESC
+  `).bind(target, cutoff).all();
+
+  const taps = (totals && totals.taps) || 0;
+  const wasted = (totals && totals.wasted) || 0;
+
+  return json({
+    target, days,
+    taps,
+    wasted,
+    prospects: (totals && totals.prospects) || 0,
+    purchases: (totals && totals.purchases) || 0,
+    wastedRate: taps > 0 ? Math.round((wasted / taps) * 1000) / 10 : 0,
+    sources: sources.results || [],
+  });
+}
+
+// ============================================================================
+// /stats/block-trends — block popularity over time, pivoted to the top movers.
+// Reads block_history (filled best-effort on each top-blocks ingest). Wrapped so
+// it returns empty until the table is created.
+// ============================================================================
+async function handleStatsBlockTrends(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoffDate = localDateStr(nowUnix() - days * 86400);
+  try {
+    const res = await env.DB.prepare(
+      "SELECT date, block_name, count FROM block_history WHERE target = ? AND date >= ? ORDER BY date ASC",
+    ).bind(target, cutoffDate).all();
+    const rows = res.results || [];
+    const dates = [];
+    const seen = {};
+    const byBlock = {};
+    for (const r of rows) {
+      if (!seen[r.date]) { seen[r.date] = 1; dates.push(r.date); }
+      if (!byBlock[r.block_name]) byBlock[r.block_name] = {};
+      byBlock[r.block_name][r.date] = r.count;
+    }
+    const blocks = Object.keys(byBlock).map((name) => {
+      const counts = dates.map((d) => (byBlock[name][d] != null ? byBlock[name][d] : 0));
+      const present = counts.filter((c) => c > 0);
+      const first = present.length ? present[0] : 0;
+      const last = counts.length ? counts[counts.length - 1] : 0;
+      const peak = counts.length ? Math.max.apply(null, counts) : 0;
+      return { name: name, counts: counts, peak: peak, last: last, delta: last - first };
+    }).sort((a, b) => b.peak - a.peak).slice(0, 6);
+    return json({ target: target, days: days, dates: dates, blocks: blocks });
+  } catch (err) {
+    return json({ target: target, days: days, dates: [], blocks: [] });
+  }
+}
+
+// ============================================================================
+// /stats/engagement-trends — daily average coins/likes/playtime/streak across
+// online players, sampled from heartbeats into engagement_history.
+// ============================================================================
+async function handleStatsEngagementTrends(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoffDate = localDateStr(nowUnix() - days * 86400);
+  try {
+    const res = await env.DB.prepare(
+      "SELECT date, players, avg_coins, avg_likes, avg_playtime, avg_streak, max_coins, max_streak FROM engagement_history WHERE target = ? AND date >= ? ORDER BY date ASC",
+    ).bind(target, cutoffDate).all();
+    return json({ target: target, days: days, rows: res.results || [] });
+  } catch (err) {
+    return json({ target: target, days: days, rows: [] });
+  }
+}
+
+// ============================================================================
+// /stats/slots-trends — saves-per-player distribution snapshotted daily into
+// slots_history on each slot-count ingest.
+// ============================================================================
+async function handleStatsSlotsTrends(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoffDate = localDateStr(nowUnix() - days * 86400);
+  try {
+    const res = await env.DB.prepare(
+      "SELECT date, total_players, avg_slots, multi_slot_rate FROM slots_history WHERE target = ? AND date >= ? ORDER BY date ASC",
+    ).bind(target, cutoffDate).all();
+    return json({ target: target, days: days, rows: res.results || [] });
+  } catch (err) {
+    return json({ target: target, days: days, rows: [] });
+  }
+}
+
+// ============================================================================
+// Chat capture. The game batch-POSTs in-game chat to /chat; we keyword-tag each
+// line immediately (so there's always a category), then Workers AI refines it on
+// demand via /chat/classify. Old rows auto-purge after 30 days.
+// ============================================================================
+const CHAT_RETENTION_DAYS = 30;
+
+// Fast, deterministic first-pass tagger. AI (ai_category) overrides this in the
+// dashboard once classified. is_complaint is what the "complaints" view keys on.
+function keywordClassifyChat(text) {
+  const t = " " + String(text || "").toLowerCase() + " ";
+  const has = (arr) => arr.some((w) => t.indexOf(w) !== -1);
+  const bug = ["bug", "glitch", "broke", "broken", "not working", "doesnt work", "doesn't work", "dont work", "won't load", "wont load", "cant load", "error", " lag", "laggy", "frozen", "freeze", "crash", "stuck", "disappear", "deleted", "lost my", "reset my", "wiped", "gone"];
+  const complaint = ["hate", "worst", "terrible", "annoying", "unfair", "boring", " bad ", "trash", "sucks", "scam", "rip off", "ripoff", "too expensive", "pay to win", "p2w", "fix this", "please fix", "why cant", "why can't", "ripped off"];
+  const toxic = ["noob", "loser", "idiot", "shut up", "stfu", "kys", "stupid", "dumb"];
+  const suggestion = ["should add", "you should", "can you add", "please add", "add a ", "add more", "wish there was", "would be cool", "suggest", "maybe add", "pls add", "plz add"];
+  const praise = ["love", "awesome", "amazing", "great", "best", " cool", "epic", " fun", "nice", "thank", "tysm", "goated", " fire", "w game", "peak", "the goat"];
+  if (has(toxic)) return { category: "toxic", isComplaint: 1 };
+  if (has(bug)) return { category: "bug", isComplaint: 1 };
+  if (has(complaint)) return { category: "complaint", isComplaint: 1 };
+  if (has(suggestion)) return { category: "suggestion", isComplaint: 0 };
+  if (String(text || "").trim().endsWith("?") || has(["how do i", "how to", "where is", "what is", "is there", "how much"])) return { category: "question", isComplaint: 0 };
+  if (has(praise)) return { category: "praise", isComplaint: 0 };
+  return { category: "chatter", isComplaint: 0 };
+}
+
+async function handleChatIngest(request, env) {
+  const ingest = request.headers.get("X-Ingest-Token");
+  if (!ingest || ingest !== env.INGEST_TOKEN) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const targetKey = parseTarget(body.target);
+  const messages = Array.isArray(body.messages) ? body.messages.slice(0, 100) : null;
+  if (!messages) return json({ error: "Missing messages[]" }, 400);
+
+  const stmts = [];
+  for (const m of messages) {
+    const text = String(m.text || "").slice(0, 280);
+    if (!text) continue;
+    const tag = keywordClassifyChat(text);
+    const ts = Number.parseInt(m.ts, 10) || nowUnix();
+    const msgId = m.msgId ? String(m.msgId).slice(0, 48) : (String(m.userId || "0") + "-" + ts + "-" + text.length);
+    stmts.push(env.DB.prepare(`
+      INSERT OR IGNORE INTO chat_messages
+        (target, msg_id, user_id, username, message, category, is_complaint, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      targetKey, msgId, m.userId || null,
+      String(m.username || "").slice(0, 64), text, tag.category, tag.isComplaint, ts,
+    ));
+  }
+
+  try {
+    if (stmts.length > 0) await env.DB.batch(stmts);
+  } catch (err) {
+    // chat_messages not migrated yet — don't fail the game's POST.
+    return json({ ok: true, stored: 0, warning: "chat_messages unavailable" });
+  }
+
+  // Best-effort retention sweep, occasionally.
+  if (Math.random() < 0.05) {
+    try {
+      await env.DB.prepare("DELETE FROM chat_messages WHERE created_at < ?")
+        .bind(nowUnix() - CHAT_RETENTION_DAYS * 86400).run();
+    } catch (err) { /* table absent */ }
+  }
+
+  return json({ ok: true, stored: stmts.length });
+}
+
+// Workers AI refinement. Pulls a batch of still-unclassified lines, classifies
+// them in ONE model call (cheap), writes ai_category + sentiment back. Returns
+// gracefully if the [ai] binding isn't configured yet.
+async function handleChatClassify(_request, env, url) {
+  const target = parseTarget(url.searchParams.get("target"));
+  if (!env.AI) {
+    return json({ error: "Workers AI binding not configured", classified: 0, remaining: 0 });
+  }
+
+  let pending;
+  try {
+    pending = await env.DB.prepare(
+      "SELECT id, message FROM chat_messages WHERE target = ? AND ai_category IS NULL ORDER BY created_at DESC LIMIT 20",
+    ).bind(target).all();
+  } catch (err) {
+    return json({ error: "chat_messages unavailable", classified: 0, remaining: 0 });
+  }
+  const rows = pending.results || [];
+  if (!rows.length) return json({ classified: 0, remaining: 0 });
+
+  const list = rows.map((r, i) => (i + 1) + ". " + String(r.message).replace(/\s+/g, " ").slice(0, 200)).join("\n");
+  const sys = "You classify short Roblox game chat messages. For each numbered message return a category from exactly this set: complaint, bug, praise, suggestion, question, social, toxic, other — and a sentiment from: positive, negative, neutral. 'complaint' = unhappy/criticism, 'bug' = something broken, 'toxic' = insults/harassment, 'social' = small talk. Respond ONLY with a JSON array like [{\"i\":1,\"category\":\"bug\",\"sentiment\":\"negative\"}]. No prose.";
+
+  const out = await aiComplete(env, sys, list, 1024);
+  if (out == null) {
+    return json({ error: "AI call failed or not configured", classified: 0, remaining: rows.length });
+  }
+
+  let parsed = [];
+  try {
+    const m = String(out).match(/\[[\s\S]*\]/);
+    parsed = m ? JSON.parse(m[0]) : [];
+  } catch (err) {
+    return json({ error: "Could not parse AI output", classified: 0, remaining: rows.length });
+  }
+
+  const COMPLAINT = { complaint: 1, bug: 1, toxic: 1 };
+  const VALID = { complaint: 1, bug: 1, praise: 1, suggestion: 1, question: 1, social: 1, toxic: 1, other: 1 };
+  const updates = [];
+  for (const p of parsed) {
+    const idx = Number.parseInt(p.i, 10) - 1;
+    if (idx < 0 || idx >= rows.length) continue;
+    const cat = VALID[p.category] ? p.category : "other";
+    const sent = ["positive", "negative", "neutral"].indexOf(p.sentiment) !== -1 ? p.sentiment : "neutral";
+    updates.push(env.DB.prepare(
+      "UPDATE chat_messages SET ai_category = ?, sentiment = ?, is_complaint = ? WHERE id = ?",
+    ).bind(cat, sent, COMPLAINT[cat] ? 1 : 0, rows[idx].id));
+  }
+  try {
+    if (updates.length > 0) await env.DB.batch(updates);
+  } catch (err) {
+    return json({ error: "write-back failed", classified: 0, remaining: rows.length });
+  }
+
+  const left = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM chat_messages WHERE target = ? AND ai_category IS NULL",
+  ).bind(target).first();
+  return json({ classified: updates.length, remaining: (left && left.n) || 0 });
+}
+
+// Read: volume over time, category breakdown, totals, and a filterable feed.
+async function handleStatsChat(_request, env, url) {
+  const days = parseDays(url, 30);
+  const target = parseTarget(url.searchParams.get("target"));
+  const cutoff = nowUnix() - days * 86400;
+  const category = url.searchParams.get("category") || "";
+  const complaintsOnly = url.searchParams.get("complaints") === "1";
+  const q = (url.searchParams.get("q") || "").slice(0, 60);
+
+  try {
+    const daily = await env.DB.prepare(`
+      SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', '${TZ_SQL}') AS date,
+             COUNT(*) AS total,
+             SUM(is_complaint) AS complaints
+      FROM chat_messages
+      WHERE target = ? AND created_at >= ?
+      GROUP BY date ORDER BY date ASC
+    `).bind(target, cutoff).all();
+
+    const cats = await env.DB.prepare(`
+      SELECT COALESCE(ai_category, category) AS category, COUNT(*) AS count
+      FROM chat_messages
+      WHERE target = ? AND created_at >= ?
+      GROUP BY category ORDER BY count DESC
+    `).bind(target, cutoff).all();
+
+    const totals = await env.DB.prepare(`
+      SELECT COUNT(*) AS total,
+             SUM(is_complaint) AS complaints,
+             SUM(CASE WHEN ai_category IS NULL THEN 1 ELSE 0 END) AS unclassified
+      FROM chat_messages WHERE target = ? AND created_at >= ?
+    `).bind(target, cutoff).first();
+
+    // Feed with optional filters, built with bound params only.
+    const cond = ["target = ?", "created_at >= ?"];
+    const binds = [target, cutoff];
+    if (complaintsOnly) cond.push("is_complaint = 1");
+    if (category) { cond.push("COALESCE(ai_category, category) = ?"); binds.push(category); }
+    if (q) { cond.push("message LIKE ?"); binds.push("%" + q + "%"); }
+    const feed = await env.DB.prepare(
+      "SELECT user_id, username, message, COALESCE(ai_category, category) AS category, sentiment, is_complaint, created_at"
+      + " FROM chat_messages WHERE " + cond.join(" AND ")
+      + " ORDER BY created_at DESC LIMIT 120",
+    ).bind(...binds).all();
+
+    return json({
+      target, days,
+      rows: daily.results || [],
+      categories: cats.results || [],
+      totals: {
+        total: (totals && totals.total) || 0,
+        complaints: (totals && totals.complaints) || 0,
+        unclassified: (totals && totals.unclassified) || 0,
+      },
+      feed: feed.results || [],
+    });
+  } catch (err) {
+    return json({ target, days, rows: [], categories: [], totals: { total: 0, complaints: 0, unclassified: 0 }, feed: [] });
+  }
+}
+
+// ============================================================================
+// In-game help bot. The game forwards question-like chat to /chat/help; Workers
+// AI answers ONLY from the How to Play guide (HELP_GUIDE). It returns one of:
+//   answer -> a short reply to show privately in the asker's chat
+//   guide  -> a nudge to open the How to Play book (the game also flashes it)
+//   none   -> not a covered how-to question; the game stays silent
+// Keep HELP_GUIDE in sync with HelpBookUI if the in-game guide changes.
+// ============================================================================
+const HELP_GUIDE = [
+  "MOVEMENT - Walk: move around your plot (PC: WASD, Mobile: joystick). Jump: hop onto blocks (PC: Space, Mobile: jump button). Sprint: hold to run faster (PC: hold Ctrl, Mobile: sprint button). Fly: jump twice to start flying and jump twice again to land (Mobile: tap the fly button, with up/down arrows).",
+  "PLACE A BLOCK: point and click - or tap on mobile - where you want it and it snaps into place (PC: right click, Mobile: tap).",
+  "BREAK A BLOCK: hold on the block to break it, and keep holding to break more (PC: hold left click, Mobile: tap and hold).",
+  "MOBILE SLABS AND DOORS: tap once to show a ghost block, tap the ghost to place it, tap X to cancel; tap the lock button to save how the ghost sits so one tap places it that way.",
+  "INVENTORY AND HOTBAR: open your inventory to see all your blocks (PC: E, Mobile: inventory button). Click or tap a block to add it to your hotbar. Remove a block from the hotbar with right click or Q. Quick-move items into chests and crafting tables with Shift+click. On mobile, double-tap an item to delete it, and hold then drag to move items.",
+  "SHOVEL: use it on grass to make a path block (PC: right click grass, Mobile: tap grass).",
+  "SHEARS: snip leaves into bare branches, snip vines to stop them growing, and snip sugar cane to stop it (PC: right click, Mobile: tap).",
+  "SLABS: aim at the top or bottom of a block for a flat slab, or aim at a side for a standing slab.",
+  "DOORS: place or open a door by right clicking it (tap on mobile). Doors snap to 6 spots on a block and always line up with your wall.",
+  "FENCES: they hook onto nearby blocks automatically; right click a fence (tap on mobile) to unhook it, and again to re-hook.",
+  "FRAME BLOCKS: place a frame (it starts empty), then use it on any solid block (PC: right click, Mobile: tap) to copy that block\'s look. Wallpaper frames are flat for floors, walls and ceilings, and you can still build on them.",
+  "TREES AND GROWING: most saplings only need 1 to grow, but big trees - Redwood and Dark Oak - need 4 saplings planted in a 2x2 square. Trees need open space above them to grow.",
+].join("\n");
+
+const HELP_PROMPT_PREFIX =
+  "You are a friendly in-game help bot for a Roblox block-building game, talking to young players. "
+  + "Use ONLY the GUIDE below; never invent features. Reply with ONE JSON object only.\n"
+  + "Decide if the player is asking HOW TO DO a specific action in the game (build, place, break, fly, sprint, plant a tree, open a door, use a tool, manage inventory, etc.).\n"
+  + "- action \"answer\": they ask how to do a specific in-game action the GUIDE covers. Give a SHORT simple answer (max ~180 chars) from the GUIDE and ALWAYS include the control (e.g. right click / tap).\n"
+  + "- action \"guide\": ONLY for broad whole-game questions like how do I play, how do I get started, what do I do. Set text to a short nudge to open the How to Play book (top-right).\n"
+  + "- action \"none\": EVERYTHING else. This includes greetings, statements, opinions, and questions that merely MENTION game things but do NOT ask how to perform an action. Examples of none: how do you know I have doors, do you like my build, is this cool, why is it laggy, who made this.\n"
+  + "Note: how do I build or how do I make stuff = answer (placing blocks). how do I play = guide.\n"
+  + "Examples:\n"
+  + "Player: how do I place blocks -> {\"action\":\"answer\",\"text\":\"Right click (or tap on mobile) to place a block. It snaps into place.\"}\n"
+  + "Player: how do I build -> {\"action\":\"answer\",\"text\":\"Build by placing blocks - right click (or tap on mobile) where you want one and it snaps into place.\"}\n"
+  + "Player: how do I open doors -> {\"action\":\"answer\",\"text\":\"Right click a door (tap on mobile) to open or place it.\"}\n"
+  + "Player: how do I play -> {\"action\":\"guide\",\"text\":\"Tap the How to Play book at the top-right to learn the basics!\"}\n"
+  + "Player: how do you know I have doors? -> {\"action\":\"none\",\"text\":\"\"}\n"
+  + "Player: do you like my house -> {\"action\":\"none\",\"text\":\"\"}\n"
+  + "Player: this game is laggy -> {\"action\":\"none\",\"text\":\"\"}\n"
+  + "Player: hi -> {\"action\":\"none\",\"text\":\"\"}\n"
+  + "Reply with ONLY the JSON object, nothing else.\n\nGUIDE:\n";
+
+// Deterministic routing net. Small models frequently miss the JSON action spec,
+// so for clearly on-topic how-to questions we map to a canned guide answer (or a
+// nudge) instead of going silent. Returns {action,text} or null (off-topic).
+async function getHelpGuide(env, target) {
+  try {
+    const row = await env.DB.prepare("SELECT content FROM help_guide WHERE target = ?").bind(target).first();
+    return row && row.content ? row.content : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// The game (HelpGuideSync) posts the in-game How to Play text here so the bot is
+// always grounded in the exact guide. Best-effort: a missing table can't break it.
+async function handleHelpGuideSync(request, env) {
+  const ingest = request.headers.get("X-Ingest-Token");
+  if (!ingest || ingest !== env.INGEST_TOKEN) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+  const target = parseTarget(body.target);
+  const content = String(body.content || "").slice(0, 8000);
+  if (!content) return json({ error: "Missing content" }, 400);
+  try {
+    await env.DB.prepare(`
+      INSERT INTO help_guide (target, content, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(target) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at
+    `).bind(target, content, nowUnix()).run();
+    return json({ ok: true, chars: content.length });
+  } catch (err) {
+    return json({ ok: true, warning: "help_guide table unavailable" });
+  }
+}
+
+function guideFallback(question) {
+  const q = " " + String(question || "").toLowerCase() + " ";
+  // Must look like "how do/can/would/to ..." AND not be a meta question that only
+  // mentions game things (how do you know..., do you like..., why is..., are you...).
+  const howto = /\bhow (do|can|would|to)\b/.test(q) || q.indexOf("how doi") !== -1;
+  const meta = /\bdo you (know|think|see|like|have|remember|feel)\b/.test(q)
+    || /\bhow do you know\b/.test(q) || /\bwhy (is|are|do|does)\b/.test(q) || /\bare you\b/.test(q);
+  if (!howto || meta) return null;
+  const has = function () {
+    for (let i = 0; i < arguments.length; i++) {
+      if (q.indexOf(arguments[i]) !== -1) return true;
+    }
+    return false;
+  };
+  if (has("place", "put down", "put block")) return { action: "answer", text: "Right click - or tap on mobile - to place a block. It snaps into place." };
+  if (has("build", "make stuff", "make things")) return { action: "answer", text: "Build by placing blocks: right click (or tap on mobile) where you want one and it snaps into place." };
+  if (has("break", "destroy", "mine")) return { action: "answer", text: "Hold left click (tap & hold on mobile) on a block to break it; keep holding to break more." };
+  if (has(" fly", "flying")) return { action: "answer", text: "Jump twice to fly (or the fly button on mobile). Jump twice again to land." };
+  if (has("sprint", "run faster")) return { action: "answer", text: "Hold Ctrl to sprint (or the sprint button on mobile)." };
+  if (has("tree", "sapling", "grow", "plant")) return { action: "answer", text: "Big trees (Redwood, Dark Oak) need 4 saplings in a 2x2 square. Other trees need 1 - leave open space above." };
+  if (has("inventory", "hotbar")) return { action: "answer", text: "Open your inventory with E (inventory button on mobile), then click/tap a block to add it to your hotbar." };
+  if (has("shear", "branch", "vine", "sugar cane", "leaves")) return { action: "answer", text: "Use Shears (right click / tap) to snip leaves into branches, or stop vines and sugar cane from growing." };
+  if (has("shovel", "path")) return { action: "answer", text: "Use the Shovel on grass (right click / tap) to turn it into a path block." };
+  if (has("open door", "place door", "door")) return { action: "answer", text: "Right click a door (tap on mobile) to place or open it. Doors snap to 6 spots and line up with your wall." };
+  if (has("fence")) return { action: "answer", text: "Fences hook onto nearby blocks; right click (tap) a fence to unhook or re-hook it." };
+  if (has("frame", "wallpaper")) return { action: "answer", text: "Place a frame, then use it on any solid block (right click / tap) to copy that block's look." };
+  if (has("slab")) return { action: "answer", text: "Aim at a block's top or bottom for a flat slab, or a side for a standing slab." };
+  if (has("play", "get started", "what do i do", "how to play")) return { action: "guide", text: "Open the How to Play book (top-right) - it walks you through everything!" };
+  return null;
+}
+
+async function handleChatHelp(request, env) {
+  const ingest = request.headers.get("X-Ingest-Token");
+  if (!ingest || ingest !== env.INGEST_TOKEN) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const question = String(body.question || "").slice(0, 200).trim();
+  if (!question) return json({ action: "none", text: "" });
+  if (!env.AI) {
+    const net = guideFallback(question);
+    return json(net || { action: "none", text: "" });
+  }
+
+  const target = parseTarget(body.target);
+  const guide = (await getHelpGuide(env, target)) || HELP_GUIDE;
+  const out = await aiComplete(env, HELP_PROMPT_PREFIX + guide, "Player: " + question, 256);
+  if (out == null) {
+    // AI unavailable/errored - deterministic fallback so real how-to questions still work.
+    const net = guideFallback(question);
+    return json(net || { action: "none", text: "" });
+  }
+
+  let parsed = {};
+  try {
+    const m = String(out).match(/\{[\s\S]*\}/);
+    parsed = m ? JSON.parse(m[0]) : {};
+  } catch (err) {
+    return json({ action: "none", text: "" });
+  }
+
+  let action = ["answer", "guide", "none"].indexOf(parsed.action) !== -1 ? parsed.action : "none";
+  let text = String(parsed.text || "").replace(/\s+/g, " ").slice(0, 220).trim();
+
+  // Gemini is the authority on intent. Only patch obviously-broken output - do
+  // NOT override a "none" (that is the model correctly judging it is not a how-to).
+  if (action === "answer" && !text) {
+    const net = guideFallback(question);
+    if (net && net.action === "answer") { text = net.text; } else { action = "none"; }
+  }
+  if (action === "guide" && !text) text = "Open the How to Play book (top-right) and I'll show you!";
+  if (action === "none") text = "";
+  return json({ action, text });
+}
+
+async function handleAdminCommand(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const { command, payload, target } = body;
+  if (!command || typeof command !== "string") {
+    return json({ error: "Missing 'command' field" }, 400);
+  }
+
+  const targetKey = parseTarget(target);
+  const universeId = UNIVERSES[targetKey];
+  if (!universeId) {
+    return json({ error: `Unknown target '${targetKey}'`, valid: Object.keys(UNIVERSES) }, 400);
+  }
+
+  const message = JSON.stringify({
+    command,
+    payload: payload || {},
+    timestamp: Date.now(),
+  });
+
+  if (message.length > 1024) {
+    return json({ error: "Message exceeds 1KB limit" }, 400);
+  }
+
+  const robloxRes = await fetch(
+    `https://apis.roblox.com/messaging-service/v1/universes/${universeId}/topics/${TOPIC}`,
+    {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ROBLOX_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message }),
+    },
+  );
+
+  if (!robloxRes.ok) {
+    const errText = await robloxRes.text();
+    return json({
+      error: "Roblox API error",
+      status: robloxRes.status,
+      target: targetKey,
+      detail: errText,
+    }, 502);
+  }
+
+  return json({ success: true, command, target: targetKey, timestamp: Date.now() });
+}
